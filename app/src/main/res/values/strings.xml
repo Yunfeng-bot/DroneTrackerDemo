@@ -1,4 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">DroneTrackerDemo</string>
+    <string name="btn_select_image">选择目标图</string>
+    <string name="btn_reset">重置跟踪</string>
+    <string name="toast_template_loaded">目标模板加载成功</string>
+    <string name="toast_template_load_failed">加载目标模板失败</string>
+    <string name="toast_opencv_loaded">OpenCV 初始化成功</string>
+    <string name="toast_opencv_failed">OpenCV 初始化失败</string>
+    <string name="toast_camera_permission_required">需要授权后才能继续</string>
+    <string name="toast_replay_target_missing">回放目标图不存在或不可读</string>
+    <string name="toast_replay_video_missing">回放视频不存在或不可读</string>
+    <string name="toast_replay_failed">回放模式启动失败</string>
+    <string name="toast_replay_started">回放模式已启动</string>
 </resources>

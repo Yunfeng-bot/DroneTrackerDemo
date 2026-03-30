@@ -9,3 +9,6 @@
 .cxx
 local.properties
 /app/build/
+/tools/eval/runs/
+/tools/eval/.adb-home/
+/tools/eval/__pycache__/
