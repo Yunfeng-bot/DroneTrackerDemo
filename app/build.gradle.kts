@@ -52,7 +52,10 @@ dependencies {
     implementation("androidx.camera:camera-extensions:$camerax_version")
 
     // OpenCV (Using unofficial prebuilt maven package for easy integration)
-    implementation("com.quickbirdstudios:opencv:4.5.3.0")
+    implementation("com.quickbirdstudios:opencv-contrib:4.5.3.0")
+    
+    // Image Cropper for ROI selection
+    implementation("com.vanniktech:android-image-cropper:4.6.0")
     
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")

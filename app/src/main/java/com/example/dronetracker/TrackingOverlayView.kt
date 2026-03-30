@@ -23,6 +23,10 @@ class TrackingOverlayView @JvmOverloads constructor(
     private var userDrawnRect: RectF? = null
     // The rect continuously updated by the tracking algorithm
     private var trackedRect: RectF? = null
+    
+    // For anti-jitter smoothing on the box size
+    private var smoothedRect: RectF? = null
+    private val alpha = 0.2f // Smoothing factor (lower = smoother but slower size adaptation)
 
     var onBoxSelectedListener: ((RectF) -> Unit)? = null
 
@@ -102,11 +106,39 @@ class TrackingOverlayView @JvmOverloads constructor(
         // Draw the tracking box defined by the algorithm
         trackedRect?.let {
             canvas.drawRect(it, trackingPaint)
+            
+            // Draw Target Crosshair (HUD style)
+            val cx = it.centerX()
+            val cy = it.centerY()
+            val crossSize = 30f // Crosshair arm length
+            canvas.drawLine(cx - crossSize, cy, cx + crossSize, cy, trackingPaint)
+            canvas.drawLine(cx, cy - crossSize, cx, cy + crossSize, trackingPaint)
         }
     }
 
     fun updateTrackedObject(rect: RectF) {
-        trackedRect = rect
+        if (smoothedRect == null) {
+            smoothedRect = RectF(rect)
+        } else {
+            // Only apply EMA smoothing to the SIZE, not the POSITION.
+            // This completely eliminates "box breathing" jitter without introducing tracking lay/drag.
+            val currentCx = rect.centerX()
+            val currentCy = rect.centerY()
+            
+            val targetWidth = rect.width()
+            val targetHeight = rect.height()
+            val currentWidth = smoothedRect!!.width()
+            val currentHeight = smoothedRect!!.height()
+            
+            val smoothedWidth = alpha * targetWidth + (1 - alpha) * currentWidth
+            val smoothedHeight = alpha * targetHeight + (1 - alpha) * currentHeight
+            
+            smoothedRect!!.left = currentCx - smoothedWidth / 2f
+            smoothedRect!!.top = currentCy - smoothedHeight / 2f
+            smoothedRect!!.right = currentCx + smoothedWidth / 2f
+            smoothedRect!!.bottom = currentCy + smoothedHeight / 2f
+        }
+        trackedRect = smoothedRect
         // We can clear the user drawn rect since we assume algorithm took over
         userDrawnRect = null 
         postInvalidate()
@@ -116,6 +148,7 @@ class TrackingOverlayView @JvmOverloads constructor(
         isDrawing = false
         userDrawnRect = null
         trackedRect = null
+        smoothedRect = null
         postInvalidate()
     }
 }

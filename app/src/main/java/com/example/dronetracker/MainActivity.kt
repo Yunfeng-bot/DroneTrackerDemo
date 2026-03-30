@@ -6,7 +6,12 @@ import android.os.Bundle
 import android.util.Log
 import android.widget.Button
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import com.canhub.cropper.CropImageContract
+import com.canhub.cropper.CropImageContractOptions
+import com.canhub.cropper.CropImageOptions
+import com.canhub.cropper.CropImageView
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -22,10 +27,42 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var viewFinder: PreviewView
     private lateinit var overlayView: TrackingOverlayView
+    private lateinit var btnSelectImage: Button
     private lateinit var btnReset: Button
 
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var trackerAnalyzer: OpenCVTrackerAnalyzer
+
+    private val cropImageLauncher = registerForActivityResult(CropImageContract()) { result ->
+        if (result.isSuccessful) {
+            val uriContent = result.uriContent
+            uriContent?.let {
+                try {
+                    val inputStream = contentResolver.openInputStream(it)
+                    val bitmap = android.graphics.BitmapFactory.decodeStream(inputStream)
+                    trackerAnalyzer.setTemplateImage(bitmap)
+                    Toast.makeText(this, "目标截图加载成功！", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Log.e("MainActivity", "Failed to load cropped image", e)
+                    Toast.makeText(this, "加载裁剪图片失败", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private val selectImageLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let {
+            cropImageLauncher.launch(
+                CropImageContractOptions(
+                    uri = it,
+                    cropImageOptions = CropImageOptions(
+                        guidelines = CropImageView.Guidelines.ON,
+                        fixAspectRatio = false
+                    )
+                )
+            )
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -33,7 +70,11 @@ class MainActivity : AppCompatActivity() {
 
         viewFinder = findViewById(R.id.viewFinder)
         overlayView = findViewById(R.id.overlayView)
+        btnSelectImage = findViewById(R.id.btnSelectImage)
         btnReset = findViewById(R.id.btnReset)
+        
+        val btnClose = findViewById<android.widget.ImageButton>(R.id.btnClose)
+        btnClose.setOnClickListener { finish() }
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
@@ -51,6 +92,11 @@ class MainActivity : AppCompatActivity() {
         // When user draws a box on the view, pass it to the analyzer
         overlayView.onBoxSelectedListener = { rect ->
             trackerAnalyzer.setInitialTarget(rect, overlayView.width, overlayView.height)
+        }
+
+        btnSelectImage.setOnClickListener {
+            // Open photo picker
+            selectImageLauncher.launch("image/*")
         }
 
         btnReset.setOnClickListener {
