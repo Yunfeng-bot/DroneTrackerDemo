@@ -9,3 +9,5 @@
 .cxx
 local.properties
 /app/build/
+/.gradle-local/
+/tools/adb_args.json

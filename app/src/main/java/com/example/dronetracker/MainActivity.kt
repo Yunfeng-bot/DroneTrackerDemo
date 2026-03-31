@@ -46,6 +46,7 @@ class MainActivity : AppCompatActivity() {
     private var replayRunner: VideoReplayRunner? = null
     private var isReplayMode = false
     private var replayTargetPath: String? = null
+    private var replayTargetPaths: List<String> = emptyList()
     private var replayVideoPath: String? = null
     private var lastReplayBitmap: Bitmap? = null
 
@@ -64,8 +65,12 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, getString(R.string.toast_template_load_failed), Toast.LENGTH_SHORT).show()
                 return@onSuccess
             }
-            trackerAnalyzer.setTemplateImage(bitmap)
-            Toast.makeText(this, getString(R.string.toast_template_loaded), Toast.LENGTH_SHORT).show()
+            val ok = trackerAnalyzer.setTemplateImage(bitmap)
+            if (ok) {
+                Toast.makeText(this, getString(R.string.toast_template_loaded), Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "模板纹理过弱，请重新提供目标清晰照片", Toast.LENGTH_LONG).show()
+            }
         }.onFailure { e ->
             Log.e(TAG, "Failed to load cropped image", e)
             Toast.makeText(this, getString(R.string.toast_template_load_failed), Toast.LENGTH_SHORT).show()
@@ -157,11 +162,20 @@ class MainActivity : AppCompatActivity() {
         trackerAnalyzer.applyRuntimeOverrides(incomingIntent?.getStringExtra(EXTRA_EVAL_PARAMS))
         isReplayMode = incomingIntent?.getBooleanExtra(EXTRA_EVAL_USE_REPLAY, false) == true
         replayTargetPath = incomingIntent?.getStringExtra(EXTRA_EVAL_TARGET_PATH)
+        replayTargetPaths = parsePathList(incomingIntent?.getStringExtra(EXTRA_EVAL_TARGET_PATHS))
         replayVideoPath = incomingIntent?.getStringExtra(EXTRA_EVAL_VIDEO_PATH)
         requiredPermissions = buildRequiredPermissions()
 
         Log.i(TAG, "tracker mode=${trackerAnalyzer.currentTrackerMode()}")
-        Log.i(TAG, "replay mode=$isReplayMode target=$replayTargetPath video=$replayVideoPath")
+        Log.i(TAG, "replay mode=$isReplayMode target=$replayTargetPath targets=${replayTargetPaths.size} video=$replayVideoPath")
+    }
+
+    private fun parsePathList(raw: String?): List<String> {
+        if (raw.isNullOrBlank()) return emptyList()
+        return raw.split(';', ',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
     }
 
     private fun refreshUiByMode() {
@@ -214,10 +228,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startReplay() {
-        val targetPath = replayTargetPath?.takeIf { it.isNotBlank() } ?: DEFAULT_REPLAY_TARGET_PATH
-        if (!loadTemplateFromPath(targetPath)) {
+        val baseTarget = replayTargetPath?.takeIf { it.isNotBlank() } ?: DEFAULT_REPLAY_TARGET_PATH
+        val targets = LinkedHashSet<String>()
+        if (replayTargetPaths.isNotEmpty()) {
+            targets.addAll(replayTargetPaths)
+            // Auto-include common multi-view templates only when multi-template mode is explicitly requested.
+            val baseFile = File(baseTarget)
+            val parent = baseFile.parentFile
+            if (parent != null && parent.exists()) {
+                listOf("T1.jpg", "T2.jpg", "target_side.jpg", "target_alt.jpg").forEach { name ->
+                    val extra = File(parent, name)
+                    if (extra.exists()) targets += extra.absolutePath
+                }
+            }
+        } else {
+            targets += baseTarget
+        }
+
+        if (!loadTemplatesFromPaths(targets.toList())) {
             Toast.makeText(this, getString(R.string.toast_replay_target_missing), Toast.LENGTH_LONG).show()
-            Log.e(TAG, "Replay target is missing or unreadable: $targetPath")
+            Log.e(TAG, "Replay target is missing or unreadable: ${targets.joinToString(";")}")
             return
         }
 
@@ -260,14 +290,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadTemplateFromPath(path: String): Boolean {
-        val file = File(path)
-        if (!file.exists()) {
-            return false
-        }
+        return loadTemplatesFromPaths(listOf(path))
+    }
 
-        val bitmap = BitmapFactory.decodeFile(path) ?: return false
-        trackerAnalyzer.setTemplateImage(bitmap)
-        return true
+    private fun loadTemplatesFromPaths(paths: List<String>): Boolean {
+        val bitmaps = ArrayList<Bitmap>(paths.size)
+        try {
+            for (path in paths) {
+                val file = File(path)
+                if (!file.exists()) continue
+                val bitmap = BitmapFactory.decodeFile(path) ?: continue
+                bitmaps += bitmap
+            }
+            if (bitmaps.isEmpty()) return false
+
+            val ready = trackerAnalyzer.setTemplateImages(bitmaps)
+            if (!ready) {
+                Toast.makeText(this, "模板纹理过弱，请重新提供目标清晰照片", Toast.LENGTH_LONG).show()
+            }
+            return ready
+        } finally {
+            // release java-side pixel refs after OpenCV copies them into Mats
+            for (bitmap in bitmaps) {
+                if (!bitmap.isRecycled) bitmap.recycle()
+            }
+        }
     }
 
     private fun buildRequiredPermissions(): Array<String> {
@@ -329,6 +376,7 @@ class MainActivity : AppCompatActivity() {
         private const val EXTRA_TRACKER_MODE = "tracker_mode"
         private const val EXTRA_EVAL_USE_REPLAY = "eval_use_replay"
         private const val EXTRA_EVAL_TARGET_PATH = "eval_target_path"
+        private const val EXTRA_EVAL_TARGET_PATHS = "eval_target_paths"
         private const val EXTRA_EVAL_VIDEO_PATH = "eval_video_path"
         private const val EXTRA_EVAL_PARAMS = "eval_params"
         private const val DEFAULT_REPLAY_TARGET_PATH = "/sdcard/Download/Video_Search/target.jpg"
