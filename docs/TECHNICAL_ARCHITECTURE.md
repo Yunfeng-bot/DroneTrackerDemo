@@ -1,45 +1,85 @@
-# 核心技术架构文档 (Technical Architecture)
+﻿# 无人机单目标追踪技术方案（2026-04-13）
 
-本文档阐述本项目从“手机原型验证 (Phase 1)” 向“军工级边缘嵌入式落地 (Phase 2)” 演进时的底层基建设计与技术选型思考。
+## 1. 目标与范围
+本方案定义当前 Android 端单目标追踪系统从 MVP 走向工业化的技术底座，覆盖：
+- ORB SEARCH -> KCF TRACK 主链路的生产化约束
+- JNI/C++ Native Bridge 与后续 NCNN/RKNN 迁移接口
+- 离线回放评测闭环（EvaluationActivity + CSV + 自动分析）
 
-## 1. 为什么不用 YOLO + DeepSORT？(核心认知纠偏)
+不包含：飞控 PID 参数本身、云台控制器固件逻辑。
 
-在业界传统的工业安防中，`YOLO`（检测）+ `DeepSORT`（多目标跟踪匹配）是绝对主流，但**在本项目特定的“指谁飞谁”场景下属于严重的架构错配**。
-*   **YOLO的硬伤：** 需要极长的周期准备“车辆”标注数据集。如果场景变更为跟踪“快艇”，整个项目的模型必须打回原形重新训练、重新经历痛苦的 Int8 硬件量化过程。
-*   **我们的架构解法：SOT（单目标跟踪 / 单样本模板匹配）。** 算法抛弃“类别”这层概念，转为理解“这块像素的特征 DNA 是什么（颜色、梯度方向、边缘残影）”，并在下一帧去图像里寻找最相似的 DNA。做到真正的任意目标、开箱即用。
+## 2. 当前生产链路（已落地）
 
----
+### 2.1 搜索与追踪双状态机
+- SEARCH：ORB 多尺度模板匹配 + RANSAC + 时序确认
+- TRACK：KCF 高频跟踪
+- 自愈：KCF 失锁/漂移后回退 SEARCH
 
-## 2. Phase 1 技术架构拆解 (Android MVP - 当前仓库状态)
+核心原则：
+- 宁可漏检，不可误锁
+- 首锁必须经过时序稳定性确认
+- tracker 对象失效后必须重建，不复用污染状态
 
-这是基于纯数学相关滤波算法搭建的轻量级飞控验证系统。
+### 2.2 ORB 预算熔断（长尾治理）
+新增预算参数：
+- `orb_feature_cap`（别名：`orb_max_feature_cap` / `orb_budget`）
 
-### 2.1 管道层 (Pipeline)
-*   **选型：** Google `CameraX` (YUV_420_888 裸流直接提取)
-*   **优势：** 避开了 Android MediaCodec 的解压缩流程，直接拿到相机传感器的底层数据，延迟极低。
+策略：
+- 仅 SEARCH 主分支强制执行 cap，限制每帧进入匹配层的特征规模上限
+- TRACK_VERIFY/模板构建分支不强制 cap，避免误伤稳定跟踪
 
-### 2.2 算法引擎核心 (Tracker Engine)
-*   **选型：** OpenCV Java SDK -> 底层 C++ `TrackerKCF` / `TrackerCSRT`。
-*   **运行位置：** 纯 CPU（ARM架构）。
-*   **底层逻辑：** 基于给定的初始矩形框，提取其 HOG（方向梯度直方图）特征，使用循环矩阵傅里叶变换在后续帧中寻找最大响应峰值位置。
-*   **权衡：** 放弃了抗剧烈形变、抗全遮挡的能力，换来了在没有 NPU 的千元机上也能跑到近乎 60 FPS 的恐怖算力，从而让飞控程序的工程师可以无阻碍地测试云台跟随代码。
+默认值：
+- `DEFAULT_ORB_FEATURE_HARD_CAP = 700`
+- 可在高纹理场景试验下压到 500（需回放验证后再启用）
 
----
+### 2.3 Native 架构底座（已接入）
+- Kotlin/Java: `nativebridge/NativeTrackerBridge.kt`
+- JNI: `cpp/jni/NativeTrackerBridge.cpp`
+- HAL:
+  - `ITracker` 抽象接口
+  - `NcnnTrackerImpl`（当前 stub）
+  - `RknnTrackerImpl`（当前 stub）
+  - `NanoTrackerEngine` 单例管理
 
-## 3. Phase 2 军工级演进架构 (Rockchip Linux 目标架构)
+目标：上层调用稳定、下层后端可热切换，不破坏业务接口。
 
-这是在拿到投资、完成飞控闭环逻辑后，要在纯嵌入式硬件上重写的终极 C++ 形态。完全推翻 Phase 1 的技术栈，但保留一切外部飞控对接接口。
+### 2.4 离线评测基础设施（已接入）
+- Activity：`EvaluationActivity`
+- 输出：每帧 CSV
+  - `frame_id, latency_ms, predicted_x, predicted_y, predicted_w, predicted_h, confidence_score`
+- 分析脚本：`tools/auto_tune/analyze_eval_csv.py`
 
-### 3.1 视频摄取流管道 (GStreamer 终极管道)
-*   为了接收真实无人机天空端发来的网络流，彻底摒弃 CameraX 和 OpenCV 去读取视频树。
-*   采用 `GStreamer` 工业标准管道。
-*   **硬件榨干：** 修改 GStreamer 管道字符串参数，强制将 H.264/H.265 的解码任务交由瑞芯微内置的 **VPU (Video Process Unit / MPP框架)** 也就是硬件看片模块处理，把 CPU 的负载占有率强行压到 `1% - 5%`。
+## 3. 关键参数与推荐基线（BASELINE_v1）
+当前推荐基线（回放验证表现最优）：
+- `search_max_long_edge=480`
+- `search_short_edge=480`
+- `orb_features=700`
+- `orb_feature_cap=700`（默认）
 
-### 3.2 孪生网络单目标深层追踪 (SiamRPN++ NPU落地)
-*   将 KCF 纯数学算法替换为具有上下文深层联想能力的孪生神经网络（如 SiamRPN++ 或 SiamMask）。
-*   **特征金字塔比对：** 拥有两条路线，一条死记硬背第一帧的“通缉令”，另一条实时流水线处理每一帧镜头，通过深度卷积层算出两者的最大相似度锚框。
-*   **极致的硬件加速 (RKNN)：** SiamRPN++ 是重型深度网络。我们将利用瑞芯微独有的 **RKNN-Toolkit** 工具包，在出厂前执行最后一次离线的 **Int8 非对称量化 (PTQ)**。
-*   将最终的 `.rknn` 文件固化到边缘设备中，利用瑞芯微强大的内置 NPU (算力高达 6 TOPS) 去跑这个厚重的孪生网络。即使是大树遮挡、目标半身隐入暗处，NPU 也能通过网络联想强行抠出目标。
+说明：
+- 420 档实测退化（召回与稳定性下降）
+- cap=500 会明显伤首锁与跟踪占比，仅可作为场景化兜底策略
 
-### 4. 演进路线总结
-`Android + CameraX + OpenCV KCF` $\xrightarrow{\text{提供完美飞控闭环 Demo}}$ 融资 $\xrightarrow{\text{重写底层}}$ `RK3588 Linux + GStreamer VPU硬解 + SiamRPN++ NPU加速`
+## 4. 已验证结论（回放）
+代表性结果：
+- 历史较优：`first_lock_sec=0.40`, `avg_latency=22.94ms`, `track_like_ratio=0.7869`
+- 过激 cap（500）会导致首锁变慢和跟踪占比下降
+
+结论：
+- 当前阶段优先稳态：采用 480 + 700 cap 基线
+- 继续通过离线回放做小步参数搜索
+
+## 5. 下一阶段架构演进
+
+### P0（当前迭代）
+- 保持 ORB/KCF 主链路
+- 继续压缩 P95 尾延迟（预算熔断 + 限频）
+- 固化自动评测评分口径
+
+### P1（下一阶段）
+- 将 NCNN 后端从 stub 变为可运行推理路径
+- 在同一评测基线上 A/B 对比 OpenCV 与 NCNN
+
+### P2（量产预研）
+- RKNN 后端接入
+- 保持同一 HAL 接口，不改上层业务状态机
