@@ -74,6 +74,28 @@ class OpenCVTrackerAnalyzer(
         val detail: String
     )
 
+    private data class MatchThresholds(
+        val minGoodMatches: Int,
+        val minInliers: Int
+    )
+
+    private data class SoftGateThresholds(
+        val minGoodMatches: Int,
+        val minInliers: Int,
+        val relaxed: Boolean
+    )
+
+    private data class WeakFallbackStats(
+        val spanX: Double,
+        val spanY: Double,
+        val area: Double
+    )
+
+    private data class KnnPair(
+        val first: DMatch,
+        val second: DMatch
+    )
+
     private data class ClusterEstimate(
         val center: Point,
         val sideOriginal: Int
@@ -139,8 +161,29 @@ class OpenCVTrackerAnalyzer(
     private var metricsFirstLockMs = -1L
     private var metricsCurrentTrackingStreak = 0
     private var metricsMaxTrackingStreak = 0
+    private var metricsSearchCandidateCount = 0
+    private var metricsSearchMissCount = 0
+    private var metricsSearchTemplateSkipCount = 0
+    private var metricsSearchTemporalRejectCount = 0
+    private var metricsSearchPromoteRejectCount = 0
+    private var metricsSearchRefinePassCount = 0
+    private var metricsSearchRefineRejectCount = 0
+    private var metricsSearchStableSeedCount = 0
+    private var metricsSearchStableAccumCount = 0
+    private var metricsSearchPromoteCount = 0
+    private var metricsSearchStableOutlierHoldCount = 0
+    private var metricsSearchTemporalHoldCount = 0
+    private var metricsSearchResetNoSeedCount = 0
+    private var metricsSearchResetGapCount = 0
+    private var metricsSearchResetStableDriftCount = 0
+    private var metricsSearchResetCenterRuleCount = 0
+    private var metricsSearchResetIouCount = 0
+    private var metricsSearchLastReason = "none"
 
     private var orbMaxFeatures = DEFAULT_ORB_FEATURES
+    private var orbScaleFactor = DEFAULT_ORB_SCALE_FACTOR
+    private var orbNLevels = DEFAULT_ORB_N_LEVELS
+    private var orbFastThreshold = DEFAULT_ORB_FAST_THRESHOLD
     private var orbLoweRatio = DEFAULT_ORB_LOWE_RATIO
     private var orbMinGoodMatches = DEFAULT_ORB_MIN_GOOD_MATCHES
     private var orbMinInliers = DEFAULT_ORB_MIN_INLIERS
@@ -154,7 +197,10 @@ class OpenCVTrackerAnalyzer(
     private var searchHighResShortEdge = DEFAULT_SEARCH_HIGH_RES_SHORT_EDGE
     private var searchUltraHighResMissStreak = DEFAULT_SEARCH_ULTRA_HIGH_RES_MISS_STREAK
     private var searchUltraHighResShortEdge = DEFAULT_SEARCH_ULTRA_HIGH_RES_SHORT_EDGE
+    private var searchMaxLongEdge = DEFAULT_SEARCH_MAX_LONG_EDGE
+    private var searchMultiTemplateMaxLongEdge = DEFAULT_SEARCH_MULTI_TEMPLATE_MAX_LONG_EDGE
     private var initBoxSize = DEFAULT_INIT_BOX_SIZE
+    private var fallbackMinBoxSize = DEFAULT_FALLBACK_MIN_BOX_SIZE
     private var fallbackMaxBoxSize = DEFAULT_FALLBACK_MAX_BOX_SIZE
     private var homographyMaxDistortion = DEFAULT_HOMOGRAPHY_MAX_DISTORTION
     private var homographyScaleMin = DEFAULT_HOMOGRAPHY_SCALE_MIN
@@ -162,6 +208,7 @@ class OpenCVTrackerAnalyzer(
     private var homographyMinJacobianDet = DEFAULT_HOMOGRAPHY_MIN_JACOBIAN_DET
     private var templateMinTextureScore = DEFAULT_TEMPLATE_MIN_TEXTURE_SCORE
     private var orbFarBoostFeatures = DEFAULT_ORB_FAR_BOOST_FEATURES
+    private var orbFarBoostMultiTemplateCap = DEFAULT_ORB_FAR_BOOST_MULTI_TEMPLATE_CAP
 
     private var kcfMaxFailStreak = DEFAULT_KCF_MAX_FAIL_STREAK
     private var forceTrackerGcOnDrop = DEFAULT_FORCE_TRACKER_GC_ON_DROP
@@ -185,11 +232,41 @@ class OpenCVTrackerAnalyzer(
     private var firstLockStablePx = DEFAULT_FIRST_LOCK_STABLE_PX
     private var firstLockMinIou = DEFAULT_FIRST_LOCK_MIN_IOU
     private var firstLockGapMs = DEFAULT_FIRST_LOCK_GAP_MS
+    private var firstLockSmallCenterDriftPx = DEFAULT_FIRST_LOCK_SMALL_CENTER_DRIFT_PX
+    private var firstLockSmallCenterDriftRelaxedPx = DEFAULT_FIRST_LOCK_SMALL_CENTER_DRIFT_RELAXED_PX
+    private var firstLockSmallStablePx = DEFAULT_FIRST_LOCK_SMALL_STABLE_PX
+    private var firstLockSmallRelaxMissStreak = DEFAULT_FIRST_LOCK_SMALL_RELAX_MISS_STREAK
+    private var firstLockSmallDynamicCenterFactor = DEFAULT_FIRST_LOCK_SMALL_DYNAMIC_CENTER_FACTOR
+    private var firstLockSmallRelaxedIouFloor = DEFAULT_FIRST_LOCK_SMALL_RELAXED_IOU_FLOOR
+    private var firstLockHoldOnTemporalReject = DEFAULT_FIRST_LOCK_HOLD_ON_TEMPORAL_REJECT
+    private var firstLockOutlierHoldMax = DEFAULT_FIRST_LOCK_OUTLIER_HOLD_MAX
     private var allowFallbackLock = DEFAULT_ALLOW_FALLBACK_LOCK
     private var fallbackRefineExpandFactor = DEFAULT_FALLBACK_REFINE_EXPAND_FACTOR
     private var fallbackRefineMinGoodMatches = DEFAULT_FALLBACK_REFINE_MIN_GOOD_MATCHES
     private var fallbackRefineMinInliers = DEFAULT_FALLBACK_REFINE_MIN_INLIERS
     private var fallbackRefineMinConfidence = DEFAULT_FALLBACK_REFINE_MIN_CONFIDENCE
+    private var fallbackRefineLoweRatio = DEFAULT_FALLBACK_REFINE_LOWE_RATIO
+    private var smallTargetAreaRatio = DEFAULT_SMALL_TARGET_AREA_RATIO
+    private var smallTargetMinGoodMatches = DEFAULT_SMALL_TARGET_MIN_GOOD_MATCHES
+    private var smallTargetMinInliers = DEFAULT_SMALL_TARGET_MIN_INLIERS
+    private var smallTargetScaleThreshold = DEFAULT_SMALL_TARGET_SCALE_THRESHOLD
+    private var weakFallbackMaxMatches = DEFAULT_WEAK_FALLBACK_MAX_MATCHES
+    private var weakFallbackMaxSpanPx = DEFAULT_WEAK_FALLBACK_MAX_SPAN_PX
+    private var weakFallbackMaxAreaPx = DEFAULT_WEAK_FALLBACK_MAX_AREA_PX
+    private var weakFallbackRequireRefine = DEFAULT_WEAK_FALLBACK_REQUIRE_REFINE
+    private var weakFallbackRescueEnabled = DEFAULT_WEAK_FALLBACK_RESCUE_ENABLED
+    private var weakFallbackRescueRatio = DEFAULT_WEAK_FALLBACK_RESCUE_RATIO
+    private var weakFallbackRescueMinGood = DEFAULT_WEAK_FALLBACK_RESCUE_MIN_GOOD
+    private var weakFallbackRelaxMissStreak = DEFAULT_WEAK_FALLBACK_RELAX_MISS_STREAK
+    private var weakFallbackRelaxFactor = DEFAULT_WEAK_FALLBACK_RELAX_FACTOR
+    private var weakFallbackCoreRescueEnabled = DEFAULT_WEAK_FALLBACK_CORE_RESCUE_ENABLED
+    private var weakFallbackCoreMaxSpanPx = DEFAULT_WEAK_FALLBACK_CORE_MAX_SPAN_PX
+    private var weakFallbackCoreMaxAreaPx = DEFAULT_WEAK_FALLBACK_CORE_MAX_AREA_PX
+    private var softRelaxEnabled = DEFAULT_SOFT_RELAX_ENABLED
+    private var softRelaxMissStreak = DEFAULT_SOFT_RELAX_MISS_STREAK
+    private var softRelaxMinGoodMatches = DEFAULT_SOFT_RELAX_MIN_GOOD_MATCHES
+    private var softRelaxScaleThreshold = DEFAULT_SOFT_RELAX_SCALE_THRESHOLD
+    private var softRelaxMaxRatio = DEFAULT_SOFT_RELAX_MAX_RATIO
     private var firstLockCandidateBox: Rect? = null
     private var firstLockCandidateCenter = Point(0.0, 0.0)
     private var firstLockCandidateFrames = 0
@@ -197,6 +274,8 @@ class OpenCVTrackerAnalyzer(
     private var firstLockCandidateLastMs = 0L
     private var firstLockCandidateBestGood = 0
     private var firstLockCandidateBestInliers = 0
+    private var firstLockOutlierHoldStreak = 0
+    private var lastSearchDiagReason = "none"
 
     fun setTrackerMode(mode: String?) {
         trackerMode = when (mode?.trim()?.lowercase(Locale.US)) {
@@ -212,7 +291,7 @@ class OpenCVTrackerAnalyzer(
 
     fun applyRuntimeOverrides(raw: String?) {
         if (raw.isNullOrBlank()) {
-            orb.setMaxFeatures(orbMaxFeatures)
+            configureOrbDetector(orbMaxFeatures)
             logEffectiveParams("default")
             return
         }
@@ -233,10 +312,22 @@ class OpenCVTrackerAnalyzer(
                     orbMaxFeatures = it.coerceIn(200, 2500)
                     shouldRefreshTemplate = true
                 }
+                "orb_scale_factor" -> value.toDoubleOrNull()?.let {
+                    orbScaleFactor = it.coerceIn(1.01, 1.40)
+                    shouldRefreshTemplate = true
+                }
+                "orb_nlevels" -> value.toIntOrNull()?.let {
+                    orbNLevels = it.coerceIn(4, 24)
+                    shouldRefreshTemplate = true
+                }
+                "orb_fast_threshold" -> value.toIntOrNull()?.let {
+                    orbFastThreshold = it.coerceIn(4, 60)
+                    shouldRefreshTemplate = true
+                }
                 "orb_ratio" -> value.toDoubleOrNull()?.let { orbLoweRatio = it.coerceIn(0.50, 0.95) }
                 "orb_min_matches" -> value.toIntOrNull()?.let { orbMinGoodMatches = it.coerceIn(8, 400) }
                 "orb_min_inliers", "min_match_count" -> value.toIntOrNull()?.let { orbMinInliers = it.coerceIn(8, 300) }
-                "orb_soft_min_matches" -> value.toIntOrNull()?.let { orbSoftMinGoodMatches = it.coerceIn(4, 300) }
+                "orb_soft_min_matches" -> value.toIntOrNull()?.let { orbSoftMinGoodMatches = it.coerceIn(3, 300) }
                 "orb_soft_min_inliers" -> value.toIntOrNull()?.let { orbSoftMinInliers = it.coerceIn(3, 200) }
                 "orb_ransac" -> value.toDoubleOrNull()?.let { orbRansacThreshold = it.coerceIn(1.0, 12.0) }
                 "search_short_edge" -> value.toIntOrNull()?.let { searchShortEdge = it.coerceIn(240, 720) }
@@ -244,8 +335,11 @@ class OpenCVTrackerAnalyzer(
                 "search_high_res_short_edge" -> value.toIntOrNull()?.let { searchHighResShortEdge = it.coerceIn(360, 960) }
                 "search_ultra_high_res_miss" -> value.toIntOrNull()?.let { searchUltraHighResMissStreak = it.coerceIn(8, 600) }
                 "search_ultra_high_res_short_edge" -> value.toIntOrNull()?.let { searchUltraHighResShortEdge = it.coerceIn(480, 1400) }
+                "search_max_long_edge" -> value.toIntOrNull()?.let { searchMaxLongEdge = it.coerceIn(320, 1400) }
+                "search_multi_max_long_edge" -> value.toIntOrNull()?.let { searchMultiTemplateMaxLongEdge = it.coerceIn(320, 1200) }
                 "init_box" -> value.toIntOrNull()?.let { initBoxSize = it.coerceIn(48, 360) }
-                "fallback_box_max" -> value.toIntOrNull()?.let { fallbackMaxBoxSize = it.coerceIn(100, 420) }
+                "fallback_box_min" -> value.toIntOrNull()?.let { fallbackMinBoxSize = it.coerceIn(32, 240) }
+                "fallback_box_max" -> value.toIntOrNull()?.let { fallbackMaxBoxSize = it.coerceIn(64, 420) }
                 "homography_distortion" -> value.toDoubleOrNull()?.let { homographyMaxDistortion = it.coerceIn(0.05, 0.60) }
                 "homography_scale_min" -> value.toDoubleOrNull()?.let { homographyScaleMin = it.coerceIn(0.40, 2.0) }
                 "homography_scale_max" -> value.toDoubleOrNull()?.let { homographyScaleMax = it.coerceIn(0.60, 3.0) }
@@ -253,16 +347,50 @@ class OpenCVTrackerAnalyzer(
                 "template_min_texture" -> value.toDoubleOrNull()?.let { templateMinTextureScore = it.coerceIn(0.0, 200.0) }
                 "orb_clahe" -> parseBoolean(value)?.let { orbUseClahe = it }
                 "orb_far_features" -> value.toIntOrNull()?.let { orbFarBoostFeatures = it.coerceIn(700, 2800) }
-                "first_lock_stable_frames" -> value.toIntOrNull()?.let { firstLockStableFrames = it.coerceIn(3, 90) }
+                "orb_far_features_multi_cap" -> value.toIntOrNull()?.let { orbFarBoostMultiTemplateCap = it.coerceIn(600, 2600) }
+                "first_lock_stable_frames" -> value.toIntOrNull()?.let { firstLockStableFrames = it.coerceIn(1, 90) }
                 "first_lock_stable_ms" -> value.toLongOrNull()?.let { firstLockStableMs = it.coerceIn(120L, 3_500L) }
                 "first_lock_stable_px" -> value.toDoubleOrNull()?.let { firstLockStablePx = it.coerceIn(8.0, 240.0) }
                 "first_lock_min_iou" -> value.toDoubleOrNull()?.let { firstLockMinIou = it.coerceIn(0.40, 0.98) }
                 "first_lock_gap_ms" -> value.toLongOrNull()?.let { firstLockGapMs = it.coerceIn(80L, 1_200L) }
+                "first_lock_small_center_px" -> value.toDoubleOrNull()?.let { firstLockSmallCenterDriftPx = it.coerceIn(8.0, 120.0) }
+                "first_lock_small_center_relaxed_px" ->
+                    value.toDoubleOrNull()?.let { firstLockSmallCenterDriftRelaxedPx = it.coerceIn(12.0, 200.0) }
+                "first_lock_small_stable_px" -> value.toDoubleOrNull()?.let { firstLockSmallStablePx = it.coerceIn(16.0, 260.0) }
+                "first_lock_small_relax_miss" -> value.toIntOrNull()?.let { firstLockSmallRelaxMissStreak = it.coerceIn(2, 300) }
+                "first_lock_small_dynamic_factor" ->
+                    value.toDoubleOrNull()?.let { firstLockSmallDynamicCenterFactor = it.coerceIn(0.30, 2.20) }
+                "first_lock_small_relaxed_iou" ->
+                    value.toDoubleOrNull()?.let { firstLockSmallRelaxedIouFloor = it.coerceIn(0.0, 0.60) }
+                "first_lock_temporal_hold" -> parseBoolean(value)?.let { firstLockHoldOnTemporalReject = it }
+                "first_lock_outlier_hold_max" -> value.toIntOrNull()?.let { firstLockOutlierHoldMax = it.coerceIn(1, 30) }
                 "allow_fallback_lock" -> parseBoolean(value)?.let { allowFallbackLock = it }
                 "fallback_refine_expand" -> value.toDoubleOrNull()?.let { fallbackRefineExpandFactor = it.coerceIn(1.1, 3.0) }
                 "fallback_refine_min_good" -> value.toIntOrNull()?.let { fallbackRefineMinGoodMatches = it.coerceIn(4, 120) }
                 "fallback_refine_min_inliers" -> value.toIntOrNull()?.let { fallbackRefineMinInliers = it.coerceIn(3, 80) }
                 "fallback_refine_min_conf" -> value.toDoubleOrNull()?.let { fallbackRefineMinConfidence = it.coerceIn(0.0, 1.0) }
+                "fallback_refine_ratio" -> value.toDoubleOrNull()?.let { fallbackRefineLoweRatio = it.coerceIn(0.60, 0.95) }
+                "small_target_area_ratio" -> value.toDoubleOrNull()?.let { smallTargetAreaRatio = it.coerceIn(0.005, 0.20) }
+                "small_target_min_good" -> value.toIntOrNull()?.let { smallTargetMinGoodMatches = it.coerceIn(4, 120) }
+                "small_target_min_inliers" -> value.toIntOrNull()?.let { smallTargetMinInliers = it.coerceIn(3, 80) }
+                "small_target_scale" -> value.toDoubleOrNull()?.let { smallTargetScaleThreshold = it.coerceIn(0.30, 0.95) }
+                "weak_fallback_max_matches" -> value.toIntOrNull()?.let { weakFallbackMaxMatches = it.coerceIn(4, 12) }
+                "weak_fallback_max_span" -> value.toDoubleOrNull()?.let { weakFallbackMaxSpanPx = it.coerceIn(32.0, 280.0) }
+                "weak_fallback_max_area" -> value.toDoubleOrNull()?.let { weakFallbackMaxAreaPx = it.coerceIn(1_024.0, 80_000.0) }
+                "weak_fallback_relax_miss" -> value.toIntOrNull()?.let { weakFallbackRelaxMissStreak = it.coerceIn(2, 300) }
+                "weak_fallback_relax_factor" -> value.toDoubleOrNull()?.let { weakFallbackRelaxFactor = it.coerceIn(1.0, 2.0) }
+                "weak_fallback_require_refine" -> parseBoolean(value)?.let { weakFallbackRequireRefine = it }
+                "weak_fallback_rescue" -> parseBoolean(value)?.let { weakFallbackRescueEnabled = it }
+                "weak_fallback_rescue_ratio" -> value.toDoubleOrNull()?.let { weakFallbackRescueRatio = it.coerceIn(0.55, 0.90) }
+                "weak_fallback_rescue_min_good" -> value.toIntOrNull()?.let { weakFallbackRescueMinGood = it.coerceIn(3, 12) }
+                "weak_fallback_core_rescue" -> parseBoolean(value)?.let { weakFallbackCoreRescueEnabled = it }
+                "weak_fallback_core_max_span" -> value.toDoubleOrNull()?.let { weakFallbackCoreMaxSpanPx = it.coerceIn(24.0, 220.0) }
+                "weak_fallback_core_max_area" -> value.toDoubleOrNull()?.let { weakFallbackCoreMaxAreaPx = it.coerceIn(400.0, 20_000.0) }
+                "soft_relax_enable" -> parseBoolean(value)?.let { softRelaxEnabled = it }
+                "soft_relax_miss" -> value.toIntOrNull()?.let { softRelaxMissStreak = it.coerceIn(4, 600) }
+                "soft_relax_min_good" -> value.toIntOrNull()?.let { softRelaxMinGoodMatches = it.coerceIn(3, 12) }
+                "soft_relax_scale" -> value.toDoubleOrNull()?.let { softRelaxScaleThreshold = it.coerceIn(0.30, 0.98) }
+                "soft_relax_max_ratio" -> value.toDoubleOrNull()?.let { softRelaxMaxRatio = it.coerceIn(0.55, 0.90) }
                 "track_verify_interval" -> value.toIntOrNull()?.let { trackVerifyIntervalFrames = it.coerceIn(4, 120) }
                 "track_verify_global_interval" -> value.toIntOrNull()?.let { trackVerifyGlobalIntervalFrames = it.coerceIn(10, 300) }
                 "track_verify_expand" -> value.toDoubleOrNull()?.let { trackVerifyLocalExpandFactor = it.coerceIn(1.2, 4.0) }
@@ -294,15 +422,35 @@ class OpenCVTrackerAnalyzer(
         if (searchUltraHighResMissStreak < searchHighResMissStreak) {
             searchUltraHighResMissStreak = searchHighResMissStreak
         }
+        if (searchMultiTemplateMaxLongEdge > searchMaxLongEdge) {
+            searchMultiTemplateMaxLongEdge = searchMaxLongEdge
+        }
+        if (fallbackMaxBoxSize < fallbackMinBoxSize) {
+            fallbackMaxBoxSize = fallbackMinBoxSize
+        }
         if (trackVerifyGlobalIntervalFrames < trackVerifyIntervalFrames) {
             trackVerifyGlobalIntervalFrames = trackVerifyIntervalFrames
         }
-        orbSoftMinGoodMatches = orbSoftMinGoodMatches.coerceAtMost(orbMinGoodMatches).coerceAtLeast(4)
+        if (firstLockSmallCenterDriftRelaxedPx < firstLockSmallCenterDriftPx) {
+            firstLockSmallCenterDriftRelaxedPx = firstLockSmallCenterDriftPx
+        }
+        firstLockSmallDynamicCenterFactor = firstLockSmallDynamicCenterFactor.coerceAtLeast(0.30)
+        firstLockSmallRelaxedIouFloor = firstLockSmallRelaxedIouFloor.coerceIn(0.0, 0.60)
+        firstLockOutlierHoldMax = firstLockOutlierHoldMax.coerceIn(1, 30)
+        orbSoftMinGoodMatches = orbSoftMinGoodMatches.coerceAtMost(orbMinGoodMatches).coerceAtLeast(3)
         orbSoftMinInliers = orbSoftMinInliers.coerceAtMost(orbMinInliers).coerceAtLeast(3)
         trackVerifyMinInliers = trackVerifyMinInliers.coerceAtMost(trackVerifyMinGoodMatches).coerceAtLeast(3)
         fallbackRefineMinInliers = fallbackRefineMinInliers.coerceAtMost(fallbackRefineMinGoodMatches).coerceAtLeast(3)
+        smallTargetMinInliers = smallTargetMinInliers.coerceAtMost(smallTargetMinGoodMatches).coerceAtLeast(3)
+        fallbackRefineLoweRatio = fallbackRefineLoweRatio.coerceAtLeast(orbLoweRatio)
+        weakFallbackRescueMinGood = weakFallbackRescueMinGood.coerceAtLeast(orbSoftMinGoodMatches)
+        weakFallbackRelaxFactor = weakFallbackRelaxFactor.coerceAtLeast(1.0)
+        weakFallbackCoreMaxSpanPx = weakFallbackCoreMaxSpanPx.coerceAtMost(weakFallbackMaxSpanPx)
+        weakFallbackCoreMaxAreaPx = weakFallbackCoreMaxAreaPx.coerceAtMost(weakFallbackMaxAreaPx)
+        softRelaxMinGoodMatches = softRelaxMinGoodMatches.coerceAtMost(orbSoftMinGoodMatches).coerceAtLeast(3)
+        softRelaxMaxRatio = softRelaxMaxRatio.coerceAtMost(orbLoweRatio).coerceAtLeast(0.55)
 
-        orb.setMaxFeatures(orbMaxFeatures)
+        configureOrbDetector(orbMaxFeatures)
         if (shouldRefreshTemplate && templateSourceGrays.isNotEmpty()) {
             rebuildTemplatePyramid(templateSourceGrays)
         }
@@ -317,22 +465,52 @@ class OpenCVTrackerAnalyzer(
         }
     }
 
+    private fun configureOrbDetector(maxFeatures: Int) {
+        orb.setMaxFeatures(maxFeatures)
+        orb.setScaleFactor(orbScaleFactor)
+        orb.setNLevels(orbNLevels)
+        orb.setFastThreshold(orbFastThreshold)
+    }
+
     private fun logEffectiveParams(source: String) {
         Log.w(
             TAG,
             "EVAL_EVENT type=PARAMS source=$source mode=${trackerMode.name.lowercase(Locale.US)} " +
                 "orbFeatures=$orbMaxFeatures ratio=${fmt(orbLoweRatio)} minMatches=$orbMinGoodMatches minInliers=$orbMinInliers " +
+                "orbScale=${fmt(orbScaleFactor)} orbLevels=$orbNLevels orbFast=$orbFastThreshold " +
                 "softMatches=$orbSoftMinGoodMatches softInliers=$orbSoftMinInliers ransac=${fmt(orbRansacThreshold)} " +
                 "searchShort=$searchShortEdge searchHiMiss=$searchHighResMissStreak searchHiShort=$searchHighResShortEdge " +
                 "searchUltraMiss=$searchUltraHighResMissStreak searchUltraShort=$searchUltraHighResShortEdge " +
-                "initBox=$initBoxSize fallbackMax=$fallbackMaxBoxSize " +
+                "searchMaxLong=$searchMaxLongEdge searchMultiMaxLong=$searchMultiTemplateMaxLongEdge " +
+                "initBox=$initBoxSize fallbackMin=$fallbackMinBoxSize fallbackMax=$fallbackMaxBoxSize " +
                 "hDist=${fmt(homographyMaxDistortion)} hScaleMin=${fmt(homographyScaleMin)} hScaleMax=${fmt(homographyScaleMax)} " +
                 "hDet=${fmt(homographyMinJacobianDet)} tplTextureMin=${fmt(templateMinTextureScore)} clahe=$orbUseClahe " +
-                "farBoostFeatures=$orbFarBoostFeatures " +
+                "farBoostFeatures=$orbFarBoostFeatures farBoostMultiCap=$orbFarBoostMultiTemplateCap " +
                 "firstLockFrames=$firstLockStableFrames firstLockMs=$firstLockStableMs firstLockPx=${fmt(firstLockStablePx)} " +
                 "firstLockIou=${fmt(firstLockMinIou)} allowFallbackLock=$allowFallbackLock " +
+                "firstLockSmallCenter=${fmt(firstLockSmallCenterDriftPx)} " +
+                "firstLockSmallCenterRelax=${fmt(firstLockSmallCenterDriftRelaxedPx)} " +
+                "firstLockSmallStable=${fmt(firstLockSmallStablePx)} firstLockSmallRelaxMiss=$firstLockSmallRelaxMissStreak " +
+                "firstLockSmallDyn=${fmt(firstLockSmallDynamicCenterFactor)} " +
+                "firstLockSmallRelaxIou=${fmt(firstLockSmallRelaxedIouFloor)} " +
+                "firstLockTemporalHold=$firstLockHoldOnTemporalReject " +
+                "firstLockOutlierHoldMax=$firstLockOutlierHoldMax " +
                 "fallbackRefineExpand=${fmt(fallbackRefineExpandFactor)} fallbackRefineGood=$fallbackRefineMinGoodMatches " +
                 "fallbackRefineInliers=$fallbackRefineMinInliers fallbackRefineConf=${fmt(fallbackRefineMinConfidence)} " +
+                "fallbackRefineRatio=${fmt(fallbackRefineLoweRatio)} " +
+                "smallArea=${fmt(smallTargetAreaRatio)} smallGood=$smallTargetMinGoodMatches " +
+                "smallInliers=$smallTargetMinInliers smallScale=${fmt(smallTargetScaleThreshold)} " +
+                "weakFallbackMaxMatches=$weakFallbackMaxMatches weakFallbackMaxSpan=${fmt(weakFallbackMaxSpanPx)} " +
+                "weakFallbackMaxArea=${fmt(weakFallbackMaxAreaPx)} weakFallbackRequireRefine=$weakFallbackRequireRefine " +
+                "weakFallbackRescue=$weakFallbackRescueEnabled weakFallbackRescueRatio=${fmt(weakFallbackRescueRatio)} " +
+                "weakFallbackRescueGood=$weakFallbackRescueMinGood " +
+                "weakFallbackRelaxMiss=$weakFallbackRelaxMissStreak weakFallbackRelaxFactor=${fmt(weakFallbackRelaxFactor)} " +
+                "weakFallbackCoreRescue=$weakFallbackCoreRescueEnabled " +
+                "weakFallbackCoreSpan=${fmt(weakFallbackCoreMaxSpanPx)} " +
+                "weakFallbackCoreArea=${fmt(weakFallbackCoreMaxAreaPx)} " +
+                "softRelaxEnable=$softRelaxEnabled softRelaxMiss=$softRelaxMissStreak " +
+                "softRelaxGood=$softRelaxMinGoodMatches softRelaxScale=${fmt(softRelaxScaleThreshold)} " +
+                "softRelaxRatio=${fmt(softRelaxMaxRatio)} " +
                 "firstLockGapMs=$firstLockGapMs verifyInt=$trackVerifyIntervalFrames verifyGlobal=$trackVerifyGlobalIntervalFrames " +
                 "verifyExpand=${fmt(trackVerifyLocalExpandFactor)} verifyGood=$trackVerifyMinGoodMatches " +
                 "verifyInliers=$trackVerifyMinInliers verifyTol=$trackVerifyFailTolerance verifyHardTol=$trackVerifyHardDriftTolerance " +
@@ -515,7 +693,7 @@ class OpenCVTrackerAnalyzer(
             } else {
                 grayScaled.copyTo(enhanced)
             }
-            orb.setMaxFeatures(max(orbMaxFeatures, orbFarBoostFeatures))
+            configureOrbDetector(max(orbMaxFeatures, orbFarBoostFeatures))
             orb.detectAndCompute(enhanced, mask, keypoints, descriptors, false)
             if (descriptors.empty()) return null
 
@@ -664,6 +842,8 @@ class OpenCVTrackerAnalyzer(
     private fun searchFrameByOrb(frame: Mat) {
         val templateReady = lastTemplateReadyState && templatePyramidLevels.isNotEmpty()
         if (!templateReady) {
+            metricsSearchTemplateSkipCount++
+            metricsSearchLastReason = "template_not_ready"
             if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
                 Log.w(
                     TAG,
@@ -679,15 +859,28 @@ class OpenCVTrackerAnalyzer(
 
         val candidate = findOrbMatch(frame)
         if (candidate == null) {
+            metricsSearchMissCount++
+            metricsSearchLastReason = lastSearchDiagReason
             searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
             expireFirstLockCandidateIfNeeded()
             return
         }
+        metricsSearchCandidateCount++
+        metricsSearchLastReason = "candidate"
         val confirmed = maybeRefineFallbackCandidate(frame, candidate)
 
         if (!isCandidateEligibleForTemporal(confirmed)) {
+            metricsSearchTemporalRejectCount++
             searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
-            clearFirstLockCandidate("candidate_not_lockable")
+            if (firstLockHoldOnTemporalReject && firstLockCandidateFrames > 0) {
+                metricsSearchTemporalHoldCount++
+                metricsSearchLastReason = "temporal_reject_hold"
+                firstLockCandidateLastMs = SystemClock.elapsedRealtime()
+                expireFirstLockCandidateIfNeeded()
+            } else {
+                metricsSearchLastReason = "temporal_reject"
+                clearFirstLockCandidate("candidate_not_lockable")
+            }
             if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
                 Log.w(
                     TAG,
@@ -707,7 +900,9 @@ class OpenCVTrackerAnalyzer(
         }
         val promoted = accumulateFirstLockCandidate(confirmed, frame.cols(), frame.rows())
         if (promoted != null) {
-            if (!isCandidateLockableForInit(promoted)) {
+            if (!isCandidateLockableForInit(promoted, frame.cols(), frame.rows())) {
+                metricsSearchPromoteRejectCount++
+                metricsSearchLastReason = "promoted_not_lockable"
                 if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
                     Log.w(
                         TAG,
@@ -723,6 +918,7 @@ class OpenCVTrackerAnalyzer(
             }
             searchMissStreak = 0
             clearFirstLockCandidate("promoted_candidate")
+            metricsSearchLastReason = "lock_init"
             initializeTracker(
                 frame,
                 promoted.box,
@@ -944,11 +1140,11 @@ class OpenCVTrackerAnalyzer(
         return null
     }
 
-    private fun findOrbMatchInRoi(frame: Mat, roiRect: Rect): OrbMatchCandidate? {
+    private fun findOrbMatchInRoi(frame: Mat, roiRect: Rect, loweRatioOverride: Double? = null): OrbMatchCandidate? {
         val safeRoi = clampRect(roiRect, frame.cols(), frame.rows()) ?: return null
         val sub = frame.submat(safeRoi)
         try {
-            val local = findOrbMatch(sub) ?: return null
+            val local = findOrbMatch(sub, loweRatioOverride = loweRatioOverride, allowSeedAssist = false) ?: return null
             val shifted = Rect(
                 local.box.x + safeRoi.x,
                 local.box.y + safeRoi.y,
@@ -985,7 +1181,7 @@ class OpenCVTrackerAnalyzer(
                 gray.copyTo(input)
             }
 
-            orb.setMaxFeatures(max(300, orbMaxFeatures / 2))
+            configureOrbDetector(max(300, orbMaxFeatures / 2))
             orb.detectAndCompute(input, mask, keypoints, descriptors, false)
             if (descriptors.empty() || descriptors.rows() < 2) {
                 return BoxMatchQuality(0, 0, 0.0)
@@ -997,7 +1193,7 @@ class OpenCVTrackerAnalyzer(
                 if (level.descriptors8U.rows() < 2) continue
                 clearKnnMatches(knnMatches)
                 bfMatcher.knnMatch(level.descriptors8U, descriptors, knnMatches, 2)
-                val goodMatches = collectGoodMatches(knnMatches)
+                val goodMatches = collectGoodMatches(knnMatches, orbLoweRatio)
                 if (goodMatches.isEmpty()) continue
                 if (goodMatches.size < 4) {
                     if (goodMatches.size > best.goodMatches) {
@@ -1058,16 +1254,82 @@ class OpenCVTrackerAnalyzer(
         val useCenterRule =
             minSide <= FIRST_LOCK_SMALL_BOX_SIDE_PX ||
                 (candidate.box.width.toDouble() * candidate.box.height.toDouble()) <= FIRST_LOCK_SMALL_BOX_AREA_PX
+        val relaxedSmallTarget =
+            useCenterRule &&
+                (searchMissStreak >= firstLockSmallRelaxMissStreak || firstLockCandidateFrames > 0) &&
+                !candidate.usedHomography &&
+                (candidate.fallbackReason?.startsWith("refined_") == true)
+        val effectiveStablePx = when {
+            !useCenterRule -> firstLockStablePx
+            relaxedSmallTarget -> max(firstLockStablePx, firstLockSmallStablePx)
+            else -> max(firstLockStablePx, firstLockSmallCenterDriftPx * 2.0)
+        }
+        val effectiveCenterDriftPx = if (relaxedSmallTarget) {
+            firstLockSmallCenterDriftRelaxedPx
+        } else {
+            firstLockSmallCenterDriftPx
+        }
         val adaptiveIou = computeAdaptiveFirstLockIou(candidate.box, frameW, frameH)
         val centerDrift = pointDistance(firstLockCandidateCenter, candidateCenter)
-        val centerRulePass = centerDrift <= FIRST_LOCK_SMALL_BOX_CENTER_DRIFT_PX
-        val needReset =
-            previous == null ||
-                (now - firstLockCandidateLastMs) > firstLockGapMs ||
-                pointDistance(firstLockCandidateCenter, candidateCenter) > firstLockStablePx ||
-                if (useCenterRule) !centerRulePass else iouWithPrevious < adaptiveIou
+        val dynamicCenterDriftPx = computeDynamicFirstLockCenterThreshold(
+            previous = previous,
+            candidate = candidate.box,
+            useCenterRule = useCenterRule,
+            baseCenterDriftPx = effectiveCenterDriftPx,
+            stableDriftPx = effectiveStablePx
+        )
+        val relaxedSmallIouPass =
+            useCenterRule &&
+                previous != null &&
+                centerDrift <= effectiveStablePx &&
+                iouWithPrevious >= firstLockSmallRelaxedIouFloor
+        val centerRulePass = !useCenterRule || centerDrift <= dynamicCenterDriftPx || relaxedSmallIouPass
+        val shouldHoldOutlier =
+            previous != null &&
+                centerDrift > effectiveStablePx &&
+                firstLockCandidateFrames > 0 &&
+                !isClearlyBetterFirstLockCandidate(candidate)
+        if (shouldHoldOutlier) {
+            metricsSearchStableOutlierHoldCount++
+            firstLockOutlierHoldStreak++
+            if (firstLockOutlierHoldStreak < firstLockOutlierHoldMax) {
+                metricsSearchLastReason = "stable_outlier_hold"
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=SEARCH_STABLE state=hold drift=${fmt(centerDrift)} " +
+                            "stableTh=${fmt(effectiveStablePx)} hold=$firstLockOutlierHoldStreak/$firstLockOutlierHoldMax " +
+                            "good=${candidate.goodMatches} inliers=${candidate.inlierCount}"
+                    )
+                }
+                return null
+            }
+            firstLockOutlierHoldStreak = 0
+            metricsSearchLastReason = "stable_outlier_reseed"
+            if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=SEARCH_STABLE state=hold_break drift=${fmt(centerDrift)} " +
+                        "stableTh=${fmt(effectiveStablePx)} reseedAfter=$firstLockOutlierHoldMax"
+                )
+            }
+        } else {
+            firstLockOutlierHoldStreak = 0
+        }
+        val resetNoSeed = previous == null
+        val resetGap = !resetNoSeed && (now - firstLockCandidateLastMs) > firstLockGapMs
+        val resetStableDrift = !resetNoSeed && centerDrift > effectiveStablePx
+        val resetCenterRule = !resetNoSeed && useCenterRule && !centerRulePass
+        val resetIou = !resetNoSeed && !useCenterRule && iouWithPrevious < adaptiveIou
+        val needReset = resetNoSeed || resetGap || resetStableDrift || resetCenterRule || resetIou
 
         if (needReset) {
+            metricsSearchStableSeedCount++
+            if (resetNoSeed) metricsSearchResetNoSeedCount++
+            if (resetGap) metricsSearchResetGapCount++
+            if (resetStableDrift) metricsSearchResetStableDriftCount++
+            if (resetCenterRule) metricsSearchResetCenterRuleCount++
+            if (resetIou) metricsSearchResetIouCount++
             firstLockCandidateBox = candidate.box
             firstLockCandidateCenter = candidateCenter
             firstLockCandidateFrames = 1
@@ -1075,24 +1337,37 @@ class OpenCVTrackerAnalyzer(
             firstLockCandidateLastMs = now
             firstLockCandidateBestGood = candidate.goodMatches
             firstLockCandidateBestInliers = candidate.inlierCount
+            firstLockOutlierHoldStreak = 0
+            val seedReason = buildFirstLockSeedReason(
+                resetNoSeed = resetNoSeed,
+                resetGap = resetGap,
+                resetStableDrift = resetStableDrift,
+                resetCenterRule = resetCenterRule,
+                resetIou = resetIou
+            )
             if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
                 Log.w(
                     TAG,
                     "EVAL_EVENT type=SEARCH_STABLE state=seed good=${candidate.goodMatches} inliers=${candidate.inlierCount} " +
                         "iou=${fmt(iouWithPrevious)} minIou=${fmt(adaptiveIou)} centerDrift=${fmt(centerDrift)} " +
-                        "centerRule=$useCenterRule box=${candidate.box.x},${candidate.box.y},${candidate.box.width}x${candidate.box.height}"
+                        "centerRule=$useCenterRule centerTh=${fmt(dynamicCenterDriftPx)} baseCenterTh=${fmt(effectiveCenterDriftPx)} " +
+                        "smallIouPass=$relaxedSmallIouPass reason=$seedReason " +
+                        "stableTh=${fmt(effectiveStablePx)} relaxed=$relaxedSmallTarget " +
+                        "box=${candidate.box.x},${candidate.box.y},${candidate.box.width}x${candidate.box.height}"
                 )
             }
             return null
         }
 
         firstLockCandidateFrames++
+        metricsSearchStableAccumCount++
         firstLockCandidateLastMs = now
         firstLockCandidateBox = candidate.box
         firstLockCandidateCenter.x = (firstLockCandidateCenter.x + candidateCenter.x) * 0.5
         firstLockCandidateCenter.y = (firstLockCandidateCenter.y + candidateCenter.y) * 0.5
         firstLockCandidateBestGood = max(firstLockCandidateBestGood, candidate.goodMatches)
         firstLockCandidateBestInliers = max(firstLockCandidateBestInliers, candidate.inlierCount)
+        firstLockOutlierHoldStreak = 0
 
         val stableMs = now - firstLockCandidateStartMs
         if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
@@ -1101,13 +1376,15 @@ class OpenCVTrackerAnalyzer(
                 "EVAL_EVENT type=SEARCH_STABLE state=accum frames=$firstLockCandidateFrames stableMs=$stableMs " +
                     "bestGood=$firstLockCandidateBestGood bestInliers=$firstLockCandidateBestInliers " +
                     "iou=${fmt(iouWithPrevious)} minIou=${fmt(adaptiveIou)} centerDrift=${fmt(centerDrift)} " +
-                    "centerRule=$useCenterRule needFrames=$firstLockStableFrames needMs=$firstLockStableMs"
+                    "centerRule=$useCenterRule centerTh=${fmt(effectiveCenterDriftPx)} stableTh=${fmt(effectiveStablePx)} " +
+                    "relaxed=$relaxedSmallTarget needFrames=$firstLockStableFrames needMs=$firstLockStableMs"
             )
         }
 
         val ready = firstLockCandidateFrames >= firstLockStableFrames && stableMs >= firstLockStableMs
         if (!ready) return null
 
+        metricsSearchPromoteCount++
         val promotedBox = firstLockCandidateBox ?: return null
         return OrbMatchCandidate(
             box = promotedBox,
@@ -1133,6 +1410,45 @@ class OpenCVTrackerAnalyzer(
         firstLockCandidateLastMs = 0L
         firstLockCandidateBestGood = 0
         firstLockCandidateBestInliers = 0
+        firstLockOutlierHoldStreak = 0
+    }
+
+    private fun computeDynamicFirstLockCenterThreshold(
+        previous: Rect?,
+        candidate: Rect,
+        useCenterRule: Boolean,
+        baseCenterDriftPx: Double,
+        stableDriftPx: Double
+    ): Double {
+        if (!useCenterRule) return baseCenterDriftPx
+        val prevSide = previous?.let { min(it.width, it.height).toDouble() } ?: 0.0
+        val currSide = min(candidate.width, candidate.height).toDouble()
+        val refSide = max(prevSide, currSide).coerceAtLeast(1.0)
+        val dynamicByBox = refSide * firstLockSmallDynamicCenterFactor
+        return max(baseCenterDriftPx, dynamicByBox).coerceAtMost(stableDriftPx)
+    }
+
+    private fun buildFirstLockSeedReason(
+        resetNoSeed: Boolean,
+        resetGap: Boolean,
+        resetStableDrift: Boolean,
+        resetCenterRule: Boolean,
+        resetIou: Boolean
+    ): String {
+        val reasons = ArrayList<String>(5)
+        if (resetNoSeed) reasons += "init"
+        if (resetGap) reasons += "gap"
+        if (resetStableDrift) reasons += "drift"
+        if (resetCenterRule) reasons += "center"
+        if (resetIou) reasons += "iou"
+        return if (reasons.isEmpty()) "none" else reasons.joinToString("+")
+    }
+
+    private fun isClearlyBetterFirstLockCandidate(candidate: OrbMatchCandidate): Boolean {
+        if (candidate.usedHomography) return true
+        if (candidate.goodMatches >= firstLockCandidateBestGood + FIRST_LOCK_OUTLIER_GOOD_BOOST) return true
+        if (candidate.inlierCount >= firstLockCandidateBestInliers + FIRST_LOCK_OUTLIER_INLIER_BOOST) return true
+        return false
     }
 
     private fun expireFirstLockCandidateIfNeeded() {
@@ -1143,7 +1459,11 @@ class OpenCVTrackerAnalyzer(
         }
     }
 
-    private fun findOrbMatch(frame: Mat): OrbMatchCandidate? {
+    private fun findOrbMatch(
+        frame: Mat,
+        loweRatioOverride: Double? = null,
+        allowSeedAssist: Boolean = true
+    ): OrbMatchCandidate? {
         if (templatePyramidLevels.isEmpty()) return null
 
         val frameGray = Mat()
@@ -1162,11 +1482,24 @@ class OpenCVTrackerAnalyzer(
                 searchMissStreak >= searchHighResMissStreak -> max(searchShortEdge, searchHighResShortEdge)
                 else -> searchShortEdge
             }
-            val searchScale = computeSearchScale(frameGray.cols(), frameGray.rows(), effectiveSearchShortEdge)
+            val effectiveSearchLongEdge =
+                if (templateLibrarySize >= 2) {
+                    min(searchMaxLongEdge, searchMultiTemplateMaxLongEdge)
+                } else {
+                    searchMaxLongEdge
+                }
+            val searchScale = computeSearchScale(
+                frameWidth = frameGray.cols(),
+                frameHeight = frameGray.rows(),
+                shortEdgeTarget = effectiveSearchShortEdge,
+                maxLongEdge = effectiveSearchLongEdge
+            )
             searchGray = if (searchScale < 0.999) Mat() else frameGray
             if (searchScale < 0.999) {
                 Imgproc.resize(frameGray, searchGray, Size(), searchScale, searchScale, Imgproc.INTER_AREA)
             }
+            val searchW = searchGray.cols()
+            val searchH = searchGray.rows()
 
             orbInput = if (orbUseClahe) Mat() else searchGray
             if (orbUseClahe) {
@@ -1178,7 +1511,9 @@ class OpenCVTrackerAnalyzer(
             } else {
                 orbMaxFeatures
             }
-            orb.setMaxFeatures(effectiveMaxFeatures)
+            val finalMaxFeatures =
+                if (templateLibrarySize >= 2) min(effectiveMaxFeatures, orbFarBoostMultiTemplateCap) else effectiveMaxFeatures
+            configureOrbDetector(finalMaxFeatures)
             orb.detectAndCompute(orbInput, detectionMask, frameKeypoints, frameDescriptors, false)
             if (frameDescriptors.empty()) {
                 logSearchDiag(
@@ -1189,7 +1524,9 @@ class OpenCVTrackerAnalyzer(
                     selectedGood = 0,
                     selectedInliers = 0,
                     matcher = "none",
-                    detail = "searchShort=$effectiveSearchShortEdge orbFeatures=$effectiveMaxFeatures"
+                    detail =
+                        "searchShort=$effectiveSearchShortEdge searchLongCap=$effectiveSearchLongEdge " +
+                            "searchSize=${searchW}x${searchH} orbFeatures=$finalMaxFeatures"
                 )
                 return null
             }
@@ -1198,8 +1535,49 @@ class OpenCVTrackerAnalyzer(
             frameDescriptors.convertTo(frameDescriptors32F, CvType.CV_32F)
             val framePoints = frameKeypoints.toArray()
             val searchMat = requireNotNull(searchGray)
+            val anchorPoint = if (firstLockCandidateFrames > 0) {
+                Point(firstLockCandidateCenter.x, firstLockCandidateCenter.y)
+            } else {
+                null
+            }
+            val anchorRadius =
+                if (anchorPoint != null) {
+                    max(firstLockStablePx, firstLockSmallStablePx) * FIRST_LOCK_ANCHOR_NEAR_FACTOR
+                } else {
+                    0.0
+                }
+            if (allowSeedAssist && firstLockCandidateFrames > 0) {
+                val seedBox = firstLockCandidateBox
+                if (seedBox != null) {
+                    val seedRoi = expandRectWithFactor(
+                        seedBox,
+                        FIRST_LOCK_SEED_REEVAL_EXPAND_FACTOR,
+                        frame.cols(),
+                        frame.rows()
+                    )
+                    if (seedRoi != null) {
+                        val localCandidate = findOrbMatchInRoi(frame, seedRoi, loweRatioOverride = loweRatioOverride)
+                        if (localCandidate != null && anchorPoint != null) {
+                            val localDist = pointDistance(anchorPoint, rectCenter(localCandidate.box))
+                            val localAcceptRadius = anchorRadius * FIRST_LOCK_SEED_REEVAL_ACCEPT_FACTOR
+                            if (localDist <= localAcceptRadius) {
+                                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                                    Log.w(
+                                        TAG,
+                                        "EVAL_EVENT type=SEARCH_SEED_LOCAL state=use " +
+                                            "dist=${fmt(localDist)} radius=${fmt(localAcceptRadius)} " +
+                                            "good=${localCandidate.goodMatches} inliers=${localCandidate.inlierCount}"
+                                    )
+                                }
+                                return localCandidate.copy(matcherType = "${localCandidate.matcherType}_seed")
+                            }
+                        }
+                    }
+                }
+            }
 
             var bestCandidate: OrbMatchCandidate? = null
+            var bestNearCandidate: OrbMatchCandidate? = null
             var bestDiag: SearchLevelResult? = null
             for (level in templatePyramidLevels) {
                 val levelResult = findOrbMatchForLevel(
@@ -1209,11 +1587,18 @@ class OpenCVTrackerAnalyzer(
                     level = level,
                     framePoints = framePoints,
                     frameDescriptors8U = frameDescriptors,
-                    frameDescriptors32F = frameDescriptors32F
+                    frameDescriptors32F = frameDescriptors32F,
+                    loweRatio = loweRatioOverride ?: orbLoweRatio
                 )
                 val candidate = levelResult.candidate
                 if (candidate != null && isBetterOrbCandidate(candidate, bestCandidate)) {
                     bestCandidate = candidate
+                }
+                if (candidate != null && anchorPoint != null) {
+                    val distToAnchor = pointDistance(anchorPoint, rectCenter(candidate.box))
+                    if (distToAnchor <= anchorRadius && isBetterOrbCandidate(candidate, bestNearCandidate)) {
+                        bestNearCandidate = candidate
+                    }
                 }
                 val currentDiag = bestDiag
                 if (
@@ -1228,11 +1613,13 @@ class OpenCVTrackerAnalyzer(
                 }
             }
 
+            if (bestNearCandidate != null) return bestNearCandidate
             if (bestCandidate != null) return bestCandidate
 
             val diag = bestDiag
+            lastSearchDiagReason = diag?.reason ?: "search_no_candidate"
             logSearchDiag(
-                reason = diag?.reason ?: "search_no_candidate",
+                reason = lastSearchDiagReason,
                 kpFrame = framePoints.size,
                 flannGood = diag?.flannGood ?: 0,
                 bfGood = diag?.bfGood ?: 0,
@@ -1240,7 +1627,8 @@ class OpenCVTrackerAnalyzer(
                 selectedInliers = diag?.selectedInliers ?: 0,
                 matcher = diag?.matcherType ?: "none",
                 detail = (diag?.detail ?: "none") +
-                    " searchShort=$effectiveSearchShortEdge orbFeatures=$effectiveMaxFeatures"
+                    " searchShort=$effectiveSearchShortEdge searchLongCap=$effectiveSearchLongEdge " +
+                    "searchSize=${searchW}x${searchH} orbFeatures=$finalMaxFeatures"
             )
             return null
         } catch (t: Throwable) {
@@ -1278,7 +1666,8 @@ class OpenCVTrackerAnalyzer(
         level: TemplateLevel,
         framePoints: Array<KeyPoint>,
         frameDescriptors8U: Mat,
-        frameDescriptors32F: Mat
+        frameDescriptors32F: Mat,
+        loweRatio: Double
     ): SearchLevelResult {
         if (level.descriptors8U.rows() < 2 || frameDescriptors8U.rows() < 2) {
             return SearchLevelResult(
@@ -1303,12 +1692,15 @@ class OpenCVTrackerAnalyzer(
         try {
             var flannGoodMatches: List<DMatch> = emptyList()
             var bfGoodMatches: List<DMatch> = emptyList()
+            var flannPairs: List<KnnPair> = emptyList()
+            var bfPairs: List<KnnPair> = emptyList()
             var flannError: String? = null
 
             if (level.descriptors32F.rows() >= 2 && frameDescriptors32F.rows() >= 2) {
                 runCatching {
                     flannMatcher.knnMatch(level.descriptors32F, frameDescriptors32F, knnMatches, 2)
-                    flannGoodMatches = collectGoodMatches(knnMatches)
+                    flannPairs = extractKnnPairs(knnMatches)
+                    flannGoodMatches = collectGoodMatchesFromPairs(flannPairs, loweRatio)
                 }.onFailure {
                     flannError = it.javaClass.simpleName ?: "flann_exception"
                 }
@@ -1317,7 +1709,8 @@ class OpenCVTrackerAnalyzer(
 
             runCatching {
                 bfMatcher.knnMatch(level.descriptors8U, frameDescriptors8U, knnMatches, 2)
-                bfGoodMatches = collectGoodMatches(knnMatches)
+                bfPairs = extractKnnPairs(knnMatches)
+                bfGoodMatches = collectGoodMatchesFromPairs(bfPairs, loweRatio)
             }.onFailure {
                 return SearchLevelResult(
                     candidate = null,
@@ -1334,17 +1727,21 @@ class OpenCVTrackerAnalyzer(
 
             var bestMatches = flannGoodMatches
             var matcherType = "flann"
+            var selectedPairs = flannPairs
             if (bfGoodMatches.size > bestMatches.size) {
                 bestMatches = bfGoodMatches
                 matcherType = "bf_hamming_fallback"
+                selectedPairs = bfPairs
             } else if (bestMatches.isEmpty() && bfGoodMatches.isNotEmpty()) {
                 bestMatches = bfGoodMatches
                 matcherType = "bf_hamming"
+                selectedPairs = bfPairs
             }
 
             val baseDetail =
                 "lvl=${fmt(level.scale)} tplKp=${level.keypointCount} tpl=${level.gray.cols()}x${level.gray.rows()}"
-            if (bestMatches.size < orbSoftMinGoodMatches) {
+            val softThresholds = computeSoftGateThresholds(searchScale, loweRatio)
+            if (bestMatches.size < softThresholds.minGoodMatches) {
                 return SearchLevelResult(
                     candidate = null,
                     reason = "few_matches",
@@ -1353,7 +1750,10 @@ class OpenCVTrackerAnalyzer(
                     selectedGood = bestMatches.size,
                     selectedInliers = 0,
                     matcherType = matcherType,
-                    detail = "$baseDetail needSoft=$orbSoftMinGoodMatches flannErr=${flannError ?: "none"}"
+                    detail =
+                        "$baseDetail needSoft=${softThresholds.minGoodMatches} baseSoft=$orbSoftMinGoodMatches " +
+                            "softRelax=${softThresholds.relaxed} miss=$searchMissStreak " +
+                            "ratio=${fmt(loweRatio)} flannErr=${flannError ?: "none"}"
                 )
             }
 
@@ -1361,7 +1761,7 @@ class OpenCVTrackerAnalyzer(
             val dstList = ArrayList<Point>(bestMatches.size)
             val templatePoints = level.keypoints.toArray()
             fillMatchPointPairs(bestMatches, templatePoints, framePoints, srcList, dstList)
-            if (srcList.size < orbSoftMinGoodMatches || dstList.size < orbSoftMinGoodMatches) {
+            if (srcList.size < softThresholds.minGoodMatches || dstList.size < softThresholds.minGoodMatches) {
                 return SearchLevelResult(
                     candidate = null,
                     reason = "pair_count_small",
@@ -1382,7 +1782,8 @@ class OpenCVTrackerAnalyzer(
                     goodMatches = bestMatches.size,
                     inliers = 0,
                     matcherType = matcherType,
-                    fallbackReason = "soft_pairs"
+                    fallbackReason = "soft_pairs",
+                    minGoodRequired = softThresholds.minGoodMatches
                 )
                 return SearchLevelResult(
                     candidate = soft,
@@ -1402,7 +1803,7 @@ class OpenCVTrackerAnalyzer(
 
             val inliers = if (inlierMask.empty()) 0 else Core.countNonZero(inlierMask)
             val inlierDstPoints = selectInlierPoints(dstList, inlierMask)
-            if (inlierDstPoints.size < orbSoftMinInliers || inliers < orbSoftMinInliers) {
+            if (inlierDstPoints.size < softThresholds.minInliers || inliers < softThresholds.minInliers) {
                 val soft = buildSoftCandidate(
                     frame = frame,
                     points = dstList,
@@ -1410,7 +1811,8 @@ class OpenCVTrackerAnalyzer(
                     goodMatches = bestMatches.size,
                     inliers = inliers,
                     matcherType = matcherType,
-                    fallbackReason = "few_inliers"
+                    fallbackReason = "few_inliers",
+                    minGoodRequired = softThresholds.minGoodMatches
                 )
                 return SearchLevelResult(
                     candidate = soft,
@@ -1420,7 +1822,9 @@ class OpenCVTrackerAnalyzer(
                     selectedGood = bestMatches.size,
                     selectedInliers = inliers,
                     matcherType = matcherType,
-                    detail = "$baseDetail needSoft=$orbSoftMinInliers filtered=${inlierDstPoints.size}"
+                    detail =
+                        "$baseDetail needSoftInliers=${softThresholds.minInliers} baseSoftInliers=$orbSoftMinInliers " +
+                            "filtered=${inlierDstPoints.size}"
                 )
             }
 
@@ -1452,7 +1856,109 @@ class OpenCVTrackerAnalyzer(
             }
 
             if (finalBox == null) {
-                val pointsForFallback = if (inlierDstPoints.isNotEmpty()) inlierDstPoints else dstList
+                var pointsForFallback = if (inlierDstPoints.isNotEmpty()) inlierDstPoints else dstList
+                if (bestMatches.size <= weakFallbackMaxMatches) {
+                    pointsForFallback = selectDensestWeakPointSubset(pointsForFallback)
+                    val weakStats = measureWeakFallbackStats(pointsForFallback, searchScale)
+                    if (weakStats != null) {
+                        val weakSpan = max(weakStats.spanX, weakStats.spanY)
+                        val spreadRelax =
+                            if (
+                                searchMissStreak >= weakFallbackRelaxMissStreak &&
+                                bestMatches.size >= (orbSoftMinGoodMatches + 1)
+                            ) {
+                                weakFallbackRelaxFactor
+                            } else {
+                                1.0
+                            }
+                        val weakSpanLimit = weakFallbackMaxSpanPx * spreadRelax
+                        val weakAreaLimit = weakFallbackMaxAreaPx * spreadRelax * spreadRelax
+                        val weakReject = weakSpan > weakSpanLimit || weakStats.area > weakAreaLimit
+                        if (weakReject) {
+                            var rescued = false
+                            var rescueDetail = "rescue=skip"
+                            if (weakFallbackRescueEnabled && selectedPairs.isNotEmpty()) {
+                                val tighterRatio = computeTighterRescueRatio(loweRatio)
+                                val rescuedMatches = collectGoodMatchesFromPairs(selectedPairs, tighterRatio)
+                                if (rescuedMatches.size >= weakFallbackRescueMinGood) {
+                                    val rescueSrc = ArrayList<Point>(rescuedMatches.size)
+                                    val rescueDst = ArrayList<Point>(rescuedMatches.size)
+                                    fillMatchPointPairs(rescuedMatches, templatePoints, framePoints, rescueSrc, rescueDst)
+                                    if (rescueDst.size >= weakFallbackRescueMinGood) {
+                                        val rescueCompactPoints = selectDensestWeakPointSubset(rescueDst)
+                                        val rescueStats = measureWeakFallbackStats(rescueCompactPoints, searchScale)
+                                        if (rescueStats != null) {
+                                            val rescueSpan = max(rescueStats.spanX, rescueStats.spanY)
+                                            val rescueReject =
+                                                rescueSpan > weakSpanLimit || rescueStats.area > weakAreaLimit
+                                            if (!rescueReject) {
+                                                pointsForFallback = rescueCompactPoints
+                                                bestMatches = rescuedMatches
+                                                selectedPairs = emptyList()
+                                                matcherType = "${matcherType}_rescue"
+                                                rescued = true
+                                                rescueDetail =
+                                                    "rescue=ok ratio=${fmt(tighterRatio)} good=${rescuedMatches.size} " +
+                                                        "span=${fmt(rescueSpan)} area=${fmt(rescueStats.area)}"
+                                            } else {
+                                                rescueDetail =
+                                                    "rescue=reject ratio=${fmt(tighterRatio)} good=${rescuedMatches.size} " +
+                                                        "span=${fmt(rescueSpan)} area=${fmt(rescueStats.area)}"
+                                            }
+                                        } else {
+                                            rescueDetail = "rescue=stats_null ratio=${fmt(tighterRatio)}"
+                                        }
+                                    } else {
+                                        rescueDetail = "rescue=pair_small ratio=${fmt(tighterRatio)} dst=${rescueDst.size}"
+                                    }
+                                } else {
+                                    rescueDetail = "rescue=good_small ratio=${fmt(tighterRatio)} good=${rescuedMatches.size}"
+                                }
+                            }
+
+                            if (!rescued && weakFallbackCoreRescueEnabled) {
+                                val corePoints = selectTightCorePoints(pointsForFallback)
+                                val coreStats = measureWeakFallbackStats(corePoints, searchScale)
+                                if (coreStats != null) {
+                                    val coreSpan = max(coreStats.spanX, coreStats.spanY)
+                                    val coreReject =
+                                        coreSpan > weakFallbackCoreMaxSpanPx || coreStats.area > weakFallbackCoreMaxAreaPx
+                                    if (!coreReject) {
+                                        pointsForFallback = corePoints
+                                        matcherType = "${matcherType}_core"
+                                        rescued = true
+                                        rescueDetail =
+                                            "rescue=core_ok span=${fmt(coreSpan)} area=${fmt(coreStats.area)}"
+                                    } else {
+                                        rescueDetail =
+                                            "rescue=core_reject span=${fmt(coreSpan)} area=${fmt(coreStats.area)}"
+                                    }
+                                }
+                            }
+
+                            if (!rescued) {
+                                return SearchLevelResult(
+                                    candidate = null,
+                                    reason = "weak_fallback_spread",
+                                    flannGood = flannGoodMatches.size,
+                                    bfGood = bfGoodMatches.size,
+                                    selectedGood = bestMatches.size,
+                                    selectedInliers = inliers,
+                                    matcherType = matcherType,
+                                    detail =
+                                        "$baseDetail span=${fmt(weakSpan)} area=${fmt(weakStats.area)} " +
+                                            "maxSpan=${fmt(weakSpanLimit)} maxArea=${fmt(weakAreaLimit)} " +
+                                            rescueDetail
+                                )
+                            } else if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                                Log.w(
+                                    TAG,
+                                    "EVAL_EVENT type=SEARCH_RESCUE state=pass matcher=$matcherType good=${bestMatches.size}"
+                                )
+                            }
+                        }
+                    }
+                }
                 val cluster = estimateFallbackCluster(pointsForFallback, searchScale)
                 val centerOriginal = scalePointToOriginal(cluster.center, searchScale)
                 val square = buildCenteredSquare(centerOriginal, cluster.sideOriginal)
@@ -1472,10 +1978,11 @@ class OpenCVTrackerAnalyzer(
             }
 
             val confidence = inliers.toDouble() / bestMatches.size.toDouble()
+            val strongThresholds = computeSearchThresholds(finalBox, frame.cols(), frame.rows(), searchScale)
             val isStrong =
-                bestMatches.size >= orbMinGoodMatches &&
-                    inliers >= orbMinInliers &&
-                    inlierDstPoints.size >= orbMinInliers
+                bestMatches.size >= strongThresholds.minGoodMatches &&
+                    inliers >= strongThresholds.minInliers &&
+                    inlierDstPoints.size >= strongThresholds.minInliers
 
             val candidate = OrbMatchCandidate(
                 box = finalBox,
@@ -1496,7 +2003,10 @@ class OpenCVTrackerAnalyzer(
                 selectedGood = bestMatches.size,
                 selectedInliers = inliers,
                 matcherType = matcherType,
-                detail = "$baseDetail fallback=${fallbackReason ?: "none"} usedH=$usedHomography"
+                detail =
+                    "$baseDetail fallback=${fallbackReason ?: "none"} usedH=$usedHomography " +
+                        "strongGood=${strongThresholds.minGoodMatches} strongInliers=${strongThresholds.minInliers} " +
+                        "ratio=${fmt(loweRatio)}"
             )
         } finally {
             homography?.release()
@@ -1518,46 +2028,138 @@ class OpenCVTrackerAnalyzer(
         return false
     }
 
-    private fun isCandidateLockableForInit(candidate: OrbMatchCandidate): Boolean {
+    private fun isCandidateLockableForInit(candidate: OrbMatchCandidate, frameW: Int, frameH: Int): Boolean {
         if (!candidate.isStrong) return false
         if (candidate.usedHomography) return true
         if (!allowFallbackLock) return false
-        val minGoodFallback =
-            (orbMinGoodMatches - FALLBACK_LOCK_GOOD_RELAX).coerceAtLeast(orbSoftMinGoodMatches + 2)
-        val minInliersFallback =
-            (orbMinInliers - FALLBACK_LOCK_INLIER_RELAX).coerceAtLeast(orbSoftMinInliers + 1)
+
+        val isSmallTarget =
+            isSmallTargetCandidate(
+                box = candidate.box,
+                frameW = frameW,
+                frameH = frameH,
+                searchScale = candidate.searchScale
+            )
+        val minGoodFallback: Int
+        val minInliersFallback: Int
+        val minConfidence: Double
+        if (isSmallTarget) {
+            minGoodFallback = max(smallTargetMinGoodMatches, orbSoftMinGoodMatches)
+            minInliersFallback = max(smallTargetMinInliers, orbSoftMinInliers)
+            minConfidence =
+                if (
+                    candidate.goodMatches >= FALLBACK_LOCK_HIGH_GOOD_MATCHES &&
+                    candidate.inlierCount >= FALLBACK_LOCK_HIGH_INLIERS
+                ) {
+                    FALLBACK_LOCK_MIN_CONFIDENCE_HIGH_GOOD
+                } else {
+                    FALLBACK_LOCK_MIN_CONFIDENCE_SMALL
+                }
+        } else {
+            minGoodFallback =
+                (orbMinGoodMatches - FALLBACK_LOCK_GOOD_RELAX).coerceAtLeast(orbSoftMinGoodMatches + 2)
+            minInliersFallback =
+                (orbMinInliers - FALLBACK_LOCK_INLIER_RELAX).coerceAtLeast(orbSoftMinInliers + 1)
+            minConfidence = FALLBACK_LOCK_MIN_CONFIDENCE
+        }
         return candidate.goodMatches >= minGoodFallback &&
             candidate.inlierCount >= minInliersFallback &&
-            candidate.confidence >= FALLBACK_LOCK_MIN_CONFIDENCE
+            candidate.confidence >= minConfidence
     }
 
     private fun isCandidateEligibleForTemporal(candidate: OrbMatchCandidate): Boolean {
-        if (candidate.goodMatches < orbSoftMinGoodMatches) return false
+        val temporalMinGoodMatches = computeTemporalMinGoodMatches(candidate)
+        if (candidate.goodMatches < temporalMinGoodMatches) return false
         val minInliers = if (candidate.usedHomography) {
             orbSoftMinInliers
         } else {
             max(orbSoftMinInliers, fallbackRefineMinInliers - 1)
         }
         if (candidate.inlierCount < minInliers) return false
-        if (!candidate.usedHomography && candidate.confidence < min(0.35, fallbackRefineMinConfidence)) return false
+        if (!candidate.usedHomography) {
+            val isSmallCandidate =
+                min(candidate.box.width, candidate.box.height).toDouble() <= FIRST_LOCK_SMALL_BOX_SIDE_PX ||
+                    candidate.box.width.toDouble() * candidate.box.height.toDouble() <= FIRST_LOCK_SMALL_BOX_AREA_PX
+            val isRefinedFallback = candidate.fallbackReason?.startsWith("refined_") == true
+            val minTemporalConfidence = when {
+                candidate.goodMatches >= TEMPORAL_HIGH_GOOD_MATCHES &&
+                    candidate.inlierCount >= TEMPORAL_HIGH_INLIERS -> TEMPORAL_MIN_CONFIDENCE_HIGH_GOOD
+                candidate.goodMatches >= TEMPORAL_MEDIUM_GOOD_MATCHES &&
+                    candidate.inlierCount >= orbSoftMinInliers -> TEMPORAL_MIN_CONFIDENCE_MEDIUM
+                isSmallCandidate && isRefinedFallback -> min(0.28, fallbackRefineMinConfidence)
+                else -> min(0.35, fallbackRefineMinConfidence)
+            }
+            if (candidate.confidence < minTemporalConfidence) return false
+        }
         return true
     }
 
     private fun maybeRefineFallbackCandidate(frame: Mat, candidate: OrbMatchCandidate): OrbMatchCandidate {
         if (candidate.usedHomography) return candidate
+        val isWeakFallbackCandidate = candidate.goodMatches <= weakFallbackMaxMatches
 
         val refineRegion =
             expandRectWithFactor(candidate.box, fallbackRefineExpandFactor, frame.cols(), frame.rows())
                 ?: candidate.box
-        val localCandidate = findOrbMatchInRoi(frame, refineRegion) ?: return candidate
+        val localCandidate = findOrbMatchInRoi(frame, refineRegion, loweRatioOverride = fallbackRefineLoweRatio)
+        if (localCandidate == null) {
+            if (isWeakFallbackCandidate && weakFallbackRequireRefine) {
+                metricsSearchRefineRejectCount++
+                metricsSearchLastReason = "refine_miss"
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=SEARCH_REFINE state=reject reason=weak_refine_miss " +
+                            "good=${candidate.goodMatches} inliers=${candidate.inlierCount} " +
+                            "conf=${fmt(candidate.confidence)} box=${candidate.box.width}x${candidate.box.height}"
+                    )
+                }
+                return candidate.copy(
+                    inlierCount = 0,
+                    confidence = 0.0,
+                    isStrong = false,
+                    fallbackReason = "weak_refine_miss"
+                )
+            }
+            return candidate
+        }
 
         val merged = if (isBetterOrbCandidate(localCandidate, candidate)) localCandidate else candidate
+        val refineMinConfidence =
+            if (
+                localCandidate.goodMatches >= REFINE_HIGH_GOOD_MATCHES &&
+                localCandidate.inlierCount >= REFINE_HIGH_INLIERS
+            ) {
+                FALLBACK_REFINE_MIN_CONFIDENCE_HIGH_GOOD
+            } else {
+                fallbackRefineMinConfidence
+            }
         val passesRefine =
             localCandidate.goodMatches >= fallbackRefineMinGoodMatches &&
                 localCandidate.inlierCount >= fallbackRefineMinInliers &&
-                localCandidate.confidence >= fallbackRefineMinConfidence
+                localCandidate.confidence >= refineMinConfidence
 
-        if (!passesRefine) return merged
+        if (!passesRefine) {
+            if (isWeakFallbackCandidate && weakFallbackRequireRefine) {
+                metricsSearchRefineRejectCount++
+                metricsSearchLastReason = "refine_fail"
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=SEARCH_REFINE state=reject reason=weak_refine_fail " +
+                            "good=${localCandidate.goodMatches} inliers=${localCandidate.inlierCount} " +
+                            "conf=${fmt(localCandidate.confidence)} minConf=${fmt(refineMinConfidence)}"
+                    )
+                }
+                return merged.copy(
+                    inlierCount = 0,
+                    confidence = 0.0,
+                    isStrong = false,
+                    fallbackReason = "weak_refine_fail"
+                )
+            }
+            return merged
+        }
 
         if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
             Log.w(
@@ -1567,6 +2169,8 @@ class OpenCVTrackerAnalyzer(
                     "conf=${fmt(localCandidate.confidence)} h=${localCandidate.usedHomography}"
             )
         }
+        metricsSearchRefinePassCount++
+        metricsSearchLastReason = "refine_pass"
         return merged.copy(
             goodMatches = max(merged.goodMatches, localCandidate.goodMatches),
             inlierCount = max(merged.inlierCount, localCandidate.inlierCount),
@@ -1583,13 +2187,138 @@ class OpenCVTrackerAnalyzer(
         val boxArea = box.width.toDouble() * box.height.toDouble()
         val areaRatio = (boxArea / frameArea).coerceAtLeast(1e-5)
         val normalized = sqrt((areaRatio / FIRST_LOCK_BASE_AREA_RATIO).coerceAtMost(1.0))
-        return (firstLockMinIou * normalized).coerceIn(FIRST_LOCK_MIN_IOU_FLOOR, firstLockMinIou)
+        val upper = firstLockMinIou.coerceIn(0.0, 1.0)
+        val lower = min(FIRST_LOCK_MIN_IOU_FLOOR, upper)
+        return (upper * normalized).coerceIn(lower, upper)
     }
 
-    private fun computeSearchScale(frameWidth: Int, frameHeight: Int, shortEdgeTarget: Int = searchShortEdge): Double {
+    private fun computeSearchScale(
+        frameWidth: Int,
+        frameHeight: Int,
+        shortEdgeTarget: Int = searchShortEdge,
+        maxLongEdge: Int = searchMaxLongEdge
+    ): Double {
         val shortEdge = min(frameWidth, frameHeight).toDouble()
-        if (shortEdge <= shortEdgeTarget.toDouble()) return 1.0
-        return (shortEdgeTarget.toDouble() / shortEdge).coerceIn(0.10, 1.0)
+        val longEdge = max(frameWidth, frameHeight).toDouble()
+        val shortScale =
+            if (shortEdge > shortEdgeTarget.toDouble()) shortEdgeTarget.toDouble() / shortEdge else 1.0
+        val longScale =
+            if (maxLongEdge > 0 && longEdge > maxLongEdge.toDouble()) maxLongEdge.toDouble() / longEdge else 1.0
+        return min(1.0, min(shortScale, longScale)).coerceIn(0.10, 1.0)
+    }
+
+    private fun computeTighterRescueRatio(baseRatio: Double): Double {
+        val maxRatio = (baseRatio - 0.02).coerceAtLeast(0.55)
+        return min(weakFallbackRescueRatio, maxRatio).coerceIn(0.55, 0.90)
+    }
+
+    private fun measureWeakFallbackStats(points: List<Point>, searchScale: Double): WeakFallbackStats? {
+        if (points.isEmpty()) return null
+        var minX = Double.POSITIVE_INFINITY
+        var minY = Double.POSITIVE_INFINITY
+        var maxX = Double.NEGATIVE_INFINITY
+        var maxY = Double.NEGATIVE_INFINITY
+        for (p in points) {
+            minX = min(minX, p.x)
+            minY = min(minY, p.y)
+            maxX = max(maxX, p.x)
+            maxY = max(maxY, p.y)
+        }
+        if (!minX.isFinite() || !minY.isFinite() || !maxX.isFinite() || !maxY.isFinite()) return null
+        val inv = 1.0 / searchScale.coerceAtLeast(1e-6)
+        val spanX = ((maxX - minX).coerceAtLeast(0.0)) * inv
+        val spanY = ((maxY - minY).coerceAtLeast(0.0)) * inv
+        return WeakFallbackStats(spanX, spanY, spanX * spanY)
+    }
+
+    private fun selectDensestWeakPointSubset(points: List<Point>): List<Point> {
+        if (points.size <= 3) return points
+        val targetSize = max(3, points.size - 1)
+        val indexBuf = ArrayList<Int>(targetSize)
+        var bestIndices: List<Int>? = null
+        var bestArea = Double.POSITIVE_INFINITY
+
+        fun evalCurrent() {
+            var minX = Double.POSITIVE_INFINITY
+            var minY = Double.POSITIVE_INFINITY
+            var maxX = Double.NEGATIVE_INFINITY
+            var maxY = Double.NEGATIVE_INFINITY
+            for (idx in indexBuf) {
+                val p = points[idx]
+                minX = min(minX, p.x)
+                minY = min(minY, p.y)
+                maxX = max(maxX, p.x)
+                maxY = max(maxY, p.y)
+            }
+            val area = ((maxX - minX).coerceAtLeast(0.0)) * ((maxY - minY).coerceAtLeast(0.0))
+            if (area < bestArea) {
+                bestArea = area
+                bestIndices = ArrayList(indexBuf)
+            }
+        }
+
+        fun dfs(start: Int) {
+            if (indexBuf.size == targetSize) {
+                evalCurrent()
+                return
+            }
+            val need = targetSize - indexBuf.size
+            val maxStart = points.size - need
+            for (i in start..maxStart) {
+                indexBuf += i
+                dfs(i + 1)
+                indexBuf.removeAt(indexBuf.lastIndex)
+            }
+        }
+
+        dfs(0)
+        val chosen = bestIndices ?: return points
+        if (chosen.size >= points.size) return points
+        return chosen.map { points[it] }
+    }
+
+    private fun selectTightCorePoints(points: List<Point>): List<Point> {
+        if (points.size <= 2) return points
+        var bestI = 0
+        var bestJ = 1
+        var bestDist2 = Double.POSITIVE_INFINITY
+        for (i in 0 until points.size - 1) {
+            val pi = points[i]
+            for (j in i + 1 until points.size) {
+                val pj = points[j]
+                val dx = pi.x - pj.x
+                val dy = pi.y - pj.y
+                val dist2 = dx * dx + dy * dy
+                if (dist2 < bestDist2) {
+                    bestDist2 = dist2
+                    bestI = i
+                    bestJ = j
+                }
+            }
+        }
+        return listOf(points[bestI], points[bestJ])
+    }
+
+    private fun computeSearchThresholds(box: Rect, frameW: Int, frameH: Int, searchScale: Double): MatchThresholds {
+        val isSmallTarget = isSmallTargetCandidate(box, frameW, frameH, searchScale)
+        if (!isSmallTarget) {
+            return MatchThresholds(orbMinGoodMatches, orbMinInliers)
+        }
+
+        val relaxedGood = min(orbMinGoodMatches, smallTargetMinGoodMatches)
+            .coerceAtLeast(orbSoftMinGoodMatches)
+        val relaxedInliers = min(orbMinInliers, smallTargetMinInliers)
+            .coerceAtLeast(orbSoftMinInliers)
+        return MatchThresholds(relaxedGood, relaxedInliers)
+    }
+
+    private fun isSmallTargetCandidate(box: Rect, frameW: Int, frameH: Int, searchScale: Double): Boolean {
+        val frameArea = (frameW.toDouble() * frameH.toDouble()).coerceAtLeast(1.0)
+        val boxArea = (box.width.toDouble() * box.height.toDouble()).coerceAtLeast(1.0)
+        val areaRatio = boxArea / frameArea
+        return areaRatio <= smallTargetAreaRatio ||
+            searchScale <= smallTargetScaleThreshold ||
+            min(box.width, box.height).toDouble() <= FIRST_LOCK_SMALL_BOX_SIDE_PX
     }
 
     private fun clearKnnMatches(knnMatches: MutableList<MatOfDMatch>) {
@@ -1599,6 +2328,16 @@ class OpenCVTrackerAnalyzer(
         knnMatches.clear()
     }
 
+    private fun extractKnnPairs(knnMatches: List<MatOfDMatch>): List<KnnPair> {
+        val out = ArrayList<KnnPair>(knnMatches.size)
+        for (pair in knnMatches) {
+            val m = pair.toArray()
+            if (m.size < 2) continue
+            out += KnnPair(first = m[0], second = m[1])
+        }
+        return out
+    }
+
     private fun buildSoftCandidate(
         frame: Mat,
         points: List<Point>,
@@ -1606,9 +2345,10 @@ class OpenCVTrackerAnalyzer(
         goodMatches: Int,
         inliers: Int,
         matcherType: String,
-        fallbackReason: String
+        fallbackReason: String,
+        minGoodRequired: Int
     ): OrbMatchCandidate? {
-        if (points.size < orbSoftMinGoodMatches) return null
+        if (points.size < minGoodRequired) return null
         val cluster = estimateFallbackCluster(points, searchScale)
         val centerSearch = cluster.center
         val sideOriginal = cluster.sideOriginal
@@ -1629,6 +2369,41 @@ class OpenCVTrackerAnalyzer(
         )
     }
 
+    private fun computeSoftGateThresholds(searchScale: Double, loweRatio: Double): SoftGateThresholds {
+        val baseGood = orbSoftMinGoodMatches
+        val baseInliers = orbSoftMinInliers
+        if (!softRelaxEnabled) return SoftGateThresholds(baseGood, baseInliers, relaxed = false)
+
+        val allowRelax =
+            searchMissStreak >= softRelaxMissStreak &&
+                searchScale <= softRelaxScaleThreshold &&
+                loweRatio <= softRelaxMaxRatio
+        if (!allowRelax) return SoftGateThresholds(baseGood, baseInliers, relaxed = false)
+
+        val relaxedGood = softRelaxMinGoodMatches.coerceAtMost(baseGood).coerceAtLeast(3)
+        return SoftGateThresholds(relaxedGood, baseInliers, relaxed = relaxedGood < baseGood)
+    }
+
+    private fun computeTemporalMinGoodMatches(candidate: OrbMatchCandidate): Int {
+        val base = orbSoftMinGoodMatches
+        if (candidate.goodMatches >= base) return base
+        if (!softRelaxEnabled) return base
+
+        val tinyBox =
+            min(candidate.box.width, candidate.box.height).toDouble() <= FIRST_LOCK_SMALL_BOX_SIDE_PX ||
+                candidate.box.width.toDouble() * candidate.box.height.toDouble() <= FIRST_LOCK_SMALL_BOX_AREA_PX
+        val refinedFallback =
+            !candidate.usedHomography &&
+                (candidate.fallbackReason?.startsWith("refined_") == true)
+        val allowRelax =
+            searchMissStreak >= softRelaxMissStreak &&
+                candidate.searchScale <= softRelaxScaleThreshold &&
+                tinyBox &&
+                refinedFallback
+        if (!allowRelax) return base
+        return softRelaxMinGoodMatches.coerceAtMost(base).coerceAtLeast(3)
+    }
+
     private fun logSearchDiag(
         reason: String,
         kpFrame: Int,
@@ -1639,6 +2414,7 @@ class OpenCVTrackerAnalyzer(
         matcher: String,
         detail: String
     ) {
+        lastSearchDiagReason = reason
         if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES != 0L) return
         Log.w(
             TAG,
@@ -1650,12 +2426,22 @@ class OpenCVTrackerAnalyzer(
         )
     }
 
-    private fun collectGoodMatches(knnMatches: List<MatOfDMatch>): List<DMatch> {
+    private fun collectGoodMatches(knnMatches: List<MatOfDMatch>, loweRatio: Double = orbLoweRatio): List<DMatch> {
         val out = ArrayList<DMatch>(knnMatches.size)
         for (pair in knnMatches) {
             val m = pair.toArray()
             if (m.size < 2) continue
-            if (m[0].distance < orbLoweRatio * m[1].distance) out += m[0]
+            if (m[0].distance < loweRatio * m[1].distance) out += m[0]
+        }
+        return out
+    }
+
+    private fun collectGoodMatchesFromPairs(knnPairs: List<KnnPair>, loweRatio: Double): List<DMatch> {
+        val out = ArrayList<DMatch>(knnPairs.size)
+        for (pair in knnPairs) {
+            if (pair.first.distance < loweRatio * pair.second.distance) {
+                out += pair.first
+            }
         }
         return out
     }
@@ -1906,8 +2692,10 @@ class OpenCVTrackerAnalyzer(
         val spanSearch = max(maxX - minX, maxY - minY).coerceAtLeast(MIN_HOMOGRAPHY_EDGE_PX)
         val sideSearch = max(spanSearch * FALLBACK_SPAN_TO_SIDE_FACTOR, MIN_HOMOGRAPHY_EDGE_PX * 2.0)
         val sideOriginal = (sideSearch / searchScale.coerceAtLeast(1e-6)).roundToInt()
-        val maxSide = max(fallbackMaxBoxSize, initBoxSize)
-        return ClusterEstimate(center, sideOriginal.coerceIn(initBoxSize, maxSide))
+        val maxSide = max(fallbackMaxBoxSize, fallbackMinBoxSize)
+        val weakMinSide = min(fallbackMinBoxSize, WEAK_FALLBACK_MIN_BOX_SIZE)
+        val minSide = if (points.size <= weakFallbackMaxMatches) weakMinSide else fallbackMinBoxSize
+        return ClusterEstimate(center, sideOriginal.coerceIn(minSide, maxSide))
     }
 
     private fun buildCenteredSquare(center: Point, side: Int): Rect {
@@ -1974,7 +2762,17 @@ class OpenCVTrackerAnalyzer(
                 TAG,
                 "EVAL_PERF mode=${trackerMode.name.lowercase(Locale.US)} frames=$metricsFrames " +
                     "avgFrameMs=${fmt(avgMs)} trackRatio=${fmt(trackRatio)} locks=$metricsLockCount " +
-                    "lost=$metricsLostCount firstLockSec=${fmt(firstLockSec)}"
+                    "lost=$metricsLostCount firstLockSec=${fmt(firstLockSec)} " +
+                    "searchCand=$metricsSearchCandidateCount searchMiss=$metricsSearchMissCount " +
+                    "tplSkip=$metricsSearchTemplateSkipCount tempRej=$metricsSearchTemporalRejectCount " +
+                    "promRej=$metricsSearchPromoteRejectCount refinePass=$metricsSearchRefinePassCount " +
+                    "refineRej=$metricsSearchRefineRejectCount stableSeed=$metricsSearchStableSeedCount " +
+                    "stableAccum=$metricsSearchStableAccumCount promote=$metricsSearchPromoteCount " +
+                    "stableHold=$metricsSearchStableOutlierHoldCount tempHold=$metricsSearchTemporalHoldCount " +
+                    "resetInit=$metricsSearchResetNoSeedCount resetGap=$metricsSearchResetGapCount " +
+                    "resetDrift=$metricsSearchResetStableDriftCount resetCenter=$metricsSearchResetCenterRuleCount " +
+                    "resetIou=$metricsSearchResetIouCount " +
+                    "lastReason=$metricsSearchLastReason"
             )
         }
 
@@ -2073,9 +2871,9 @@ class OpenCVTrackerAnalyzer(
         private const val MIN_TEMPLATE_LEVEL_DIM = 20
         private const val MIN_TEMPLATE_LEVEL_KEYPOINTS = 10
         private const val MIN_TEMPLATE_USABLE_KEYPOINTS = 50
-        private const val MAX_ACTIVE_TEMPLATE_LEVELS = 12
+        private const val MAX_ACTIVE_TEMPLATE_LEVELS = 30
         private const val MAX_TEMPLATE_DIM = 480.0
-        private val TEMPLATE_PYRAMID_SCALES = doubleArrayOf(1.0, 0.75, 0.5, 0.35, 0.25, 0.18, 0.125)
+        private val TEMPLATE_PYRAMID_SCALES = doubleArrayOf(1.0, 0.75, 0.5, 0.35, 0.25, 0.18, 0.125, 0.09, 0.075)
 
         private const val MIN_HOMOGRAPHY_EDGE_PX = 6.0
         private const val MIN_HOMOGRAPHY_POLYGON_AREA = 48.0
@@ -2090,17 +2888,37 @@ class OpenCVTrackerAnalyzer(
         private const val FIRST_LOCK_SMALL_BOX_SIDE_PX = 50.0
         private const val FIRST_LOCK_SMALL_BOX_AREA_PX = 2_500.0
         private const val FIRST_LOCK_SMALL_BOX_CENTER_DRIFT_PX = 20.0
+        private const val FIRST_LOCK_OUTLIER_GOOD_BOOST = 6
+        private const val FIRST_LOCK_OUTLIER_INLIER_BOOST = 2
+        private const val FIRST_LOCK_ANCHOR_NEAR_FACTOR = 1.6
+        private const val FIRST_LOCK_SEED_REEVAL_EXPAND_FACTOR = 2.0
+        private const val FIRST_LOCK_SEED_REEVAL_ACCEPT_FACTOR = 1.25
         private const val FIRST_LOCK_BASE_AREA_RATIO = 0.015
         private const val FIRST_LOCK_MIN_IOU_FLOOR = 0.55
         private const val FALLBACK_LOCK_GOOD_RELAX = 2
         private const val FALLBACK_LOCK_INLIER_RELAX = 2
         private const val FALLBACK_LOCK_MIN_CONFIDENCE = 0.38
+        private const val FALLBACK_LOCK_MIN_CONFIDENCE_SMALL = 0.28
+        private const val FALLBACK_LOCK_MIN_CONFIDENCE_HIGH_GOOD = 0.12
+        private const val FALLBACK_LOCK_HIGH_GOOD_MATCHES = 20
+        private const val FALLBACK_LOCK_HIGH_INLIERS = 6
+        private const val REFINE_HIGH_GOOD_MATCHES = 20
+        private const val REFINE_HIGH_INLIERS = 6
+        private const val FALLBACK_REFINE_MIN_CONFIDENCE_HIGH_GOOD = 0.12
+        private const val TEMPORAL_HIGH_GOOD_MATCHES = 24
+        private const val TEMPORAL_HIGH_INLIERS = 6
+        private const val TEMPORAL_MEDIUM_GOOD_MATCHES = 12
+        private const val TEMPORAL_MIN_CONFIDENCE_HIGH_GOOD = 0.12
+        private const val TEMPORAL_MIN_CONFIDENCE_MEDIUM = 0.22
 
         private const val DEFAULT_ORB_FEATURES = 900
+        private const val DEFAULT_ORB_SCALE_FACTOR = 1.20
+        private const val DEFAULT_ORB_N_LEVELS = 8
+        private const val DEFAULT_ORB_FAST_THRESHOLD = 20
         private const val DEFAULT_ORB_LOWE_RATIO = 0.75
         private const val DEFAULT_ORB_MIN_GOOD_MATCHES = 10
         private const val DEFAULT_ORB_MIN_INLIERS = 6
-        private const val DEFAULT_ORB_SOFT_MIN_GOOD_MATCHES = 5
+        private const val DEFAULT_ORB_SOFT_MIN_GOOD_MATCHES = 4
         private const val DEFAULT_ORB_SOFT_MIN_INLIERS = 3
         private const val DEFAULT_ORB_RANSAC_THRESHOLD = 4.0
         private const val DEFAULT_ORB_USE_CLAHE = true
@@ -2113,7 +2931,10 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_SEARCH_HIGH_RES_SHORT_EDGE = 860
         private const val DEFAULT_SEARCH_ULTRA_HIGH_RES_MISS_STREAK = 24
         private const val DEFAULT_SEARCH_ULTRA_HIGH_RES_SHORT_EDGE = 1080
+        private const val DEFAULT_SEARCH_MAX_LONG_EDGE = 640
+        private const val DEFAULT_SEARCH_MULTI_TEMPLATE_MAX_LONG_EDGE = 520
         private const val DEFAULT_INIT_BOX_SIZE = 100
+        private const val DEFAULT_FALLBACK_MIN_BOX_SIZE = 48
         private const val DEFAULT_FALLBACK_MAX_BOX_SIZE = 180
         private const val DEFAULT_HOMOGRAPHY_MAX_DISTORTION = 0.20
         private const val DEFAULT_HOMOGRAPHY_SCALE_MIN = 0.60
@@ -2121,16 +2942,49 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_HOMOGRAPHY_MIN_JACOBIAN_DET = 1e-5
         private const val DEFAULT_TEMPLATE_MIN_TEXTURE_SCORE = 15.0
 
-        private const val DEFAULT_FIRST_LOCK_STABLE_FRAMES = 2
-        private const val DEFAULT_FIRST_LOCK_STABLE_MS = 220L
+        private const val DEFAULT_ORB_FAR_BOOST_MULTI_TEMPLATE_CAP = 1200
+
+        private const val DEFAULT_FIRST_LOCK_STABLE_FRAMES = 3
+        private const val DEFAULT_FIRST_LOCK_STABLE_MS = 240L
         private const val DEFAULT_FIRST_LOCK_STABLE_PX = 54.0
         private const val DEFAULT_FIRST_LOCK_MIN_IOU = 0.70
-        private const val DEFAULT_FIRST_LOCK_GAP_MS = 380L
+        private const val DEFAULT_FIRST_LOCK_GAP_MS = 650L
+        private const val DEFAULT_FIRST_LOCK_SMALL_CENTER_DRIFT_PX = 20.0
+        private const val DEFAULT_FIRST_LOCK_SMALL_CENTER_DRIFT_RELAXED_PX = 34.0
+        private const val DEFAULT_FIRST_LOCK_SMALL_STABLE_PX = 84.0
+        private const val DEFAULT_FIRST_LOCK_SMALL_RELAX_MISS_STREAK = 8
+        private const val DEFAULT_FIRST_LOCK_SMALL_DYNAMIC_CENTER_FACTOR = 1.2
+        private const val DEFAULT_FIRST_LOCK_SMALL_RELAXED_IOU_FLOOR = 0.06
+        private const val DEFAULT_FIRST_LOCK_HOLD_ON_TEMPORAL_REJECT = true
+        private const val DEFAULT_FIRST_LOCK_OUTLIER_HOLD_MAX = 2
         private const val DEFAULT_ALLOW_FALLBACK_LOCK = true
         private const val DEFAULT_FALLBACK_REFINE_EXPAND_FACTOR = 1.8
         private const val DEFAULT_FALLBACK_REFINE_MIN_GOOD_MATCHES = 8
-        private const val DEFAULT_FALLBACK_REFINE_MIN_INLIERS = 5
-        private const val DEFAULT_FALLBACK_REFINE_MIN_CONFIDENCE = 0.45
+        private const val DEFAULT_FALLBACK_REFINE_MIN_INLIERS = 4
+        private const val DEFAULT_FALLBACK_REFINE_MIN_CONFIDENCE = 0.40
+        private const val DEFAULT_FALLBACK_REFINE_LOWE_RATIO = 0.84
+        private const val DEFAULT_SMALL_TARGET_AREA_RATIO = 0.05
+        private const val DEFAULT_SMALL_TARGET_MIN_GOOD_MATCHES = 5
+        private const val DEFAULT_SMALL_TARGET_MIN_INLIERS = 4
+        private const val DEFAULT_SMALL_TARGET_SCALE_THRESHOLD = 0.55
+        private const val DEFAULT_WEAK_FALLBACK_MAX_MATCHES = 6
+        private const val DEFAULT_WEAK_FALLBACK_MAX_SPAN_PX = 96.0
+        private const val DEFAULT_WEAK_FALLBACK_MAX_AREA_PX = 7_200.0
+        private const val DEFAULT_WEAK_FALLBACK_RELAX_MISS_STREAK = 8
+        private const val DEFAULT_WEAK_FALLBACK_RELAX_FACTOR = 1.35
+        private const val DEFAULT_WEAK_FALLBACK_REQUIRE_REFINE = true
+        private const val DEFAULT_WEAK_FALLBACK_RESCUE_ENABLED = true
+        private const val DEFAULT_WEAK_FALLBACK_RESCUE_RATIO = 0.66
+        private const val DEFAULT_WEAK_FALLBACK_RESCUE_MIN_GOOD = 4
+        private const val DEFAULT_WEAK_FALLBACK_CORE_RESCUE_ENABLED = true
+        private const val DEFAULT_WEAK_FALLBACK_CORE_MAX_SPAN_PX = 72.0
+        private const val DEFAULT_WEAK_FALLBACK_CORE_MAX_AREA_PX = 3_200.0
+        private const val DEFAULT_SOFT_RELAX_ENABLED = true
+        private const val DEFAULT_SOFT_RELAX_MISS_STREAK = 10
+        private const val DEFAULT_SOFT_RELAX_MIN_GOOD_MATCHES = 3
+        private const val DEFAULT_SOFT_RELAX_SCALE_THRESHOLD = 0.75
+        private const val DEFAULT_SOFT_RELAX_MAX_RATIO = 0.70
+        private const val WEAK_FALLBACK_MIN_BOX_SIZE = 40
 
         private const val DEFAULT_KCF_MAX_FAIL_STREAK = 3
         private const val DEFAULT_FORCE_TRACKER_GC_ON_DROP = true

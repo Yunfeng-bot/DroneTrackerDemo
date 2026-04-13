@@ -11,3 +11,8 @@ local.properties
 /app/build/
 /.gradle-local/
 /tools/adb_args.json
+/tools/.adb-home/
+/tools/auto_tune/out/
+/.android-home/
+/.home/
+/tools/auto_tune/__pycache__/

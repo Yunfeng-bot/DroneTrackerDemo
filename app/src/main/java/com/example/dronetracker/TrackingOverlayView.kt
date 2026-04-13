@@ -37,7 +37,7 @@ class TrackingOverlayView @JvmOverloads constructor(
     }
 
     private val trackingPaint = Paint().apply {
-        color = Color.GREEN
+        color = Color.RED
         style = Paint.Style.STROKE
         strokeWidth = 10f
     }

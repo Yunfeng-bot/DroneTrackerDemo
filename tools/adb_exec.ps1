@@ -2,6 +2,19 @@ param()
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $argsFile = Join-Path $scriptDir "adb_args.json"
+$adbHome = Join-Path $scriptDir ".adb-home"
+$adbUserHome = Join-Path $adbHome ".android"
+
+if (-not (Test-Path -LiteralPath $adbUserHome)) {
+    New-Item -ItemType Directory -Force -Path $adbUserHome | Out-Null
+}
+
+# Force adb to use workspace-local home to avoid sandbox permission jitter on
+# C:\Users\CodexSandboxOffline\.android.
+$env:ANDROID_SDK_HOME = $adbHome
+$env:ANDROID_USER_HOME = $adbUserHome
+$env:HOME = $adbHome
+$env:USERPROFILE = $adbHome
 
 if (-not (Test-Path -LiteralPath $argsFile)) {
     Write-Error "adb args file not found: $argsFile"
