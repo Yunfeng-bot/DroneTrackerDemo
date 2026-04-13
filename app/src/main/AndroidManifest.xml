@@ -30,7 +30,7 @@
 
         <activity
             android:name=".EvaluationActivity"
-            android:exported="false" />
+            android:exported="true" />
 
         <activity
             android:name="com.canhub.cropper.CropImageActivity"
@@ -38,3 +38,5 @@
     </application>
 
 </manifest>
+
+

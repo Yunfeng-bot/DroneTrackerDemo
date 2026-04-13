@@ -49,11 +49,6 @@ class EvaluationActivity : AppCompatActivity() {
         statusView = findViewById(R.id.evalStatusView)
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-        trackerAnalyzer = OpenCVTrackerAnalyzer(overlayView)
-        trackerAnalyzer.setTrackerMode(intent.getStringExtra(EXTRA_TRACKER_MODE))
-        trackerAnalyzer.applyRuntimeOverrides(intent.getStringExtra(EXTRA_EVAL_PARAMS))
-
-        requiredPermissions = buildRequiredPermissions()
 
         if (!OpenCVLoader.initDebug()) {
             Toast.makeText(this, "OpenCV init failed", Toast.LENGTH_LONG).show()
@@ -61,6 +56,12 @@ class EvaluationActivity : AppCompatActivity() {
             finish()
             return
         }
+
+        trackerAnalyzer = OpenCVTrackerAnalyzer(overlayView)
+        trackerAnalyzer.setTrackerMode(intent.getStringExtra(EXTRA_TRACKER_MODE))
+        trackerAnalyzer.applyRuntimeOverrides(intent.getStringExtra(EXTRA_EVAL_PARAMS))
+
+        requiredPermissions = buildRequiredPermissions()
 
         if (allPermissionsGranted()) {
             startReplayEvaluation()
@@ -283,3 +284,4 @@ class EvaluationActivity : AppCompatActivity() {
         private const val DEFAULT_EVAL_TARGET_PATH = "/sdcard/Download/Video_Search/target.jpg"
     }
 }
+
