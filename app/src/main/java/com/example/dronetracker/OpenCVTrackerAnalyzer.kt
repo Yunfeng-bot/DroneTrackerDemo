@@ -199,6 +199,7 @@ class OpenCVTrackerAnalyzer(
     private var metricsSearchLastReason = "none"
 
     private var orbMaxFeatures = DEFAULT_ORB_FEATURES
+    private var orbFeatureHardCap = DEFAULT_ORB_FEATURE_HARD_CAP
     private var orbScaleFactor = DEFAULT_ORB_SCALE_FACTOR
     private var orbNLevels = DEFAULT_ORB_N_LEVELS
     private var orbFastThreshold = DEFAULT_ORB_FAST_THRESHOLD
@@ -330,6 +331,10 @@ class OpenCVTrackerAnalyzer(
                     orbMaxFeatures = it.coerceIn(200, 2500)
                     shouldRefreshTemplate = true
                 }
+                "orb_feature_cap", "orb_max_feature_cap", "orb_budget" -> value.toIntOrNull()?.let {
+                    orbFeatureHardCap = it.coerceIn(200, 1200)
+                    shouldRefreshTemplate = true
+                }
                 "orb_scale_factor" -> value.toDoubleOrNull()?.let {
                     orbScaleFactor = it.coerceIn(1.01, 1.40)
                     shouldRefreshTemplate = true
@@ -426,6 +431,7 @@ class OpenCVTrackerAnalyzer(
             }
         }
 
+        orbFeatureHardCap = orbFeatureHardCap.coerceIn(200, 1200)
         if (homographyScaleMin > homographyScaleMax) {
             val t = homographyScaleMin
             homographyScaleMin = homographyScaleMax
@@ -483,8 +489,13 @@ class OpenCVTrackerAnalyzer(
         }
     }
 
-    private fun configureOrbDetector(maxFeatures: Int) {
-        orb.setMaxFeatures(maxFeatures)
+    private fun configureOrbDetector(maxFeatures: Int, enforceBudgetCap: Boolean = false) {
+        val boundedFeatures = if (enforceBudgetCap) {
+            min(maxFeatures, orbFeatureHardCap).coerceAtLeast(64)
+        } else {
+            maxFeatures.coerceAtLeast(64)
+        }
+        orb.setMaxFeatures(boundedFeatures)
         orb.setScaleFactor(orbScaleFactor)
         orb.setNLevels(orbNLevels)
         orb.setFastThreshold(orbFastThreshold)
@@ -494,7 +505,7 @@ class OpenCVTrackerAnalyzer(
         Log.w(
             TAG,
             "EVAL_EVENT type=PARAMS source=$source mode=${trackerMode.name.lowercase(Locale.US)} " +
-                "orbFeatures=$orbMaxFeatures ratio=${fmt(orbLoweRatio)} minMatches=$orbMinGoodMatches minInliers=$orbMinInliers " +
+                "orbFeatures=$orbMaxFeatures featureCap=$orbFeatureHardCap ratio=${fmt(orbLoweRatio)} minMatches=$orbMinGoodMatches minInliers=$orbMinInliers " +
                 "orbScale=${fmt(orbScaleFactor)} orbLevels=$orbNLevels orbFast=$orbFastThreshold " +
                 "softMatches=$orbSoftMinGoodMatches softInliers=$orbSoftMinInliers ransac=${fmt(orbRansacThreshold)} " +
                 "searchShort=$searchShortEdge searchHiMiss=$searchHighResMissStreak searchHiShort=$searchHighResShortEdge " +
@@ -1556,7 +1567,7 @@ class OpenCVTrackerAnalyzer(
             }
             val finalMaxFeatures =
                 if (templateLibrarySize >= 2) min(effectiveMaxFeatures, orbFarBoostMultiTemplateCap) else effectiveMaxFeatures
-            configureOrbDetector(finalMaxFeatures)
+            configureOrbDetector(finalMaxFeatures, enforceBudgetCap = true)
             orb.detectAndCompute(orbInput, detectionMask, frameKeypoints, frameDescriptors, false)
             if (frameDescriptors.empty()) {
                 logSearchDiag(
@@ -2961,6 +2972,7 @@ class OpenCVTrackerAnalyzer(
         private const val TEMPORAL_MIN_CONFIDENCE_MEDIUM = 0.22
 
         private const val DEFAULT_ORB_FEATURES = 900
+        private const val DEFAULT_ORB_FEATURE_HARD_CAP = 700
         private const val DEFAULT_ORB_SCALE_FACTOR = 1.20
         private const val DEFAULT_ORB_N_LEVELS = 8
         private const val DEFAULT_ORB_FAST_THRESHOLD = 20
