@@ -16,3 +16,5 @@ local.properties
 /.android-home/
 /.home/
 /tools/auto_tune/__pycache__/
+/tools/auto_tune/eval_csv/
+
