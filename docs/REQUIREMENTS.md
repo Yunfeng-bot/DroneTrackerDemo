@@ -21,6 +21,10 @@
 3. 确认测试素材：
    - 视频：`/sdcard/Download/Video_Search/scene.mp4`
    - 模板：`/sdcard/Download/Video_Search/target.jpg`
+4. 构建环境（强制）：
+   - 命令行必须使用 Android Studio 自带 JBR（Java 21）
+   - 禁止使用系统 JDK 25 直接构建
+   - 推荐命令：`powershell -ExecutionPolicy Bypass -File tools/gradlew_jbr.ps1 :app:assembleDebug`
 
 ### 3.3 执行
 使用 ADB 显式启动 EvaluationActivity：
@@ -62,3 +66,48 @@
 - 所有优化结论以 CSV 与脚本输出为准
 - 禁止仅凭 logcat 或肉眼判断作为最终结论
 - 禁止未经回放验证直接修改默认参数并发布
+
+## 6. 深度孪生后端切换 SOP（Claude/Codex 通用）
+
+### 6.1 切换前检查
+1. 确认当前基线与 Gate（来自 `docs/OPTIMIZATION_PLAN.md`）
+2. 确认模型元信息齐全（hash/量化配置/导出脚本版本）
+3. 确认 fallback 开关仍可切回 ORB/KCF
+
+### 6.2 切换执行步骤
+1. 编译并安装最新 APK
+2. 以相同视频和模板分别运行：
+   - `OpenCV` 后端
+   - `NCNN/RKNN` 后端
+3. 产出两份 CSV
+4. 使用同一分析脚本对比
+
+### 6.3 结论模板（强制）
+- 结论：采用 / 暂不采用
+- 原因：首锁、稳定性、p95 三项数据
+- 风险：异常场景与回退策略
+- 下一步：参数/模型/量化要改什么
+
+### 6.4 文档回写要求
+每次切换尝试后必须回写：
+- `docs/TECHNICAL_ARCHITECTURE.md`（架构状态）
+- `docs/OPTIMIZATION_PLAN.md`（基线与 Gate）
+- commit id 与评测 CSV 路径
+
+## 7. 当前状态声明（2026-04-13）
+
+### 7.1 必须认知
+1. 当前 Native NCNN 路径已完成工程地基（JNI/Zero-Copy/状态机/日志）
+2. 但 `NcnnTrackerImpl` 仍为占位追踪核（stub），不是正式深度孪生模型推理
+3. 因此“当前 NCNN 指标低于 OpenCV/KCF”不作为深度路线否定结论
+
+### 7.2 最新 P0 回放结果（10 次）
+- 结果文件：`tools/auto_tune/out/p0_10run_summary_20260413.csv`
+- `first_lock_after_target_sec` median `2.267s`，p95 `2.703s`
+- `track_ratio` median `0.345`，p95 `0.382`
+- `avgFrameMs` median `81.1ms`，p95 `85.37ms`
+
+### 7.3 下一步强制优先级
+1. P1-1：接入真实 `NanoTrack/Siam` 模型（`ncnn::Net` + `.param/.bin`）
+2. P1-2：响应图后处理加入 Hanning/Cosine Window 抑制跳变
+3. P1-3：开启 FP16，模型稳定后评估 INT8

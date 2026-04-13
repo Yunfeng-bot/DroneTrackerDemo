@@ -116,6 +116,39 @@ object NativeTrackerBridge {
         return NativeTrackResult(raw[0], raw[1], raw[2], raw[3], raw[4])
     }
 
+    fun initTargetGray(gray: ByteArray, width: Int, height: Int, bbox: Rect): Boolean {
+        if (!libraryLoaded) return false
+        if (gray.size < width * height || width <= 0 || height <= 0) return false
+        return runCatching {
+            nativeInitTargetGray(
+                gray,
+                width,
+                height,
+                bbox.left.toFloat(),
+                bbox.top.toFloat(),
+                bbox.width().toFloat(),
+                bbox.height().toFloat()
+            )
+        }.getOrElse {
+            Log.e(TAG, "initTargetGray failed", it)
+            false
+        }
+    }
+
+    fun trackGray(gray: ByteArray, width: Int, height: Int): NativeTrackResult? {
+        if (!libraryLoaded) return null
+        if (gray.size < width * height || width <= 0 || height <= 0) return null
+        val raw = runCatching {
+            nativeTrackGray(gray, width, height)
+        }.getOrElse {
+            Log.e(TAG, "trackGray failed", it)
+            null
+        } ?: return null
+
+        if (raw.size < 5) return null
+        return NativeTrackResult(raw[0], raw[1], raw[2], raw[3], raw[4])
+    }
+
     fun reset() {
         if (!libraryLoaded) return
         runCatching { nativeReset() }
@@ -172,6 +205,22 @@ object NativeTrackerBridge {
         width: Int,
         height: Int,
         rotation: Int
+    ): FloatArray?
+
+    private external fun nativeInitTargetGray(
+        grayBuffer: ByteArray,
+        width: Int,
+        height: Int,
+        x: Float,
+        y: Float,
+        w: Float,
+        h: Float
+    ): Boolean
+
+    private external fun nativeTrackGray(
+        grayBuffer: ByteArray,
+        width: Int,
+        height: Int
     ): FloatArray?
 
     private external fun nativeReset()

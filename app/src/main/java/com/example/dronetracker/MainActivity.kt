@@ -104,16 +104,22 @@ class MainActivity : AppCompatActivity() {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        if (OpenCVLoader.initDebug()) {
-            Toast.makeText(this, getString(R.string.toast_opencv_loaded), Toast.LENGTH_SHORT).show()
-        } else {
+        if (!OpenCVLoader.initDebug()) {
             Toast.makeText(this, getString(R.string.toast_opencv_failed), Toast.LENGTH_LONG).show()
             Log.e(TAG, "OpenCV init failed")
+        } else {
+            Log.i(TAG, "OpenCV runtime ready for SEARCH/verify pipeline")
         }
 
         trackerAnalyzer = OpenCVTrackerAnalyzer(overlayView)
         NativeTrackerBridge.initializeEngine()
-        Log.i(TAG, "native bridge backend=${NativeTrackerBridge.backendName()} available=${NativeTrackerBridge.isAvailable()}")
+        val backend = NativeTrackerBridge.backendName()
+        Log.i(TAG, "native bridge backend=$backend available=${NativeTrackerBridge.isAvailable()}")
+        Toast.makeText(
+            this,
+            "SEARCH=OpenCV, TRACK=$backend",
+            Toast.LENGTH_SHORT
+        ).show()
         applyIntentConfig(intent)
 
         overlayView.onBoxSelectedListener = { rect ->

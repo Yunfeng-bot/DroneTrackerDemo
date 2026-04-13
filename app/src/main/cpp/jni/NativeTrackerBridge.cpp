@@ -73,6 +73,29 @@ bool fillFrameBuffer(
     return true;
 }
 
+bool fillGrayFrameBuffer(
+    const uint8_t* grayPtr,
+    jint width,
+    jint height,
+    FrameBuffer* out) {
+    if (out == nullptr || grayPtr == nullptr || width <= 0 || height <= 0) {
+        return false;
+    }
+    out->yPlane = grayPtr;
+    out->uPlane = nullptr;
+    out->vPlane = nullptr;
+    out->width = width;
+    out->height = height;
+    out->rotation = 0;
+    out->yRowStride = width;
+    out->uRowStride = 0;
+    out->vRowStride = 0;
+    out->yPixelStride = 1;
+    out->uPixelStride = 0;
+    out->vPixelStride = 0;
+    return true;
+}
+
 jfloatArray buildTrackResultArray(JNIEnv* env, const TrackResult& result) {
     jfloatArray out = env->NewFloatArray(5);
     if (out == nullptr) {
@@ -191,6 +214,85 @@ Java_com_example_dronetracker_nativebridge_NativeTrackerBridge_nativeTrack(
 
     TrackResult result;
     const bool ok = NanoTrackerEngine::instance().track(frame, &result);
+    if (!ok || !result.ok) {
+        return nullptr;
+    }
+    return buildTrackResultArray(env, result);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dronetracker_nativebridge_NativeTrackerBridge_nativeInitTargetGray(
+    JNIEnv* env,
+    jobject /*thiz*/,
+    jbyteArray grayBuffer,
+    jint width,
+    jint height,
+    jfloat x,
+    jfloat y,
+    jfloat w,
+    jfloat h) {
+    if (grayBuffer == nullptr || width <= 0 || height <= 0) {
+        return JNI_FALSE;
+    }
+
+    const jsize expected = width * height;
+    if (env->GetArrayLength(grayBuffer) < expected) {
+        return JNI_FALSE;
+    }
+
+    jbyte* grayPtr = env->GetByteArrayElements(grayBuffer, nullptr);
+    if (grayPtr == nullptr) {
+        return JNI_FALSE;
+    }
+
+    FrameBuffer frame;
+    const bool frameOk = fillGrayFrameBuffer(reinterpret_cast<const uint8_t*>(grayPtr), width, height, &frame);
+    if (!frameOk) {
+        env->ReleaseByteArrayElements(grayBuffer, grayPtr, JNI_ABORT);
+        return JNI_FALSE;
+    }
+
+    TrackerBbox bbox;
+    bbox.x = x;
+    bbox.y = y;
+    bbox.w = w;
+    bbox.h = h;
+    const bool ok = NanoTrackerEngine::instance().initTarget(frame, bbox);
+    env->ReleaseByteArrayElements(grayBuffer, grayPtr, JNI_ABORT);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_com_example_dronetracker_nativebridge_NativeTrackerBridge_nativeTrackGray(
+    JNIEnv* env,
+    jobject /*thiz*/,
+    jbyteArray grayBuffer,
+    jint width,
+    jint height) {
+    if (grayBuffer == nullptr || width <= 0 || height <= 0) {
+        return nullptr;
+    }
+
+    const jsize expected = width * height;
+    if (env->GetArrayLength(grayBuffer) < expected) {
+        return nullptr;
+    }
+
+    jbyte* grayPtr = env->GetByteArrayElements(grayBuffer, nullptr);
+    if (grayPtr == nullptr) {
+        return nullptr;
+    }
+
+    FrameBuffer frame;
+    const bool frameOk = fillGrayFrameBuffer(reinterpret_cast<const uint8_t*>(grayPtr), width, height, &frame);
+    if (!frameOk) {
+        env->ReleaseByteArrayElements(grayBuffer, grayPtr, JNI_ABORT);
+        return nullptr;
+    }
+
+    TrackResult result;
+    const bool ok = NanoTrackerEngine::instance().track(frame, &result);
+    env->ReleaseByteArrayElements(grayBuffer, grayPtr, JNI_ABORT);
     if (!ok || !result.ok) {
         return nullptr;
     }
