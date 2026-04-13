@@ -1,4 +1,4 @@
-﻿package com.example.dronetracker
+package com.example.dronetracker
 
 import android.Manifest
 import android.content.Intent
@@ -26,6 +26,7 @@ import com.canhub.cropper.CropImageContract
 import com.canhub.cropper.CropImageContractOptions
 import com.canhub.cropper.CropImageOptions
 import com.canhub.cropper.CropImageView
+import com.example.dronetracker.nativebridge.NativeTrackerBridge
 import org.opencv.android.OpenCVLoader
 import java.io.File
 import java.util.concurrent.ExecutorService
@@ -69,7 +70,7 @@ class MainActivity : AppCompatActivity() {
             if (ok) {
                 Toast.makeText(this, getString(R.string.toast_template_loaded), Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(this, "模板纹理过弱，请重新提供目标清晰照片", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "\u6A21\u677F\u7EB9\u7406\u8FC7\u5F31\uFF0C\u8BF7\u91CD\u65B0\u63D0\u4F9B\u76EE\u6807\u6E05\u6670\u7167\u7247", Toast.LENGTH_LONG).show()
             }
         }.onFailure { e ->
             Log.e(TAG, "Failed to load cropped image", e)
@@ -111,6 +112,8 @@ class MainActivity : AppCompatActivity() {
         }
 
         trackerAnalyzer = OpenCVTrackerAnalyzer(overlayView)
+        NativeTrackerBridge.initializeEngine()
+        Log.i(TAG, "native bridge backend=${NativeTrackerBridge.backendName()} available=${NativeTrackerBridge.isAvailable()}")
         applyIntentConfig(intent)
 
         overlayView.onBoxSelectedListener = { rect ->
@@ -306,7 +309,7 @@ class MainActivity : AppCompatActivity() {
 
             val ready = trackerAnalyzer.setTemplateImages(bitmaps)
             if (!ready) {
-                Toast.makeText(this, "模板纹理过弱，请重新提供目标清晰照片", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "\u6A21\u677F\u7EB9\u7406\u8FC7\u5F31\uFF0C\u8BF7\u91CD\u65B0\u63D0\u4F9B\u76EE\u6807\u6E05\u6670\u7167\u7247", Toast.LENGTH_LONG).show()
             }
             return ready
         } finally {
@@ -366,6 +369,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         lastReplayBitmap = null
+        NativeTrackerBridge.release()
         cameraExecutor.shutdown()
         super.onDestroy()
     }
@@ -383,3 +387,4 @@ class MainActivity : AppCompatActivity() {
         private const val DEFAULT_REPLAY_VIDEO_PATH = "/sdcard/Download/Video_Search/scene.mp4"
     }
 }
+

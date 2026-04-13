@@ -29,6 +29,10 @@
         </activity>
 
         <activity
+            android:name=".EvaluationActivity"
+            android:exported="false" />
+
+        <activity
             android:name="com.canhub.cropper.CropImageActivity"
             android:theme="@style/Theme.AppCompat.DayNight.DarkActionBar" />
     </application>

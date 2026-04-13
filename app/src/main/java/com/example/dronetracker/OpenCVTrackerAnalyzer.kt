@@ -101,6 +101,16 @@ class OpenCVTrackerAnalyzer(
         val sideOriginal: Int
     )
 
+    data class PredictionSnapshot(
+        val frameId: Long,
+        val x: Int,
+        val y: Int,
+        val width: Int,
+        val height: Int,
+        val confidence: Double,
+        val tracking: Boolean
+    )
+
     private class TemplateLevel(
         val scale: Double,
         val gray: Mat,
@@ -148,6 +158,14 @@ class OpenCVTrackerAnalyzer(
     private var frameCounter = 0L
     private var consecutiveTrackerFailures = 0
     private var lastTemplateReadyState = true
+    @Volatile
+    private var latestPredictionFrame = 0L
+    @Volatile
+    private var latestPredictionBox: Rect? = null
+    @Volatile
+    private var latestPredictionConfidence = 0.0
+    @Volatile
+    private var latestPredictionTracking = false
 
     private var nv21Buffer: ByteArray? = null
 
@@ -750,6 +768,7 @@ class OpenCVTrackerAnalyzer(
         trackVerifyHardDriftStreak = 0
         searchMissStreak = 0
         clearFirstLockCandidate("reset")
+        updateLatestPrediction(null, 0.0, tracking = false)
         overlayView.post { overlayView.reset() }
     }
 
@@ -794,7 +813,19 @@ class OpenCVTrackerAnalyzer(
             )
         )
     }
-
+    @Synchronized
+    fun latestPredictionSnapshot(): PredictionSnapshot {
+        val box = latestPredictionBox
+        return PredictionSnapshot(
+            frameId = latestPredictionFrame,
+            x = box?.x ?: -1,
+            y = box?.y ?: -1,
+            width = box?.width ?: -1,
+            height = box?.height ?: -1,
+            confidence = latestPredictionConfidence,
+            tracking = latestPredictionTracking
+        )
+    }
     override fun analyze(image: ImageProxy) {
         val startMs = SystemClock.elapsedRealtime()
         val frame = imageToMat(image)
@@ -853,6 +884,7 @@ class OpenCVTrackerAnalyzer(
             }
             lastTemplateReadyState = false
             clearFirstLockCandidate("template_not_ready")
+            updateLatestPrediction(null, 0.0, tracking = false)
             return
         }
         lastTemplateReadyState = true
@@ -863,11 +895,13 @@ class OpenCVTrackerAnalyzer(
             metricsSearchLastReason = lastSearchDiagReason
             searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
             expireFirstLockCandidateIfNeeded()
+            updateLatestPrediction(null, 0.0, tracking = false)
             return
         }
         metricsSearchCandidateCount++
         metricsSearchLastReason = "candidate"
         val confirmed = maybeRefineFallbackCandidate(frame, candidate)
+        updateLatestPrediction(confirmed.box, confirmed.confidence, tracking = false)
 
         if (!isCandidateEligibleForTemporal(confirmed)) {
             metricsSearchTemporalRejectCount++
@@ -936,7 +970,10 @@ class OpenCVTrackerAnalyzer(
             consecutiveTrackerFailures++
             Log.w(TAG, "KCF update failed: streak=$consecutiveTrackerFailures")
             if (consecutiveTrackerFailures < kcfMaxFailStreak) {
-                lastTrackedBox?.let { dispatchTrackedRect(it) }
+                lastTrackedBox?.let {
+                    dispatchTrackedRect(it)
+                    updateLatestPrediction(it, 0.55, tracking = true)
+                }
                 return
             }
             onLost("kcf_update_fail")
@@ -947,7 +984,10 @@ class OpenCVTrackerAnalyzer(
         if (safe == null) {
             consecutiveTrackerFailures++
             if (consecutiveTrackerFailures < kcfMaxFailStreak) {
-                lastTrackedBox?.let { dispatchTrackedRect(it) }
+                lastTrackedBox?.let {
+                    dispatchTrackedRect(it)
+                    updateLatestPrediction(it, 0.55, tracking = true)
+                }
                 return
             }
             onLost("kcf_invalid_box")
@@ -973,6 +1013,7 @@ class OpenCVTrackerAnalyzer(
 
         lastTrackedBox = safe
         dispatchTrackedRect(safe)
+        updateLatestPrediction(safe, 1.0, tracking = true)
     }
 
     private fun onLost(reason: String) {
@@ -983,6 +1024,7 @@ class OpenCVTrackerAnalyzer(
         lastTrackedBox = null
         metricsLostCount++
         clearFirstLockCandidate("lost")
+        updateLatestPrediction(null, 0.0, tracking = false)
         Log.w(TAG, "EVAL_EVENT type=LOST reason=$reason lost=$metricsLostCount")
         overlayView.post { overlayView.reset() }
     }
@@ -1010,6 +1052,7 @@ class OpenCVTrackerAnalyzer(
         searchMissStreak = 0
         lastTrackedBox = safe
         dispatchTrackedRect(safe)
+        updateLatestPrediction(safe, 1.0, tracking = true)
 
         if (!wasTracking) {
             metricsLockCount++
@@ -2732,7 +2775,13 @@ class OpenCVTrackerAnalyzer(
         )
         overlayView.post { overlayView.updateTrackedObject(rect) }
     }
-
+    @Synchronized
+    private fun updateLatestPrediction(box: Rect?, confidence: Double, tracking: Boolean) {
+        latestPredictionFrame = frameCounter
+        latestPredictionTracking = tracking
+        latestPredictionConfidence = confidence
+        latestPredictionBox = if (box == null) null else Rect(box.x, box.y, box.width, box.height)
+    }
     private fun updateScaleFactors(frameWidth: Int, frameHeight: Int) {
         if (overlayView.width == 0 || overlayView.height == 0) return
         scaleX = overlayView.width.toFloat() / frameWidth.toFloat()
