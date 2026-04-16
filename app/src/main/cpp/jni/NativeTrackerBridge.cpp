@@ -75,22 +75,25 @@ bool fillFrameBuffer(
 
 bool fillGrayFrameBuffer(
     const uint8_t* grayPtr,
+    jint bufferLength,
     jint width,
     jint height,
     FrameBuffer* out) {
-    if (out == nullptr || grayPtr == nullptr || width <= 0 || height <= 0) {
+    if (out == nullptr || grayPtr == nullptr || width <= 0 || height <= 0 || bufferLength <= 0) {
         return false;
     }
+    const jint grayBytes = width * height;
+    const bool packedRgb = bufferLength >= grayBytes * 3;
     out->yPlane = grayPtr;
     out->uPlane = nullptr;
     out->vPlane = nullptr;
     out->width = width;
     out->height = height;
     out->rotation = 0;
-    out->yRowStride = width;
+    out->yRowStride = packedRgb ? width * 3 : width;
     out->uRowStride = 0;
     out->vRowStride = 0;
-    out->yPixelStride = 1;
+    out->yPixelStride = packedRgb ? 3 : 1;
     out->uPixelStride = 0;
     out->vPixelStride = 0;
     return true;
@@ -235,8 +238,9 @@ Java_com_example_dronetracker_nativebridge_NativeTrackerBridge_nativeInitTargetG
         return JNI_FALSE;
     }
 
+    const jsize length = env->GetArrayLength(grayBuffer);
     const jsize expected = width * height;
-    if (env->GetArrayLength(grayBuffer) < expected) {
+    if (length < expected) {
         return JNI_FALSE;
     }
 
@@ -246,7 +250,7 @@ Java_com_example_dronetracker_nativebridge_NativeTrackerBridge_nativeInitTargetG
     }
 
     FrameBuffer frame;
-    const bool frameOk = fillGrayFrameBuffer(reinterpret_cast<const uint8_t*>(grayPtr), width, height, &frame);
+    const bool frameOk = fillGrayFrameBuffer(reinterpret_cast<const uint8_t*>(grayPtr), length, width, height, &frame);
     if (!frameOk) {
         env->ReleaseByteArrayElements(grayBuffer, grayPtr, JNI_ABORT);
         return JNI_FALSE;
@@ -273,8 +277,9 @@ Java_com_example_dronetracker_nativebridge_NativeTrackerBridge_nativeTrackGray(
         return nullptr;
     }
 
+    const jsize length = env->GetArrayLength(grayBuffer);
     const jsize expected = width * height;
-    if (env->GetArrayLength(grayBuffer) < expected) {
+    if (length < expected) {
         return nullptr;
     }
 
@@ -284,7 +289,7 @@ Java_com_example_dronetracker_nativebridge_NativeTrackerBridge_nativeTrackGray(
     }
 
     FrameBuffer frame;
-    const bool frameOk = fillGrayFrameBuffer(reinterpret_cast<const uint8_t*>(grayPtr), width, height, &frame);
+    const bool frameOk = fillGrayFrameBuffer(reinterpret_cast<const uint8_t*>(grayPtr), length, width, height, &frame);
     if (!frameOk) {
         env->ReleaseByteArrayElements(grayBuffer, grayPtr, JNI_ABORT);
         return nullptr;

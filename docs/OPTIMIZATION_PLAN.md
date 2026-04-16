@@ -60,7 +60,7 @@
 ## 7. 深度孪生迁移计划（P1/P2）
 
 ### 7.1 里程碑
-- M1：NCNN 真模型后端跑通（`ncnn::Net` 加载 `.param/.bin`，非 stub）
+- M1：NCNN 真模型后端跑通（`ncnn::Net` + `.param/.bin`，已完成代码接入，待 Gate 验证）
 - M2：与 ORB/KCF A/B 对比通过 Gate
 - M3：RKNN 量化模型上板跑通
 - M4：默认后端切换为深度孪生，ORB/KCF 作为 fallback
@@ -82,7 +82,7 @@
 - 只用肉眼效果判定“变好”
 - 缺少模型版本与量化信息登记
 
-## 8. 最新执行快照（2026-04-13）
+## 8. 最新执行快照（2026-04-14）
 
 ### 8.1 P0 已完成项
 1. Native 追踪链路加入置信熔断（soft/hard/min）与可配置参数入口
@@ -97,11 +97,20 @@
 - `avgFrameMs`：median `81.1ms`，p95 `85.37ms`
 
 ### 8.3 当前结论（必须同步给后续 AI）
-1. 当前 `NcnnTrackerImpl` 仍属工程占位实现（stub 相关性内核），不是正式 Siam/NanoTrack 推理
-2. 因此现阶段 NCNN 指标劣于成熟 OpenCV/KCF，不代表“深度路线失败”
-3. P0 参数微调收益已接近上限，继续微调无法实现质变
+1. `NcnnTrackerImpl` 已接入 `ncnn::Net`、模型文件解析与 FP16 选项，并保留 no-runtime fallback
+2. 当前阶段的核心任务不是继续 stub 炼丹，而是完成同源 A/B 与 Gate 判定
+3. 在 Gate 通过前，默认后端仍保持 OpenCV/KCF，不做默认切换
 
 ### 8.4 下一阶段主战役（P1）
-1. 接入真模型：`ncnn::Net` 加载真实 `NanoTrack/Siam` 权重（`.param/.bin`）
-2. 后处理稳态增强：在响应图引入 Hanning/Cosine Window 抑制边缘跳变
-3. 性能压缩：默认启用 FP16（后续评估 INT8 量化）并复用现有回放 Gate 做 A/B
+1. 完成 OpenCV vs NCNN 同源 A/B：固定模型版本、导出配置、CSV 与脚本分析结论
+2. 后处理稳态增强：启用 Hanning/Cosine Window，并在 Gate 口径下评估收益
+3. 性能压缩：保持 FP16 默认，模型稳定后进入 INT8 量化评估
+
+
+
+### 8.5 2026-04-14 A/B 试跑（OpenCV vs NCNN）
+- 记录文档：`docs/P1_AB_RUN_20260414.md`
+- OpenCV CSV：`tools/auto_tune/eval_csv/eval_opencv_20260414_132205.csv`
+- NCNN CSV：`tools/auto_tune/eval_csv/eval_ncnn_20260414_132319.csv`
+- 本轮结论：暂不采用（设备缺少 `nanotrack.param/bin`，无法形成真模型 NCNN 结论）
+- 下一步：模型文件下发后，按同口径重跑并执行 Gate 判定

@@ -94,20 +94,38 @@
 - `docs/OPTIMIZATION_PLAN.md`（基线与 Gate）
 - commit id 与评测 CSV 路径
 
-## 7. 当前状态声明（2026-04-13）
+## 7. 当前状态声明（2026-04-14）
 
 ### 7.1 必须认知
 1. 当前 Native NCNN 路径已完成工程地基（JNI/Zero-Copy/状态机/日志）
-2. 但 `NcnnTrackerImpl` 仍为占位追踪核（stub），不是正式深度孪生模型推理
-3. 因此“当前 NCNN 指标低于 OpenCV/KCF”不作为深度路线否定结论
+2. `NcnnTrackerImpl` 已接入 `ncnn::Net` 与 `.param/.bin` 加载，默认开启 FP16；当 ABI 或模型缺失时会回退到 `ncnn-stub`
+3. 已完成 NCNN Dual 真模型链路的同源 A/B 复测（2026-04-14 晚），当前结果可进入 P1 Gate 审核；默认后端切换仍需补充多场景回归。
 
 ### 7.2 最新 P0 回放结果（10 次）
 - 结果文件：`tools/auto_tune/out/p0_10run_summary_20260413.csv`
 - `first_lock_after_target_sec` median `2.267s`，p95 `2.703s`
 - `track_ratio` median `0.345`，p95 `0.382`
 - `avgFrameMs` median `81.1ms`，p95 `85.37ms`
+- 该结果仍是当前已确认的公开基线，P1 需在同口径下给出可复现实验结论
 
 ### 7.3 下一步强制优先级
-1. P1-1：接入真实 `NanoTrack/Siam` 模型（`ncnn::Net` + `.param/.bin`）
-2. P1-2：响应图后处理加入 Hanning/Cosine Window 抑制跳变
-3. P1-3：开启 FP16，模型稳定后评估 INT8
+1. P1-1：固定模型版本并完成 OpenCV vs NCNN 同源 A/B（CSV + 脚本分析 + Gate 判定）
+2. P1-2：在 NCNN 路径启用 Hanning/Cosine Window 抑制跳变，并验证收益是否满足 Gate
+3. P1-3：维持 FP16 默认配置，模型稳定后再进入 INT8 量化评估
+
+
+
+### 7.4 最新执行记录（2026-04-14）
+- OpenCV CSV：`tools/auto_tune/eval_csv/eval_opencv_20260414_132205.csv`
+- NCNN CSV：`tools/auto_tune/eval_csv/eval_ncnn_20260414_132319.csv`
+- 结果：两组指标接近，但设备缺少 `nanotrack.param/bin`，本轮不纳入 P1 Gate 判定。
+- 详情见：`docs/P1_AB_RUN_20260414.md`
+
+
+### 7.5 追加执行记录（2026-04-14 晚）
+- OpenCV CSV（午间对照）：`tools/auto_tune/eval_csv/eval_opencv_20260414_132205.csv`
+- NCNN 早期 CSV（模型缺失）：`tools/auto_tune/eval_csv/eval_ncnn_20260414_132319.csv`
+- NCNN Dual 最新 CSV：`tools/auto_tune/eval_csv/eval_ncnn_dual_full_20260414.csv`
+- 晚间复测结果（`--conf-lock 0.9`）：`frames=301`, `track_like_ratio=0.8206`, `first_lock_sec=0.4667`, `avg_latency_ms=27.4019`, `p95_latency_ms=132.5030`
+- 结论：NCNN Dual 真模型链路已跑通且达到 P1 Gate 审核口径；默认后端切换前仍需补充多场景回归。
+- 详情见：`docs/P1_AB_RUN_20260414.md`

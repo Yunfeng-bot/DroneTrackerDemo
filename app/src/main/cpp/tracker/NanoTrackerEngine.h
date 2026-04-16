@@ -34,6 +34,8 @@ private:
     mutable std::mutex mutex_;
     std::unique_ptr<ITracker> tracker_;
     TrackerBackend backend_ = TrackerBackend::kNcnn;
+    std::string modelParamPath_;
+    std::string modelBinPath_;
     bool modelReady_ = false;
 };
 

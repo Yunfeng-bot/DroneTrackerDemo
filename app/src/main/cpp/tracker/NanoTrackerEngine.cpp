@@ -19,14 +19,32 @@ NanoTrackerEngine& NanoTrackerEngine::instance() {
 bool NanoTrackerEngine::init(TrackerBackend backend, const std::string& modelParamPath, const std::string& modelBinPath) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    backend_ = backend;
-    tracker_ = createTrackerLocked(backend);
-    if (!tracker_) {
-        modelReady_ = false;
-        return false;
+    const bool sameConfig =
+        tracker_ != nullptr &&
+        backend_ == backend &&
+        modelParamPath_ == modelParamPath &&
+        modelBinPath_ == modelBinPath;
+    if (sameConfig && modelReady_) {
+        __android_log_print(
+            ANDROID_LOG_INFO,
+            kTag,
+            "engine init reuse backend=%s ready=1",
+            tracker_->name());
+        return true;
     }
 
-    modelReady_ = tracker_->loadModel(modelParamPath, modelBinPath);
+    backend_ = backend;
+    modelParamPath_ = modelParamPath;
+    modelBinPath_ = modelBinPath;
+    if (!sameConfig) {
+        tracker_ = createTrackerLocked(backend);
+        if (!tracker_) {
+            modelReady_ = false;
+            return false;
+        }
+    }
+
+    modelReady_ = tracker_->loadModel(modelParamPath_, modelBinPath_);
     __android_log_print(
         ANDROID_LOG_INFO,
         kTag,
@@ -62,6 +80,8 @@ void NanoTrackerEngine::reset() {
 void NanoTrackerEngine::release() {
     std::lock_guard<std::mutex> lock(mutex_);
     tracker_.reset();
+    modelParamPath_.clear();
+    modelBinPath_.clear();
     modelReady_ = false;
 }
 

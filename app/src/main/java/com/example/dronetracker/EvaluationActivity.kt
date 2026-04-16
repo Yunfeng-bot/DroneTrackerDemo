@@ -14,6 +14,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.example.dronetracker.nativebridge.NativeTrackerBridge
 import org.opencv.android.OpenCVLoader
 import org.opencv.core.Mat
 import java.io.File
@@ -55,6 +56,17 @@ class EvaluationActivity : AppCompatActivity() {
             Log.e(TAG, "OpenCV init failed")
             finish()
             return
+        }
+
+        val ncnnBackbonePaths = stageNcnnModelsFromAssets()
+        if (ncnnBackbonePaths != null) {
+            NativeTrackerBridge.setDefaultModelPaths(ncnnBackbonePaths.first, ncnnBackbonePaths.second)
+            Log.i(
+                TAG,
+                "native model assets staged backboneParam=${ncnnBackbonePaths.first} backboneBin=${ncnnBackbonePaths.second}"
+            )
+        } else {
+            Log.w(TAG, "native model assets staging failed in EvaluationActivity")
         }
 
         trackerAnalyzer = OpenCVTrackerAnalyzer(overlayView)
@@ -221,6 +233,35 @@ class EvaluationActivity : AppCompatActivity() {
         return permissions.toTypedArray()
     }
 
+    private fun stageNcnnModelsFromAssets(): Pair<String, String>? {
+        return runCatching {
+            val modelDir = File(filesDir, "ncnn_models")
+            if (!modelDir.exists()) {
+                modelDir.mkdirs()
+            }
+
+            val modelFiles = listOf(
+                ASSET_NCNN_BACKBONE_PARAM,
+                ASSET_NCNN_BACKBONE_BIN,
+                ASSET_NCNN_HEAD_PARAM,
+                ASSET_NCNN_HEAD_BIN
+            )
+            for (assetName in modelFiles) {
+                val target = File(modelDir, assetName)
+                assets.open(assetName).use { input ->
+                    target.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            }
+
+            File(modelDir, ASSET_NCNN_BACKBONE_PARAM).absolutePath to
+                File(modelDir, ASSET_NCNN_BACKBONE_BIN).absolutePath
+        }.onFailure { error ->
+            Log.e(TAG, "stageNcnnModelsFromAssets failed", error)
+        }.getOrNull()
+    }
+
     private fun allPermissionsGranted(): Boolean {
         return requiredPermissions.all {
             ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
@@ -282,6 +323,10 @@ class EvaluationActivity : AppCompatActivity() {
 
         private const val DEFAULT_EVAL_VIDEO_PATH = "/sdcard/test.mp4"
         private const val DEFAULT_EVAL_TARGET_PATH = "/sdcard/Download/Video_Search/target.jpg"
+        private const val ASSET_NCNN_BACKBONE_PARAM = "nanotrack_backbone_sim-opt.param"
+        private const val ASSET_NCNN_BACKBONE_BIN = "nanotrack_backbone_sim-opt.bin"
+        private const val ASSET_NCNN_HEAD_PARAM = "nanotrack_head_sim-opt.param"
+        private const val ASSET_NCNN_HEAD_BIN = "nanotrack_head_sim-opt.bin"
     }
 }
 

@@ -6,6 +6,10 @@ IF "%DIRNAME%"=="" SET DIRNAME=.
 SET APP_BASE_NAME=%~n0
 SET APP_HOME=%DIRNAME%
 
+REM Force project Gradle to use Android Studio JBR on Windows to avoid incompatible system JDK
+SET PROJECT_JBR=C:\Program Files\Android\Android Studio\jbr
+IF EXIST "%PROJECT_JBR%\bin\java.exe" SET JAVA_HOME=%PROJECT_JBR%
+
 SET DEFAULT_JVM_OPTS="-Xmx64m" "-Xms64m"
 
 IF DEFINED JAVA_HOME GOTO findJavaFromJavaHome

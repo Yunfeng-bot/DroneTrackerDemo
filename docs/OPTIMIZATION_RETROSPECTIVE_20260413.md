@@ -1,4 +1,4 @@
-# 追踪优化复盘（2026-04-13）
+﻿# 追踪优化复盘（2026-04-13）
 
 ## 1. 本轮目标
 1. 落地 Native 路径的 P0 能力：置信熔断、自愈、首锁保护、可观测性
@@ -57,3 +57,10 @@
 1. 先读：`docs/TECHNICAL_ARCHITECTURE.md`、`docs/OPTIMIZATION_PLAN.md`、本文件
 2. 先跑：`powershell -ExecutionPolicy Bypass -File tools/gradlew_jbr.ps1 :app:assembleDebug`
 3. 再测：`tools/auto_tune/sweep_replay.py`，并把 CSV 结论回写文档
+
+
+## 8. 状态更新（2026-04-14）
+1. NcnnTrackerImpl 已接入 ncnn::Net 与 .param/.bin 加载逻辑，具备 no-runtime fallback。
+2. 复盘文档中的 stub-only 结论已过时，当前阶段应以 Gate 口径做 OpenCV vs NCNN 同源 A/B。
+3. 下一步重点从是否接入真模型切换为后处理稳定性（Hanning/Cosine）与可复现验证结果回写。
+

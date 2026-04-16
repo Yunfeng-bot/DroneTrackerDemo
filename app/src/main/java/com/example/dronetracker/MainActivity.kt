@@ -96,6 +96,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         viewFinder = findViewById(R.id.viewFinder)
+        viewFinder.scaleType = PreviewView.ScaleType.FIT_CENTER
         replayFrameView = findViewById(R.id.replayFrameView)
         overlayView = findViewById(R.id.overlayView)
         btnSelectImage = findViewById(R.id.btnSelectImage)
@@ -112,6 +113,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         trackerAnalyzer = OpenCVTrackerAnalyzer(overlayView)
+        val ncnnBackbonePaths = stageNcnnModelsFromAssets()
+        if (ncnnBackbonePaths != null) {
+            NativeTrackerBridge.setDefaultModelPaths(ncnnBackbonePaths.first, ncnnBackbonePaths.second)
+            Log.i(
+                TAG,
+                "native model assets staged backboneParam=${ncnnBackbonePaths.first} backboneBin=${ncnnBackbonePaths.second}"
+            )
+        } else {
+            Log.w(TAG, "native model assets staging failed, fallback to external model paths")
+        }
         NativeTrackerBridge.initializeEngine()
         val backend = NativeTrackerBridge.backendName()
         Log.i(TAG, "native bridge backend=$backend available=${NativeTrackerBridge.isAvailable()}")
@@ -347,6 +358,35 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun stageNcnnModelsFromAssets(): Pair<String, String>? {
+        return runCatching {
+            val modelDir = File(filesDir, "ncnn_models")
+            if (!modelDir.exists()) {
+                modelDir.mkdirs()
+            }
+
+            val modelFiles = listOf(
+                ASSET_NCNN_BACKBONE_PARAM,
+                ASSET_NCNN_BACKBONE_BIN,
+                ASSET_NCNN_HEAD_PARAM,
+                ASSET_NCNN_HEAD_BIN
+            )
+            for (assetName in modelFiles) {
+                val target = File(modelDir, assetName)
+                assets.open(assetName).use { input ->
+                    target.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            }
+
+            File(modelDir, ASSET_NCNN_BACKBONE_PARAM).absolutePath to
+                File(modelDir, ASSET_NCNN_BACKBONE_BIN).absolutePath
+        }.onFailure { error ->
+            Log.e(TAG, "stageNcnnModelsFromAssets failed", error)
+        }.getOrNull()
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<String>,
@@ -391,6 +431,11 @@ class MainActivity : AppCompatActivity() {
         private const val EXTRA_EVAL_PARAMS = "eval_params"
         private const val DEFAULT_REPLAY_TARGET_PATH = "/sdcard/Download/Video_Search/target.jpg"
         private const val DEFAULT_REPLAY_VIDEO_PATH = "/sdcard/Download/Video_Search/scene.mp4"
+        private const val ASSET_NCNN_BACKBONE_PARAM = "nanotrack_backbone_sim-opt.param"
+        private const val ASSET_NCNN_BACKBONE_BIN = "nanotrack_backbone_sim-opt.bin"
+        private const val ASSET_NCNN_HEAD_PARAM = "nanotrack_head_sim-opt.param"
+        private const val ASSET_NCNN_HEAD_BIN = "nanotrack_head_sim-opt.bin"
     }
 }
+
 

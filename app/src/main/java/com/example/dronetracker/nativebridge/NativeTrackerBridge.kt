@@ -27,6 +27,12 @@ object NativeTrackerBridge {
     @Volatile
     private var loadFailure: Throwable? = null
 
+    @Volatile
+    private var defaultModelParamPath: String? = null
+
+    @Volatile
+    private var defaultModelBinPath: String? = null
+
     init {
         runCatching {
             System.loadLibrary("dronetracker_native")
@@ -43,12 +49,21 @@ object NativeTrackerBridge {
         modelBinPath: String? = null
     ): Boolean {
         if (!libraryLoaded) return false
+        val resolvedParam = modelParamPath?.takeIf { it.isNotBlank() }
+            ?: if (backend == Backend.NCNN) defaultModelParamPath else null
+        val resolvedBin = modelBinPath?.takeIf { it.isNotBlank() }
+            ?: if (backend == Backend.NCNN) defaultModelBinPath else null
         return runCatching {
-            nativeInitEngine(backend.value, modelParamPath, modelBinPath)
+            nativeInitEngine(backend.value, resolvedParam, resolvedBin)
         }.getOrElse {
             Log.e(TAG, "initializeEngine failed", it)
             false
         }
+    }
+
+    fun setDefaultModelPaths(modelParamPath: String?, modelBinPath: String?) {
+        defaultModelParamPath = modelParamPath?.takeIf { it.isNotBlank() }
+        defaultModelBinPath = modelBinPath?.takeIf { it.isNotBlank() }
     }
 
     fun initTarget(image: ImageProxy, bbox: Rect): Boolean {

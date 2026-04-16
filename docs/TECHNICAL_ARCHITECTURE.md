@@ -1,4 +1,4 @@
-﻿# 无人机单目标追踪技术方案（2026-04-13）
+﻿# 无人机单目标追踪技术方案（2026-04-14）
 
 ## 1. 目标与范围
 本方案定义当前 Android 端单目标追踪系统从 MVP 走向工业化的技术底座，覆盖：
@@ -37,7 +37,7 @@
 - JNI: `cpp/jni/NativeTrackerBridge.cpp`
 - HAL:
   - `ITracker` 抽象接口
-  - `NcnnTrackerImpl`（当前为工程占位 stub，不是正式 Siam 网络）
+  - `NcnnTrackerImpl`（已接入 `ncnn::Net` 与模型加载，保留 no-runtime fallback）
   - `RknnTrackerImpl`（当前 stub）
   - `NanoTrackerEngine` 单例管理
 
@@ -156,3 +156,4 @@
 - 发布阶段保留 `OpenCV` 兜底开关
 - 深度后端触发异常时自动切回 ORB/KCF
 - 严禁“单后端不可回退”上线
+
