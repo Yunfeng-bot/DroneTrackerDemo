@@ -210,20 +210,16 @@ class AdbRunner:
         self.repo_root = repo_root
         self.mode = mode
         self.wrapper = repo_root / "tools" / "adb_exec.ps1"
-        self.args_file = repo_root / "tools" / "adb_args.json"
 
     def run(self, args: List[str], timeout_sec: int = 30, check: bool = True) -> str:
         if self.mode == "wrapper":
-            self.args_file.write_text(
-                json.dumps(args, ensure_ascii=False),
-                encoding="utf-8",
-            )
             cmd = [
                 "powershell",
                 "-ExecutionPolicy",
                 "Bypass",
                 "-File",
                 str(self.wrapper),
+                *args,
             ]
         else:
             cmd = ["adb", *args]
@@ -400,11 +396,18 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
-    output_root = repo_root / args.output_dir
     run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_root = repo_root / args.output_dir
     run_dir = output_root / run_tag
     logs_dir = run_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        fallback_root = repo_root / ".codex_tmp" / "auto_tune" / "out"
+        run_dir = fallback_root / run_tag
+        logs_dir = run_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[sweep] output dir not writable ({output_root}): {exc}. fallback={fallback_root}")
 
     grid = make_default_grid(args.preset)
     for item in args.grid:
