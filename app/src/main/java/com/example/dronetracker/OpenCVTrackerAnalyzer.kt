@@ -5159,10 +5159,10 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_ORB_FAR_BOOST_MULTI_TEMPLATE_CAP = 1200
 
         private const val DEFAULT_FIRST_LOCK_STABLE_FRAMES = 3
-        private const val DEFAULT_FIRST_LOCK_STABLE_MS = 240L
+        private const val DEFAULT_FIRST_LOCK_STABLE_MS = 200L
         private const val DEFAULT_FIRST_LOCK_STABLE_PX = 54.0
         private const val DEFAULT_FIRST_LOCK_MIN_IOU = 0.40
-        private const val DEFAULT_FIRST_LOCK_GAP_MS = 650L
+        private const val DEFAULT_FIRST_LOCK_GAP_MS = 500L
         private const val DEFAULT_FIRST_LOCK_SMALL_CENTER_DRIFT_PX = 20.0
         private const val DEFAULT_FIRST_LOCK_SMALL_CENTER_DRIFT_RELAXED_PX = 34.0
         private const val DEFAULT_FIRST_LOCK_SMALL_STABLE_PX = 84.0
@@ -5192,10 +5192,10 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_FIRST_LOCK_CENTER_RELAX_CAP_FACTOR = 1.2
         private const val DEFAULT_FIRST_LOCK_CONF_STRONG_GOOD = 24
         private const val DEFAULT_FIRST_LOCK_CONF_STRONG_INLIERS = 8
-        private const val DEFAULT_FIRST_LOCK_CONF_STRONG_MIN = 0.24
+        private const val DEFAULT_FIRST_LOCK_CONF_STRONG_MIN = 0.22
         private const val DEFAULT_FIRST_LOCK_CONF_MEDIUM_GOOD = 16
         private const val DEFAULT_FIRST_LOCK_CONF_MEDIUM_INLIERS = 6
-        private const val DEFAULT_FIRST_LOCK_CONF_MEDIUM_MIN = 0.28
+        private const val DEFAULT_FIRST_LOCK_CONF_MEDIUM_MIN = 0.24
         private const val DEFAULT_FIRST_LOCK_CONF_SMALL_MIN = 0.30
         private const val DEFAULT_FIRST_LOCK_CONF_BASE_MIN = 0.03
         private const val DEFAULT_FIRST_LOCK_HOLD_ON_TEMPORAL_REJECT = true
@@ -5238,9 +5238,9 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_NATIVE_FUSE_WARMUP_FRAMES = 12
         private const val DEFAULT_NATIVE_HOLD_LAST_ON_SOFT_REJECT = true
         private const val DEFAULT_NATIVE_ORB_VERIFY_ENABLED = false
-        private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_GOOD = 18
-        private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_INLIERS = 7
-        private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_CONFIDENCE = 0.42
+        private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_GOOD = 16
+        private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_INLIERS = 6
+        private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_CONFIDENCE = 0.36
         private const val DEFAULT_AUTO_VERIFY_STRONG_APPEARANCE_MIN_LIVE = 0.16
         private const val DEFAULT_AUTO_VERIFY_STRONG_APPEARANCE_MIN_REPLAY = 0.10
         private const val DEFAULT_AUTO_VERIFY_LOCAL_ROI_EXPAND_FACTOR = 1.6
@@ -5249,9 +5249,9 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_IOU_LIVE = 0.40
         private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_IOU_REPLAY = 0.00
         private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_SCALE_LIVE = 0.72
-        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_SCALE_REPLAY = 0.80
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_SCALE_REPLAY = 0.75
         private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_FLOOR_LIVE = 0.24
-        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_FLOOR_REPLAY = 0.30
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_FLOOR_REPLAY = 0.24
         private const val DEFAULT_AUTO_VERIFY_APPEAR_STRONG_GOOD = 24
         private const val DEFAULT_AUTO_VERIFY_APPEAR_STRONG_INLIERS = 10
         private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_STRONG = -0.06
@@ -5269,13 +5269,13 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_KALMAN_HIGH_CONFIDENCE_THRESHOLD = 0.80
         private const val DEFAULT_KALMAN_LOW_CONFIDENCE_THRESHOLD = 0.20
         private const val DEFAULT_KALMAN_HIGH_CONFIDENCE_NOISE_SCALE = 0.25
-        private const val DEFAULT_KALMAN_LOW_CONFIDENCE_NOISE_SCALE = 8.0
-        private const val DEFAULT_KALMAN_OCCLUSION_NOISE_SCALE = 12.0
+        private const val DEFAULT_KALMAN_LOW_CONFIDENCE_NOISE_SCALE = 6.0
+        private const val DEFAULT_KALMAN_OCCLUSION_NOISE_SCALE = 10.0
         private const val DEFAULT_KALMAN_FEED_NATIVE_PRIOR = true
         private const val DEFAULT_KALMAN_PRETRACK_PRIOR_FEED = false
         private const val DEFAULT_KALMAN_PRIOR_ONLY_ON_UNCERTAIN = true
-        private const val DEFAULT_KALMAN_PRIOR_MIN_IOU = 0.30
-        private const val DEFAULT_KALMAN_PRIOR_STALE_MS = 120L
+        private const val DEFAULT_KALMAN_PRIOR_MIN_IOU = 0.25
+        private const val DEFAULT_KALMAN_PRIOR_STALE_MS = 100L
         private const val DEFAULT_LOCK_HOLD_FRAMES = 0
         private const val DEFAULT_LOST_OVERLAY_HOLD_MS = 120L
         private const val DEFAULT_FAST_FIRST_LOCK_FRAMES = 240
@@ -5300,14 +5300,14 @@ class OpenCVTrackerAnalyzer(
         private const val TRACK_VERIFY_HARD_MIN_GOOD_MATCHES = 5
         private const val DEFAULT_TRACK_VERIFY_HARD_DRIFT_TOLERANCE = 3
         private const val DEFAULT_TRACK_VERIFY_NATIVE_BYPASS_CONFIDENCE = 0.75
-        private const val DEFAULT_TRACK_GUARD_MAX_CENTER_JUMP_FACTOR = 1.10
+        private const val DEFAULT_TRACK_GUARD_MAX_CENTER_JUMP_FACTOR = 1.00
         private const val DEFAULT_TRACK_GUARD_MIN_AREA_RATIO = 0.35
-        private const val DEFAULT_TRACK_GUARD_MAX_AREA_RATIO = 2.20
+        private const val DEFAULT_TRACK_GUARD_MAX_AREA_RATIO = 2.00
         private const val DEFAULT_TRACK_GUARD_DROP_STREAK = 1
         private const val DEFAULT_TRACK_GUARD_APPEARANCE_CHECK_INTERVAL = 4L
         private const val DEFAULT_TRACK_GUARD_MIN_APPEARANCE_SCORE = -0.12
-        private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED = 0.28
-        private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE = 0.35
+        private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED = 0.24
+        private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE = 0.32
         private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_RELAX = 0.03
         private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_FLOOR = 0.10
 
