@@ -24,6 +24,10 @@ inline float sigmoid(float x) {
     return z / (1.0f + z);
 }
 
+inline float cosineToUnit(float cosine) {
+    return clampFloat((cosine + 1.0f) * 0.5f, 0.0f, 1.0f);
+}
+
 inline float changeRatio(float v) {
     if (v <= 1e-6f) {
         return 1.0f;
@@ -334,6 +338,7 @@ bool NcnnTrackerImpl::loadModel(const std::string& modelParamPath, const std::st
     useDualNetPipeline_ = false;
     headParamPath_.clear();
     headBinPath_.clear();
+    backboneFeatureBlob_.clear();
 
     std::string resolvedParam;
     std::string resolvedBin;
@@ -384,6 +389,13 @@ bool NcnnTrackerImpl::loadModel(const std::string& modelParamPath, const std::st
         useDualNetPipeline_ = true;
         headParamPath_ = resolvedHeadParam;
         headBinPath_ = resolvedHeadBin;
+        {
+            std::vector<std::string> backboneOutputs;
+            for (const char* name : netBackbone_.output_names()) {
+                backboneOutputs.emplace_back(name == nullptr ? "" : name);
+            }
+            backboneFeatureBlob_ = backboneOutputs.empty() || backboneOutputs[0].empty() ? "output" : backboneOutputs[0];
+        }
         modelMode_ = ModelMode::kSiamLike;
         templateInputBlob_ = "input";
         searchInputBlob_ = "input";
@@ -396,11 +408,12 @@ bool NcnnTrackerImpl::loadModel(const std::string& modelParamPath, const std::st
         __android_log_print(
             ANDROID_LOG_INFO,
             kTag,
-            "backend=ncnn dual-net load ok backbone=%s/%s head=%s/%s fp16=%d",
+            "backend=ncnn dual-net load ok backbone=%s/%s head=%s/%s featBlob=%s fp16=%d",
             resolvedParam.c_str(),
             resolvedBin.c_str(),
             resolvedHeadParam.c_str(),
             resolvedHeadBin.c_str(),
+            backboneFeatureBlob_.c_str(),
             useFp16Arithmetic_ ? 1 : 0);
         __android_log_print(ANDROID_LOG_INFO, kTag, "DT_NCNN_PIPELINE_DUAL_OK");
         return true;
@@ -496,6 +509,9 @@ bool NcnnTrackerImpl::init(const FrameBuffer& frame, const TrackerBbox& bbox) {
             return false;
         }
         templateFeature_ = feature.clone();
+        if (!computeGapEmbedding(templateFeature_, &templateGapEmbedding_) || templateGapEmbedding_.empty()) {
+            return false;
+        }
         templateInputMat_ = ncnn::Mat();
     } else {
         ncnn::Mat templatePatch;
@@ -504,6 +520,7 @@ bool NcnnTrackerImpl::init(const FrameBuffer& frame, const TrackerBbox& bbox) {
         }
         templateInputMat_ = templatePatch.clone();
         templateFeature_ = ncnn::Mat();
+        templateGapEmbedding_.clear();
     }
 
     hasTemplate_ = true;
@@ -565,6 +582,13 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
             outResult->similarity = 0.0f;
             outResult->bbox = lastBox_;
             return false;
+        }
+        std::vector<float> searchGapEmbedding;
+        float gapSimilarity = 0.0f;
+        bool hasGapSimilarity = false;
+        if (!templateGapEmbedding_.empty() && computeGapEmbedding(xf, &searchGapEmbedding) && !searchGapEmbedding.empty()) {
+            gapSimilarity = cosineToUnit(cosineSimilarity(templateGapEmbedding_, searchGapEmbedding));
+            hasGapSimilarity = true;
         }
 
         ncnn::Extractor exHead = netHead_.create_extractor();
@@ -652,12 +676,23 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
             }
         }
 
-        if (bestRawScore < minScoreThreshold_) {
+        const bool recoverByGap = hasGapSimilarity && gapSimilarity >= gapRecoverSimilarityThreshold_;
+        if (bestRawScore < minScoreThreshold_ && !recoverByGap) {
             outResult->ok = false;
             outResult->confidence = clampFloat(bestRawScore, 0.0f, 1.0f);
-            outResult->similarity = clampFloat(bestRawScore, 0.0f, 1.0f);
+            outResult->similarity = hasGapSimilarity ? gapSimilarity : clampFloat(bestRawScore, 0.0f, 1.0f);
             outResult->bbox = lastBox_;
             return false;
+        }
+
+        if (recoverByGap && bestRawScore < minScoreThreshold_) {
+            __android_log_print(
+                ANDROID_LOG_INFO,
+                kTag,
+                "backend=ncnn dual recover-by-gap raw=%.3f gap=%.3f th=%.3f",
+                bestRawScore,
+                gapSimilarity,
+                gapRecoverSimilarityThreshold_);
         }
 
         const float predXs = (bestX1 + bestX2) * 0.5f;
@@ -684,8 +719,12 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
         outResult->ok = true;
         outResult->bbox = decoded;
         const float calibratedConfidence = clampFloat(bestRawScore * 1.35f + 0.05f, 0.0f, 1.0f);
-        outResult->confidence = clampFloat(calibratedConfidence * 0.90f + bestPScore * 0.10f, 0.0f, 1.0f);
-        outResult->similarity = clampFloat(bestRawScore, 0.0f, 1.0f);
+        float fusedConfidence = clampFloat(calibratedConfidence * 0.90f + bestPScore * 0.10f, 0.0f, 1.0f);
+        if (recoverByGap) {
+            fusedConfidence = std::max(fusedConfidence, gapSimilarity * 0.92f);
+        }
+        outResult->confidence = fusedConfidence;
+        outResult->similarity = hasGapSimilarity ? gapSimilarity : clampFloat(bestRawScore, 0.0f, 1.0f);
         return true;
     }
 
@@ -710,8 +749,14 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
             if (!runEmbeddingFeature(searchPatch, &feature) || feature.empty()) {
                 return false;
             }
-            const float cosine = cosineSimilarity(templateFeature_, feature);
-            confidence = clampFloat((cosine + 1.0f) * 0.5f, 0.0f, 1.0f);
+            float cosine = cosineSimilarity(templateFeature_, feature);
+            if (!templateGapEmbedding_.empty()) {
+                std::vector<float> searchGapEmbedding;
+                if (computeGapEmbedding(feature, &searchGapEmbedding) && !searchGapEmbedding.empty()) {
+                    cosine = cosineSimilarity(templateGapEmbedding_, searchGapEmbedding);
+                }
+            }
+            confidence = cosineToUnit(cosine);
         } else {
             float siamScore = 0.0f;
             const ncnn::Mat& templateRef = useDualNetPipeline_ ? templateFeature_ : templateInputMat_;
@@ -912,6 +957,7 @@ void NcnnTrackerImpl::reset() {
     hasTemplate_ = false;
     lastBox_ = TrackerBbox{};
     templateFeature_ = ncnn::Mat();
+    templateGapEmbedding_.clear();
     templateInputMat_ = ncnn::Mat();
 }
 
@@ -1129,8 +1175,9 @@ bool NcnnTrackerImpl::runEmbeddingFeature(const ncnn::Mat& patch, ncnn::Mat* out
         if (extractor.input("input", patch) != 0) {
             return false;
         }
+        const char* featureBlob = backboneFeatureBlob_.empty() ? "output" : backboneFeatureBlob_.c_str();
         ncnn::Mat feature;
-        if (extractor.extract("output", feature) != 0 || feature.empty()) {
+        if (extractor.extract(featureBlob, feature) != 0 || feature.empty()) {
             return false;
         }
         *outFeature = feature;
@@ -1149,6 +1196,42 @@ bool NcnnTrackerImpl::runEmbeddingFeature(const ncnn::Mat& patch, ncnn::Mat* out
     }
     *outFeature = feature;
     return true;
+}
+
+bool NcnnTrackerImpl::computeGapEmbedding(const ncnn::Mat& featureMap, std::vector<float>* outEmbedding) const {
+    if (outEmbedding == nullptr || featureMap.empty()) {
+        return false;
+    }
+    outEmbedding->clear();
+
+    if (featureMap.dims <= 2) {
+        const size_t total = featureMap.total();
+        if (total == 0) {
+            return false;
+        }
+        double sum = 0.0;
+        for (size_t i = 0; i < total; ++i) {
+            sum += featureMap[i];
+        }
+        outEmbedding->push_back(static_cast<float>(sum / static_cast<double>(total)));
+        return true;
+    }
+
+    const int channels = std::max(1, featureMap.c);
+    outEmbedding->resize(static_cast<size_t>(channels), 0.0f);
+    for (int c = 0; c < channels; ++c) {
+        const ncnn::Mat channel = featureMap.channel(c);
+        const size_t elems = channel.total();
+        if (elems == 0) {
+            continue;
+        }
+        double sum = 0.0;
+        for (size_t i = 0; i < elems; ++i) {
+            sum += channel[i];
+        }
+        (*outEmbedding)[static_cast<size_t>(c)] = static_cast<float>(sum / static_cast<double>(elems));
+    }
+    return !outEmbedding->empty();
 }
 
 bool NcnnTrackerImpl::runSiamScore(const ncnn::Mat& templatePatch, const ncnn::Mat& searchPatch, float* outScore) const {
@@ -1234,6 +1317,28 @@ float NcnnTrackerImpl::cosineSimilarity(const ncnn::Mat& a, const ncnn::Mat& b) 
     return clampFloat(dot / denom, -1.0f, 1.0f);
 }
 
+float NcnnTrackerImpl::cosineSimilarity(const std::vector<float>& a, const std::vector<float>& b) const {
+    if (a.empty() || b.empty()) {
+        return -1.0f;
+    }
+    const size_t total = std::min(a.size(), b.size());
+    if (total == 0) {
+        return -1.0f;
+    }
+    double dot = 0.0;
+    double na = 0.0;
+    double nb = 0.0;
+    for (size_t i = 0; i < total; ++i) {
+        const double va = static_cast<double>(a[i]);
+        const double vb = static_cast<double>(b[i]);
+        dot += va * vb;
+        na += va * va;
+        nb += vb * vb;
+    }
+    const double denom = std::sqrt(std::max(na * nb, 1e-12));
+    return clampFloat(static_cast<float>(dot / denom), -1.0f, 1.0f);
+}
+
 float NcnnTrackerImpl::reduceScore(const ncnn::Mat& out) const {
     if (out.empty() || out.total() == 0) {
         return -1.0f;
@@ -1256,6 +1361,7 @@ void NcnnTrackerImpl::updateTemplateFeature(const ncnn::Mat& feature) {
     }
     if (templateFeature_.empty() || templateFeature_.total() != feature.total()) {
         templateFeature_ = feature.clone();
+        computeGapEmbedding(templateFeature_, &templateGapEmbedding_);
         return;
     }
     const float beta = clampFloat(templateUpdateRate_, 0.0f, 0.20f);
@@ -1263,6 +1369,7 @@ void NcnnTrackerImpl::updateTemplateFeature(const ncnn::Mat& feature) {
     for (size_t i = 0; i < total; ++i) {
         templateFeature_[i] = templateFeature_[i] * (1.0f - beta) + feature[i] * beta;
     }
+    computeGapEmbedding(templateFeature_, &templateGapEmbedding_);
 }
 
 void NcnnTrackerImpl::ensureDualHanningCache(int rows, int cols) {

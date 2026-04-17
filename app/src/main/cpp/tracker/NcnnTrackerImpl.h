@@ -41,6 +41,7 @@ private:
         int patchSize,
         ncnn::Mat* outMat) const;
     bool runEmbeddingFeature(const ncnn::Mat& patch, ncnn::Mat* outFeature) const;
+    bool computeGapEmbedding(const ncnn::Mat& featureMap, std::vector<float>* outEmbedding) const;
     bool runSiamScore(const ncnn::Mat& templatePatch, const ncnn::Mat& searchPatch, float* outScore) const;
     bool resolveDualNetHeadPaths(
         const std::string& backboneParamPath,
@@ -49,6 +50,7 @@ private:
         std::string* outHeadBinPath) const;
     void ensureDualHanningCache(int rows, int cols);
     float cosineSimilarity(const ncnn::Mat& a, const ncnn::Mat& b) const;
+    float cosineSimilarity(const std::vector<float>& a, const std::vector<float>& b) const;
     float reduceScore(const ncnn::Mat& out) const;
     void updateTemplateFeature(const ncnn::Mat& feature);
     float cosineWindowValue(float centerOffset, float radius) const;
@@ -95,10 +97,12 @@ private:
     ncnn::Net netBackbone_;
     ncnn::Net netHead_;
     ncnn::Mat templateFeature_;
+    std::vector<float> templateGapEmbedding_;
     ncnn::Mat templateInputMat_;
     bool useDualNetPipeline_ = false;
     std::string headParamPath_;
     std::string headBinPath_;
+    std::string backboneFeatureBlob_;
     bool enableCosineWindow_ = true;
     float cosineWindowInfluence_ = 0.40f;
     std::vector<float> dualHanningY_;
@@ -116,6 +120,7 @@ private:
     float minScoreThreshold_ = 0.16f;
     float smoothAlpha_ = 0.60f;
     float templateUpdateRate_ = 0.04f;
+    float gapRecoverSimilarityThreshold_ = 0.85f;
 };
 
 } // namespace dronetracker
