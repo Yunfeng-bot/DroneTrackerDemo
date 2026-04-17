@@ -31,6 +31,7 @@ bool RknnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
     }
     outResult->ok = false;
     outResult->confidence = 0.0f;
+    outResult->similarity = 0.0f;
     outResult->bbox = TrackerBbox{};
     return false;
 }

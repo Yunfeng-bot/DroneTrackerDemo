@@ -32,6 +32,8 @@ struct TrackerBbox {
 struct TrackResult {
     bool ok = false;
     float confidence = 0.0f;
+    // Model-native similarity score in [0, 1], before upper-layer temporal/window fusion.
+    float similarity = 0.0f;
     TrackerBbox bbox;
 };
 

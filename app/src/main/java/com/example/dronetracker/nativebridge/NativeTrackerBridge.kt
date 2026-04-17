@@ -16,7 +16,8 @@ object NativeTrackerBridge {
         val y: Float,
         val w: Float,
         val h: Float,
-        val confidence: Float
+        val confidence: Float,
+        val similarity: Float
     )
 
     private const val TAG = "NativeTrackerBridge"
@@ -128,7 +129,8 @@ object NativeTrackerBridge {
         } ?: return null
 
         if (raw.size < 5) return null
-        return NativeTrackResult(raw[0], raw[1], raw[2], raw[3], raw[4])
+        val similarity = if (raw.size >= 6) raw[5] else raw[4]
+        return NativeTrackResult(raw[0], raw[1], raw[2], raw[3], raw[4], similarity)
     }
 
     fun setPriorBbox(bbox: Rect): Boolean {
@@ -176,7 +178,8 @@ object NativeTrackerBridge {
         } ?: return null
 
         if (raw.size < 5) return null
-        return NativeTrackResult(raw[0], raw[1], raw[2], raw[3], raw[4])
+        val similarity = if (raw.size >= 6) raw[5] else raw[4]
+        return NativeTrackResult(raw[0], raw[1], raw[2], raw[3], raw[4], similarity)
     }
 
     fun reset() {

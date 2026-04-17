@@ -553,6 +553,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
         if (!extractPatchToMat(frame, prevCx, prevCy, sX, sX, searchInputSize_, &searchPatch)) {
             outResult->ok = false;
             outResult->confidence = 0.0f;
+            outResult->similarity = 0.0f;
             outResult->bbox = lastBox_;
             return false;
         }
@@ -561,6 +562,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
         if (!runEmbeddingFeature(searchPatch, &xf) || xf.empty()) {
             outResult->ok = false;
             outResult->confidence = 0.0f;
+            outResult->similarity = 0.0f;
             outResult->bbox = lastBox_;
             return false;
         }
@@ -570,6 +572,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
         if (exHead.input("input1", templateFeature_) != 0 || exHead.input("input2", xf) != 0) {
             outResult->ok = false;
             outResult->confidence = 0.0f;
+            outResult->similarity = 0.0f;
             outResult->bbox = lastBox_;
             return false;
         }
@@ -580,6 +583,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
             bbox.c < 4) {
             outResult->ok = false;
             outResult->confidence = 0.0f;
+            outResult->similarity = 0.0f;
             outResult->bbox = lastBox_;
             return false;
         }
@@ -590,6 +594,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
         if (rows <= 0 || cols <= 0 || scoreMap.total() != static_cast<size_t>(rows * cols)) {
             outResult->ok = false;
             outResult->confidence = 0.0f;
+            outResult->similarity = 0.0f;
             outResult->bbox = lastBox_;
             return false;
         }
@@ -650,6 +655,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
         if (bestRawScore < minScoreThreshold_) {
             outResult->ok = false;
             outResult->confidence = clampFloat(bestRawScore, 0.0f, 1.0f);
+            outResult->similarity = clampFloat(bestRawScore, 0.0f, 1.0f);
             outResult->bbox = lastBox_;
             return false;
         }
@@ -679,6 +685,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
         outResult->bbox = decoded;
         const float calibratedConfidence = clampFloat(bestRawScore * 1.35f + 0.05f, 0.0f, 1.0f);
         outResult->confidence = clampFloat(calibratedConfidence * 0.90f + bestPScore * 0.10f, 0.0f, 1.0f);
+        outResult->similarity = clampFloat(bestRawScore, 0.0f, 1.0f);
         return true;
     }
 
@@ -758,6 +765,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
     if (coarseBestWindowed < 0.0f) {
         outResult->ok = false;
         outResult->confidence = 0.0f;
+        outResult->similarity = 0.0f;
         outResult->bbox = lastBox_;
         return false;
     }
@@ -819,6 +827,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
     if (bestWindowedConfidence < minScoreThreshold_) {
         outResult->ok = false;
         outResult->confidence = 0.0f;
+        outResult->similarity = 0.0f;
         outResult->bbox = lastBox_;
         return false;
     }
@@ -879,6 +888,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
     outResult->ok = true;
     outResult->bbox = lastBox_;
     outResult->confidence = clampFloat(bestConfidence * 0.70f + bestWindowedConfidence * 0.30f, 0.0f, 1.0f);
+    outResult->similarity = clampFloat(bestConfidence, 0.0f, 1.0f);
     return true;
 }
 
@@ -1413,6 +1423,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
     if (bestScore < minScoreThreshold_) {
         outResult->ok = false;
         outResult->confidence = 0.0f;
+        outResult->similarity = 0.0f;
         outResult->bbox = lastBox_;
         return false;
     }
@@ -1442,6 +1453,7 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
     outResult->ok = true;
     outResult->bbox = lastBox_;
     outResult->confidence = clampFloat((bestScore + 1.0f) * 0.5f, 0.0f, 1.0f);
+    outResult->similarity = outResult->confidence;
     return true;
 }
 

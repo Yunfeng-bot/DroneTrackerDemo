@@ -100,18 +100,19 @@ bool fillGrayFrameBuffer(
 }
 
 jfloatArray buildTrackResultArray(JNIEnv* env, const TrackResult& result) {
-    jfloatArray out = env->NewFloatArray(5);
+    jfloatArray out = env->NewFloatArray(6);
     if (out == nullptr) {
         return nullptr;
     }
-    const jfloat values[5] = {
+    const jfloat values[6] = {
         result.bbox.x,
         result.bbox.y,
         result.bbox.w,
         result.bbox.h,
         result.confidence,
+        result.similarity,
     };
-    env->SetFloatArrayRegion(out, 0, 5, values);
+    env->SetFloatArrayRegion(out, 0, 6, values);
     return out;
 }
 
