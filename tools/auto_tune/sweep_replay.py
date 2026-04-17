@@ -28,6 +28,12 @@ from typing import Dict, Iterable, List, Tuple
 PACKAGE_NAME = "com.example.dronetracker"
 ACTIVITY_NAME = ".MainActivity"
 TRACKER_TAG = "Tracker"
+# Sweep scoring only needs EVAL_PERF / EVAL_SUMMARY (warning level),
+# so avoid verbose score spam that can stall logcat dumps.
+TRACKER_LOG_LEVEL = "W"
+LOGCAT_PRIMARY_TIMEOUT_SEC = 20
+LOGCAT_FALLBACK_TIMEOUT_SEC = 20
+LOGCAT_MAX_LINES = 400
 
 
 @dataclass
@@ -440,6 +446,11 @@ def parse_tracker_log(text: str) -> Dict[str, object]:
         first_lock_sec = to_float(perf_kv.get("firstLockSec"))
     if first_lock_sec is None:
         first_lock_sec = to_float(lock_kv.get("firstLockSec"))
+    first_lock_replay_sec = to_float(summary_kv.get("firstLockReplaySec"))
+    if first_lock_replay_sec is None:
+        first_lock_replay_sec = to_float(perf_kv.get("firstLockReplaySec"))
+    if first_lock_replay_sec is None:
+        first_lock_replay_sec = to_float(lock_kv.get("firstLockReplaySec"))
 
     track_ratio = to_float(summary_kv.get("trackRatio"))
     if track_ratio is None:
@@ -451,11 +462,16 @@ def parse_tracker_log(text: str) -> Dict[str, object]:
     frames = to_int(summary_kv.get("frames"))
     if frames is None:
         frames = to_int(perf_kv.get("frames")) or 0
+    replay_pts_sec = to_float(summary_kv.get("replayPtsSec"))
+    if replay_pts_sec is None:
+        replay_pts_sec = to_float(perf_kv.get("replayPtsSec"))
 
     return {
         "locks": locks,
         "lost": lost,
         "first_lock_sec": first_lock_sec,
+        "first_lock_replay_sec": first_lock_replay_sec,
+        "replay_pts_sec": replay_pts_sec,
         "track_ratio": track_ratio,
         "avg_frame_ms": avg_frame_ms,
         "max_track_streak": max_track_streak,
@@ -658,7 +674,17 @@ def main() -> int:
         )
         force_stop_args = build_simple_args(serial, "shell", "am", "force-stop", PACKAGE_NAME)
         clear_log_args = build_simple_args(serial, "logcat", "-c")
-        dump_log_args = build_simple_args(serial, "logcat", "-d", "-s", f"{TRACKER_TAG}:V")
+        dump_log_args = build_simple_args(
+            serial,
+            "logcat",
+            "-d",
+            "-b",
+            "main",
+            "-m",
+            str(LOGCAT_MAX_LINES),
+            "-s",
+            f"{TRACKER_TAG}:{TRACKER_LOG_LEVEL}",
+        )
         pidof_args = build_simple_args(serial, "shell", "pidof", PACKAGE_NAME)
 
         error = ""
@@ -680,23 +706,34 @@ def main() -> int:
                     app_pid = pid_out.split()[0].strip()
                 time.sleep(total_wait_sec)
                 if app_pid:
-                    dump_args = build_simple_args(serial, "logcat", "-d", f"--pid={app_pid}")
+                    dump_args = build_simple_args(
+                        serial,
+                        "logcat",
+                        "-d",
+                        "-b",
+                        "main",
+                        "-m",
+                        str(LOGCAT_MAX_LINES),
+                        f"--pid={app_pid}",
+                        "-s",
+                        f"{TRACKER_TAG}:{TRACKER_LOG_LEVEL}",
+                    )
                     try:
-                        log_text = adb.run(dump_args, timeout_sec=45, check=True)
+                        log_text = adb.run(dump_args, timeout_sec=LOGCAT_PRIMARY_TIMEOUT_SEC, check=True)
                     except Exception as dump_exc:  # noqa: BLE001
                         note = f"pid logcat fallback: {dump_exc}"
                         error = f"{error}; {note}" if error else note
-                        log_text = adb.run(dump_log_args, timeout_sec=45, check=False)
+                        log_text = adb.run(dump_log_args, timeout_sec=LOGCAT_FALLBACK_TIMEOUT_SEC, check=False)
                 else:
-                    log_text = adb.run(dump_log_args, timeout_sec=45, check=True)
+                    log_text = adb.run(dump_log_args, timeout_sec=LOGCAT_PRIMARY_TIMEOUT_SEC, check=True)
                 adb.run(force_stop_args, timeout_sec=20, check=False)
             except Exception as exc:  # noqa: BLE001
                 error = str(exc)
                 try:
                     if app_pid:
-                        log_text = adb.run(dump_log_args, timeout_sec=45, check=False)
+                        log_text = adb.run(dump_log_args, timeout_sec=LOGCAT_FALLBACK_TIMEOUT_SEC, check=False)
                     else:
-                        log_text = adb.run(dump_log_args, timeout_sec=45, check=False)
+                        log_text = adb.run(dump_log_args, timeout_sec=LOGCAT_FALLBACK_TIMEOUT_SEC, check=False)
                 except Exception:  # noqa: BLE001
                     pass
                 if (not log_text) and ("EVAL_" in error or "Tracker" in error):
@@ -714,12 +751,17 @@ def main() -> int:
                 break
             print(f"  -> empty metrics/log on attempt {attempt}, retrying...")
             time.sleep(0.6)
+        first_lock_metric = parsed.get("first_lock_replay_sec")
+        first_lock_metric_source = "replay" if isinstance(first_lock_metric, (int, float)) and first_lock_metric >= 0 else "wall"
+        if first_lock_metric_source == "wall":
+            first_lock_metric = parsed.get("first_lock_sec")
+
         first_lock_after_target = compute_first_lock_after_target(
-            first_lock_sec=parsed["first_lock_sec"],  # type: ignore[arg-type]
+            first_lock_sec=first_lock_metric,  # type: ignore[arg-type]
             target_appear_sec=args.target_appear_sec,
         )
         early_lock = False
-        raw_first_lock = parsed["first_lock_sec"]  # type: ignore[assignment]
+        raw_first_lock = first_lock_metric  # type: ignore[assignment]
         if isinstance(raw_first_lock, (int, float)):
             early_lock = raw_first_lock >= 0 and raw_first_lock + 1e-6 < max(0.0, args.target_appear_sec)
         score = compute_score(
@@ -734,14 +776,21 @@ def main() -> int:
             weights=weights,
         )
         if error:
-            score -= 200.0
+            error_l = str(error).lower()
+            has_metrics_for_error = int(parsed.get("frames", 0) or 0) > 0 or parsed.get("avg_frame_ms") is not None
+            timeout_with_metrics = "timeout" in error_l and has_metrics_for_error
+            if not timeout_with_metrics:
+                score -= 200.0
 
         record = {
             "run": idx,
             "attempts": attempt,
             "score": round(score, 4),
             "first_lock_sec": parsed["first_lock_sec"],
+            "first_lock_replay_sec": parsed.get("first_lock_replay_sec"),
+            "first_lock_metric_source": first_lock_metric_source,
             "first_lock_after_target_sec": first_lock_after_target,
+            "replay_pts_sec": parsed.get("replay_pts_sec"),
             "early_lock": int(early_lock),
             "locks": parsed["locks"],
             "lost": parsed["lost"],
@@ -756,10 +805,11 @@ def main() -> int:
         }
         results.append(record)
         first_raw = "NA" if record["first_lock_sec"] is None else f"{record['first_lock_sec']}s"
+        first_replay = "NA" if record["first_lock_replay_sec"] is None else f"{record['first_lock_replay_sec']}s"
         first_after = "NA" if record["first_lock_after_target_sec"] is None else f"{record['first_lock_after_target_sec']}s"
         print(
             f"  -> score={record['score']} lock={record['locks']} lost={record['lost']} "
-            f"firstRaw={first_raw} firstAfter={first_after} early={record['early_lock']} "
+            f"firstRaw={first_raw} firstReplay={first_replay} src={record['first_lock_metric_source']} firstAfter={first_after} replayPts={record['replay_pts_sec']} early={record['early_lock']} "
             f"ratio={record['track_ratio']} avgMs={record['avg_frame_ms']}"
         )
         time.sleep(max(0.0, args.cooldown_sec))
@@ -772,7 +822,10 @@ def main() -> int:
         "attempts",
         "score",
         "first_lock_sec",
+        "first_lock_replay_sec",
+        "first_lock_metric_source",
         "first_lock_after_target_sec",
+        "replay_pts_sec",
         "early_lock",
         "locks",
         "lost",
@@ -806,11 +859,12 @@ def main() -> int:
     print("\nTop candidates:")
     for i, row in enumerate(top10, start=1):
         top_first_raw = "NA" if row["first_lock_sec"] is None else f"{row['first_lock_sec']}s"
+        top_first_replay = "NA" if row.get("first_lock_replay_sec") is None else f"{row['first_lock_replay_sec']}s"
         top_first_after = (
             "NA" if row["first_lock_after_target_sec"] is None else f"{row['first_lock_after_target_sec']}s"
         )
         print(
-            f"  {i:02d}. score={row['score']:<8} firstRaw={top_first_raw} firstAfter={top_first_after} "
+            f"  {i:02d}. score={row['score']:<8} firstRaw={top_first_raw} firstReplay={top_first_replay} src={row.get('first_lock_metric_source','wall')} firstAfter={top_first_after} "
             f"early={row['early_lock']} lock/lost={row['locks']}/{row['lost']} streak={row['max_track_streak']} "
             f"ratio={row['track_ratio']} avgMs={row['avg_frame_ms']}"
         )

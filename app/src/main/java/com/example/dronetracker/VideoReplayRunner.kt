@@ -16,7 +16,7 @@ class VideoReplayRunner(
     private val previewEveryNFrames: Int = 3,
     private val maxFrameDim: Int = 1280,
     private val onFrame: (Bitmap) -> Unit,
-    private val onMatFrame: (Mat) -> Unit,
+    private val onMatFrame: (Mat, Long) -> Unit,
     private val onError: (String, Throwable?) -> Unit
 ) : Runnable {
 
@@ -99,7 +99,7 @@ class VideoReplayRunner(
                             4 -> Imgproc.cvtColor(mat, mat, Imgproc.COLOR_RGBA2RGB)
                             1 -> Imgproc.cvtColor(mat, mat, Imgproc.COLOR_GRAY2RGB)
                         }
-                        onMatFrame(mat)
+                        onMatFrame(mat, ptsMs)
                     } finally {
                         mat.release()
                     }

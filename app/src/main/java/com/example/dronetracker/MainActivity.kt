@@ -281,12 +281,13 @@ class MainActivity : AppCompatActivity() {
         viewFinder.visibility = View.INVISIBLE
         replayFrameView.visibility = View.VISIBLE
 
+        trackerAnalyzer.beginEvalSession("replay_start")
         replayRunner?.stop()
         replayRunner = VideoReplayRunner(
             videoPath = videoPath,
             loop = true,
             onFrame = { bitmap -> renderReplayFrame(bitmap) },
-            onMatFrame = { mat -> trackerAnalyzer.analyzeReplayFrame(mat) },
+            onMatFrame = { mat, ptsMs -> trackerAnalyzer.analyzeReplayFrame(mat, ptsMs) },
             onError = { message, throwable ->
                 Log.e(TAG, message, throwable)
                 runOnUiThread {

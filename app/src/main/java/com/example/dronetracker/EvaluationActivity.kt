@@ -109,13 +109,14 @@ class EvaluationActivity : AppCompatActivity() {
         statusView.text = "Running replay benchmark..."
         Log.i(TAG, "Evaluation start video=$videoPath csv=${csvOutputFile?.absolutePath} loop=$loop")
 
+        trackerAnalyzer.beginEvalSession("evaluation_replay_start")
         replayRunner?.stop()
         replayRunner = VideoReplayRunner(
             videoPath = videoPath,
             loop = loop,
             previewEveryNFrames = 2,
             onFrame = { bitmap -> renderReplayFrame(bitmap) },
-            onMatFrame = { mat -> analyzeAndLogFrame(mat) },
+            onMatFrame = { mat, ptsMs -> analyzeAndLogFrame(mat, ptsMs) },
             onError = { message, throwable ->
                 Log.e(TAG, message, throwable)
                 runOnUiThread {
@@ -127,9 +128,9 @@ class EvaluationActivity : AppCompatActivity() {
         cameraExecutor.execute(replayRunner)
     }
 
-    private fun analyzeAndLogFrame(mat: Mat) {
+    private fun analyzeAndLogFrame(mat: Mat, replayPtsMs: Long) {
         val startNs = SystemClock.elapsedRealtimeNanos()
-        trackerAnalyzer.analyzeReplayFrame(mat)
+        trackerAnalyzer.analyzeReplayFrame(mat, replayPtsMs)
         val latencyMs = (SystemClock.elapsedRealtimeNanos() - startNs).toDouble() / 1_000_000.0
         val prediction = trackerAnalyzer.latestPredictionSnapshot()
 

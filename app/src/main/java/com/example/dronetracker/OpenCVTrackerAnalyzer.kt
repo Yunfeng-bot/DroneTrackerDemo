@@ -524,6 +524,8 @@ class OpenCVTrackerAnalyzer(
     private var metricsLockCount = 0
     private var metricsLostCount = 0
     private var metricsFirstLockMs = -1L
+    private var metricsFirstLockReplayMs = -1L
+    private var metricsFirstLockFrame = -1L
     private var metricsCurrentTrackingStreak = 0
     private var metricsMaxTrackingStreak = 0
     private var metricsSearchCandidateCount = 0
@@ -560,6 +562,7 @@ class OpenCVTrackerAnalyzer(
     private var metricsNativeSimMin = 1.0
     private var metricsNativeSimMax = 0.0
     private var metricsSearchLastReason = "none"
+    private var currentReplayPtsMs = -1L
 
     private var orbMaxFeatures = DEFAULT_ORB_FEATURES
     private var orbFeatureHardCap = DEFAULT_ORB_FEATURE_HARD_CAP
@@ -603,6 +606,8 @@ class OpenCVTrackerAnalyzer(
     private var nativeFuseSoftStreak = DEFAULT_NATIVE_FUSE_SOFT_STREAK
     private var nativeFuseWarmupFrames = DEFAULT_NATIVE_FUSE_WARMUP_FRAMES
     private var nativeHoldLastOnSoftReject = DEFAULT_NATIVE_HOLD_LAST_ON_SOFT_REJECT
+    private var nativeGateUseMeasurement = DEFAULT_NATIVE_GATE_USE_MEASUREMENT
+    private var nativeGapPassthrough = DEFAULT_NATIVE_GAP_PASSTHROUGH
     private var nativeScoreLogIntervalFrames = DEFAULT_NATIVE_SCORE_LOG_INTERVAL_FRAMES
     private var nativeModelParamPathOverride: String? = DEFAULT_NATIVE_MODEL_PARAM_PATH
     private var nativeModelBinPathOverride: String? = DEFAULT_NATIVE_MODEL_BIN_PATH
@@ -642,6 +647,9 @@ class OpenCVTrackerAnalyzer(
     private var trackGuardAnchorMaxDrop = DEFAULT_TRACK_GUARD_ANCHOR_MAX_DROP
     private var trackGuardAnchorMinScore = DEFAULT_TRACK_GUARD_ANCHOR_MIN_SCORE
     private var trackAnchorAppearanceScore = Double.NaN
+    private var smallTargetNativeVerifyIntervalFrames = DEFAULT_SMALL_TARGET_NATIVE_VERIFY_INTERVAL_FRAMES
+    private var smallTargetNativeVerifyAreaScale = DEFAULT_SMALL_TARGET_NATIVE_VERIFY_AREA_SCALE
+    private var smallTargetAnchorDropScale = DEFAULT_SMALL_TARGET_ANCHOR_DROP_SCALE
 
     private var firstLockStableFrames = DEFAULT_FIRST_LOCK_STABLE_FRAMES
     private var firstLockStableMs = DEFAULT_FIRST_LOCK_STABLE_MS
@@ -1002,6 +1010,12 @@ class OpenCVTrackerAnalyzer(
                     value.toDoubleOrNull()?.let { trackGuardAnchorMaxDrop = it.coerceIn(0.05, 1.50) }
                 "track_guard_anchor_min_score" ->
                     value.toDoubleOrNull()?.let { trackGuardAnchorMinScore = it.coerceIn(-1.0, 1.0) }
+                "small_target_verify_interval", "small_target_native_verify_interval" ->
+                    value.toIntOrNull()?.let { smallTargetNativeVerifyIntervalFrames = it.coerceIn(1, 30) }
+                "small_target_verify_area_scale", "small_target_native_verify_area_scale" ->
+                    value.toDoubleOrNull()?.let { smallTargetNativeVerifyAreaScale = it.coerceIn(0.20, 4.0) }
+                "small_target_anchor_drop_scale" ->
+                    value.toDoubleOrNull()?.let { smallTargetAnchorDropScale = it.coerceIn(0.30, 1.0) }
                 "track_backend", "tracker_backend" -> parseTrackBackend(value)?.let { preferredTrackBackend = it }
                 "native_failures" -> value.toIntOrNull()?.let { nativeMaxFailStreak = it.coerceIn(1, 10) }
                 "native_min_confidence", "native_min_conf" ->
@@ -1016,6 +1030,10 @@ class OpenCVTrackerAnalyzer(
                     value.toIntOrNull()?.let { nativeFuseWarmupFrames = it.coerceIn(0, 60) }
                 "native_hold_last_on_soft_reject", "native_hold_last" ->
                     parseBoolean(value)?.let { nativeHoldLastOnSoftReject = it }
+                "native_gate_use_measurement", "native_use_measurement_gate", "native_gate_use_meas" ->
+                    parseBoolean(value)?.let { nativeGateUseMeasurement = it }
+                "native_gap_passthrough", "gap_passthrough" ->
+                    parseBoolean(value)?.let { nativeGapPassthrough = it }
                 "native_orb_verify", "native_verify" ->
                     parseBoolean(value)?.let { nativeOrbVerifyEnabled = it }
                 "native_score_log_interval", "native_score_log_stride" ->
@@ -1127,6 +1145,9 @@ class OpenCVTrackerAnalyzer(
         trackGuardMinAppearanceScore = trackGuardMinAppearanceScore.coerceIn(-1.0, 1.0)
         trackGuardAnchorMaxDrop = trackGuardAnchorMaxDrop.coerceIn(0.05, 1.50)
         trackGuardAnchorMinScore = trackGuardAnchorMinScore.coerceIn(-1.0, 1.0)
+        smallTargetNativeVerifyIntervalFrames = smallTargetNativeVerifyIntervalFrames.coerceIn(1, 30)
+        smallTargetNativeVerifyAreaScale = smallTargetNativeVerifyAreaScale.coerceIn(0.20, 4.0)
+        smallTargetAnchorDropScale = smallTargetAnchorDropScale.coerceIn(0.30, 1.0)
         nativeScoreLogIntervalFrames = nativeScoreLogIntervalFrames.coerceIn(1, 240)
         if (firstLockSmallCenterDriftRelaxedPx < firstLockSmallCenterDriftPx) {
             firstLockSmallCenterDriftRelaxedPx = firstLockSmallCenterDriftPx
@@ -1671,11 +1692,13 @@ class OpenCVTrackerAnalyzer(
                 "trackGuardAppearInt=${cfg.trackGuard.appearanceCheckIntervalFrames} " +
                 "trackGuardAppearMin=${fmt(cfg.trackGuard.minAppearanceScore)} " +
                 "trackGuardAnchor=$trackGuardAnchorEnabled/${fmt(trackGuardAnchorMaxDrop)}/${fmt(trackGuardAnchorMinScore)} " +
+                "smallTargetVerifyInt=$smallTargetNativeVerifyIntervalFrames smallTargetVerifyAreaScale=${fmt(smallTargetNativeVerifyAreaScale)} smallTargetAnchorDropScale=${fmt(smallTargetAnchorDropScale)} " +
                 "trackBackend=${preferredTrackBackend.name.lowercase(Locale.US)} " +
                 "kcfFail=$kcfMaxFailStreak nativeFail=${cfg.nativeGate.maxFailStreak} nativeMinConf=${fmt(cfg.nativeGate.minConfidence)} " +
                 "nativeFuseSoft=${fmt(cfg.nativeGate.fuseSoftConfidence)} nativeFuseHard=${fmt(cfg.nativeGate.fuseHardConfidence)} " +
                 "nativeFuseStreak=${cfg.nativeGate.fuseSoftStreak} nativeFuseWarmup=${cfg.nativeGate.fuseWarmupFrames} " +
-                "nativeHoldLast=${cfg.nativeGate.holdLastOnSoftReject} nativeOrbVerify=$nativeOrbVerifyEnabled nativeScoreLogInt=$nativeScoreLogIntervalFrames " +
+                "nativeHoldLast=${cfg.nativeGate.holdLastOnSoftReject} nativeGateUseMeasurement=$nativeGateUseMeasurement " +
+                "nativeGapPassthrough=$nativeGapPassthrough nativeOrbVerify=$nativeOrbVerifyEnabled nativeScoreLogInt=$nativeScoreLogIntervalFrames " +
                 "lockHoldFrames=$lockHoldFrames lostOverlayHoldMs=$lostOverlayHoldMs " +
                 "fastFirstLockFrames=$fastFirstLockFrames " +
                 "nativeParam=${summarizePath(nativeModelParamPathOverride)} " +
@@ -1978,24 +2001,84 @@ class OpenCVTrackerAnalyzer(
         }
     }
 
+    @Synchronized
+    fun beginEvalSession(reason: String = "manual") {
+        metricsSessionStartMs = SystemClock.elapsedRealtime()
+        diagSessionId = metricsSessionStartMs
+        frameCounter = 0L
+        currentReplayPtsMs = -1L
+
+        metricsFrames = 0L
+        metricsTotalProcessMs = 0L
+        metricsTrackingFrames = 0L
+        metricsSearchingFrames = 0L
+        metricsLockCount = 0
+        metricsLostCount = 0
+        metricsFirstLockMs = -1L
+        metricsFirstLockReplayMs = -1L
+        metricsFirstLockFrame = -1L
+        metricsCurrentTrackingStreak = 0
+        metricsMaxTrackingStreak = 0
+        metricsSearchCandidateCount = 0
+        metricsSearchMissCount = 0
+        metricsSearchTemplateSkipCount = 0
+        metricsSearchStrideSkipCount = 0
+        metricsSearchBudgetSkipCount = 0
+        metricsSearchBudgetTripCount = 0
+        metricsSearchTemporalRejectCount = 0
+        metricsSearchPromoteRejectCount = 0
+        metricsSearchRefinePassCount = 0
+        metricsSearchRefineRejectCount = 0
+        metricsSearchStableSeedCount = 0
+        metricsSearchStableAccumCount = 0
+        metricsSearchPromoteCount = 0
+        metricsSearchStableOutlierHoldCount = 0
+        metricsSearchTemporalHoldCount = 0
+        metricsSearchResetNoSeedCount = 0
+        metricsSearchResetGapCount = 0
+        metricsSearchResetStableDriftCount = 0
+        metricsSearchResetCenterRuleCount = 0
+        metricsSearchResetIouCount = 0
+        metricsSearchResetConfidenceCount = 0
+        metricsNativeFuseSoftCount = 0
+        metricsNativeFuseHardCount = 0
+        metricsNativeLowConfHoldCount = 0
+        metricsKalmanPredHoldCount = 0
+        metricsNativeConfSamples = 0L
+        metricsNativeConfSum = 0.0
+        metricsNativeConfMin = 1.0
+        metricsNativeConfMax = 0.0
+        metricsNativeSimSamples = 0L
+        metricsNativeSimSum = 0.0
+        metricsNativeSimMin = 1.0
+        metricsNativeSimMax = 0.0
+        metricsSearchLastReason = "none"
+        Log.w(TAG, "EVAL_EVENT type=SESSION_START reason=$reason session=$diagSessionId")
+    }
+
     fun logEvalSummary(reason: String = "manual") {
         val elapsed = (SystemClock.elapsedRealtime() - metricsSessionStartMs).coerceAtLeast(1L)
         val avgMs = if (metricsFrames > 0) metricsTotalProcessMs.toDouble() / metricsFrames else 0.0
         val firstLockSec = if (metricsFirstLockMs >= 0L) metricsFirstLockMs.toDouble() / 1000.0 else -1.0
+        val firstLockReplaySec = if (metricsFirstLockReplayMs >= 0L) metricsFirstLockReplayMs.toDouble() / 1000.0 else -1.0
+        val replayPtsSec = if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0
         val trackingRatio = if (metricsFrames > 0) metricsTrackingFrames.toDouble() / metricsFrames else 0.0
         Log.w(
             TAG,
             String.format(
                 Locale.US,
-                "EVAL_SUMMARY reason=%s mode=%s elapsedMs=%d frames=%d avgFrameMs=%.2f locks=%d lost=%d firstLockSec=%.3f trackRatio=%.3f maxTrackStreak=%d searchSkipStride=%d searchSkipBudget=%d budgetTrips=%d nativeFuseSoft=%d nativeFuseHard=%d nativeHold=%d kalmanPredHold=%d",
+                "EVAL_SUMMARY reason=%s mode=%s elapsedMs=%d replayPtsSec=%.3f frames=%d avgFrameMs=%.2f locks=%d lost=%d firstLockSec=%.3f firstLockReplaySec=%.3f firstLockFrame=%d trackRatio=%.3f maxTrackStreak=%d searchSkipStride=%d searchSkipBudget=%d budgetTrips=%d nativeFuseSoft=%d nativeFuseHard=%d nativeHold=%d kalmanPredHold=%d",
                 reason,
                 trackerMode.name.lowercase(Locale.US),
                 elapsed,
+                replayPtsSec,
                 metricsFrames,
                 avgMs,
                 metricsLockCount,
                 metricsLostCount,
                 firstLockSec,
+                firstLockReplaySec,
+                metricsFirstLockFrame,
                 trackingRatio,
                 metricsMaxTrackingStreak,
                 metricsSearchStrideSkipCount,
@@ -2045,6 +2128,7 @@ class OpenCVTrackerAnalyzer(
         var frame: Mat? = null
         try {
             isReplayInput = false
+            currentReplayPtsMs = -1L
             val logicalSize = logicalFrameSize(image)
             updateScaleFactors(logicalSize.first, logicalSize.second)
             if (isTracking && activeTrackBackend != TrackBackend.KCF && pendingInitBox == null) {
@@ -2064,10 +2148,11 @@ class OpenCVTrackerAnalyzer(
         }
     }
 
-    fun analyzeReplayFrame(frame: Mat) {
+    fun analyzeReplayFrame(frame: Mat, replayPtsMs: Long = -1L) {
         val startMs = SystemClock.elapsedRealtime()
         try {
             isReplayInput = true
+            currentReplayPtsMs = replayPtsMs
             updateScaleFactors(frame.cols(), frame.rows())
             processFrame(frame, image = null)
         } catch (t: Throwable) {
@@ -2370,34 +2455,35 @@ class OpenCVTrackerAnalyzer(
         val nativeConfidence = result.confidence.toDouble().coerceIn(0.0, 1.0)
         val nativeSimilarity = result.similarity.toDouble().coerceIn(0.0, 1.0)
         val nativeMeasurementConfidence = resolveNativeMeasurementConfidence(result)
+        val nativeGateConfidence = if (nativeGateUseMeasurement) nativeMeasurementConfidence else nativeConfidence
         recordNativeConfidenceSample(nativeConfidence)
         recordNativeSimilaritySample(nativeSimilarity)
-        when (evaluateNativeConfidence(nativeConfidence)) {
+        when (evaluateNativeConfidence(nativeGateConfidence)) {
             NativeConfidenceAction.DROP_HARD -> {
                 logNativeScoreSample("native_mat", "drop_hard", nativeConfidence, nativeSimilarity, nativeMeasurementConfidence)
-                if (holdCurrentBoxOnTransientLoss("native_conf_hard", nativeConfidence)) return
+                if (holdCurrentBoxOnTransientLoss("native_conf_hard", nativeGateConfidence)) return
                 onLost("native_conf_hard")
                 return
             }
             NativeConfidenceAction.DROP_SOFT_STREAK -> {
                 logNativeScoreSample("native_mat", "drop_soft", nativeConfidence, nativeSimilarity, nativeMeasurementConfidence)
-                if (holdCurrentBoxOnTransientLoss("native_conf_soft", nativeConfidence)) return
+                if (holdCurrentBoxOnTransientLoss("native_conf_soft", nativeGateConfidence)) return
                 onLost("native_conf_soft")
                 return
             }
             NativeConfidenceAction.HOLD -> {
                 logNativeScoreSample("native_mat", "hold", nativeConfidence, nativeSimilarity, nativeMeasurementConfidence)
-                suppressOverlayOnUncertainTracking("native_conf_hold", nativeConfidence)
+                suppressOverlayOnUncertainTracking("native_conf_hold", nativeGateConfidence)
                 return
             }
             NativeConfidenceAction.DROP_MIN_CONF -> {
                 logNativeScoreSample("native_mat", "drop_min_conf", nativeConfidence, nativeSimilarity, nativeMeasurementConfidence)
                 consecutiveTrackerFailures++
                 if (consecutiveTrackerFailures < nativeCfg.maxFailStreak) {
-                    suppressOverlayOnUncertainTracking("native_conf_pending", nativeConfidence)
+                    suppressOverlayOnUncertainTracking("native_conf_pending", nativeGateConfidence)
                     return
                 }
-                if (holdCurrentBoxOnTransientLoss("native_conf_low", nativeConfidence)) return
+                if (holdCurrentBoxOnTransientLoss("native_conf_low", nativeGateConfidence)) return
                 onLost("native_conf_low")
                 return
             }
@@ -2419,23 +2505,27 @@ class OpenCVTrackerAnalyzer(
                 suppressOverlayOnUncertainTracking("native_track_pending", 0.45)
                 return
             }
-            if (holdCurrentBoxOnTransientLoss("native_invalid_box", nativeConfidence)) return
+            if (holdCurrentBoxOnTransientLoss("native_invalid_box", nativeGateConfidence)) return
             onLost("native_invalid_box")
             return
         }
 
         consecutiveTrackerFailures = 0
-        if (shouldDropOnTrackGuard(frame, safe, nativeConfidence)) {
+        if (shouldDropOnTrackGuard(frame, safe, nativeGateConfidence)) {
             onLost("track_guard_fail")
             return
         }
-        val nativeVerifyInterval = resolveNativeVerifyIntervalFrames()
+        val nativeVerifyInterval = resolveNativeVerifyIntervalFrames(
+            current = safe,
+            frameW = frame.cols(),
+            frameH = frame.rows()
+        )
         if (
             shouldRunNativeOrbVerify() &&
             nativeVerifyInterval > 0 &&
             frameCounter % nativeVerifyInterval.toLong() == 0L
         ) {
-            val verifyDecision = maybeVerifyTracking(frame, safe, nativeConfidence)
+            val verifyDecision = maybeVerifyTracking(frame, safe, nativeGateConfidence)
             if (verifyDecision != null) {
                 when (verifyDecision.action) {
                     "realign" -> {
@@ -2445,7 +2535,7 @@ class OpenCVTrackerAnalyzer(
                         }
                     }
                     "drop" -> {
-                        if (holdCurrentBoxOnTransientLoss(verifyDecision.reason, nativeConfidence)) {
+                        if (holdCurrentBoxOnTransientLoss(verifyDecision.reason, nativeGateConfidence)) {
                             return
                         }
                         onLost(verifyDecision.reason)
@@ -2475,34 +2565,35 @@ class OpenCVTrackerAnalyzer(
         val nativeConfidence = result.confidence.toDouble().coerceIn(0.0, 1.0)
         val nativeSimilarity = result.similarity.toDouble().coerceIn(0.0, 1.0)
         val nativeMeasurementConfidence = resolveNativeMeasurementConfidence(result)
+        val nativeGateConfidence = if (nativeGateUseMeasurement) nativeMeasurementConfidence else nativeConfidence
         recordNativeConfidenceSample(nativeConfidence)
         recordNativeSimilaritySample(nativeSimilarity)
-        when (evaluateNativeConfidence(nativeConfidence)) {
+        when (evaluateNativeConfidence(nativeGateConfidence)) {
             NativeConfidenceAction.DROP_HARD -> {
                 logNativeScoreSample("native_img", "drop_hard", nativeConfidence, nativeSimilarity, nativeMeasurementConfidence)
-                if (holdCurrentBoxOnTransientLoss("native_conf_hard", nativeConfidence)) return
+                if (holdCurrentBoxOnTransientLoss("native_conf_hard", nativeGateConfidence)) return
                 onLost("native_conf_hard")
                 return
             }
             NativeConfidenceAction.DROP_SOFT_STREAK -> {
                 logNativeScoreSample("native_img", "drop_soft", nativeConfidence, nativeSimilarity, nativeMeasurementConfidence)
-                if (holdCurrentBoxOnTransientLoss("native_conf_soft", nativeConfidence)) return
+                if (holdCurrentBoxOnTransientLoss("native_conf_soft", nativeGateConfidence)) return
                 onLost("native_conf_soft")
                 return
             }
             NativeConfidenceAction.HOLD -> {
                 logNativeScoreSample("native_img", "hold", nativeConfidence, nativeSimilarity, nativeMeasurementConfidence)
-                suppressOverlayOnUncertainTracking("native_conf_hold", nativeConfidence)
+                suppressOverlayOnUncertainTracking("native_conf_hold", nativeGateConfidence)
                 return
             }
             NativeConfidenceAction.DROP_MIN_CONF -> {
                 logNativeScoreSample("native_img", "drop_min_conf", nativeConfidence, nativeSimilarity, nativeMeasurementConfidence)
                 consecutiveTrackerFailures++
                 if (consecutiveTrackerFailures < nativeCfg.maxFailStreak) {
-                    suppressOverlayOnUncertainTracking("native_conf_pending", nativeConfidence)
+                    suppressOverlayOnUncertainTracking("native_conf_pending", nativeGateConfidence)
                     return
                 }
-                if (holdCurrentBoxOnTransientLoss("native_conf_low", nativeConfidence)) return
+                if (holdCurrentBoxOnTransientLoss("native_conf_low", nativeGateConfidence)) return
                 onLost("native_conf_low")
                 return
             }
@@ -2524,17 +2615,21 @@ class OpenCVTrackerAnalyzer(
                 suppressOverlayOnUncertainTracking("native_track_pending", 0.45)
                 return
             }
-            if (holdCurrentBoxOnTransientLoss("native_invalid_box", nativeConfidence)) return
+            if (holdCurrentBoxOnTransientLoss("native_invalid_box", nativeGateConfidence)) return
             onLost("native_invalid_box")
             return
         }
 
-        if (shouldDropOnTrackGuard(null, safe, nativeConfidence)) {
+        if (shouldDropOnTrackGuard(null, safe, nativeGateConfidence)) {
             onLost("track_guard_fail")
             return
         }
 
-        val nativeVerifyInterval = resolveNativeVerifyIntervalFrames()
+        val nativeVerifyInterval = resolveNativeVerifyIntervalFrames(
+            current = safe,
+            frameW = frameW,
+            frameH = frameH
+        )
         if (
             shouldRunNativeOrbVerify() &&
             nativeVerifyInterval > 0 &&
@@ -2542,7 +2637,7 @@ class OpenCVTrackerAnalyzer(
         ) {
             val verifyFrame = imageToMat(image)
             try {
-                val verifyDecision = maybeVerifyTracking(verifyFrame, safe, nativeConfidence)
+                val verifyDecision = maybeVerifyTracking(verifyFrame, safe, nativeGateConfidence)
                 if (verifyDecision != null) {
                     when (verifyDecision.action) {
                         "realign" -> {
@@ -2552,7 +2647,7 @@ class OpenCVTrackerAnalyzer(
                             }
                         }
                         "drop" -> {
-                            if (holdCurrentBoxOnTransientLoss(verifyDecision.reason, nativeConfidence)) {
+                            if (holdCurrentBoxOnTransientLoss(verifyDecision.reason, nativeGateConfidence)) {
                                 return
                             }
                             onLost(verifyDecision.reason)
@@ -2593,9 +2688,17 @@ class OpenCVTrackerAnalyzer(
         return (similarity * 0.70 + confidence * 0.30).coerceIn(0.0, 1.0)
     }
 
+    private fun isNativeGapPassthroughActive(): Boolean {
+        return nativeGapPassthrough && activeTrackBackend != TrackBackend.KCF
+    }
+
     private fun shouldDropOnTrackGuard(frame: Mat?, current: Rect, confidence: Double): Boolean {
+        if (isNativeGapPassthroughActive()) return false
         val guardCfg = heuristicConfig.trackGuard
         val prev = lastMeasuredTrackBox
+        val smallTargetForGuard =
+            frame != null &&
+                isSmallTargetForExtraVerify(current = current, frameW = frame.cols(), frameH = frame.rows())
         val geomOk = evaluateTrackBoxConsistency(current, prev, guardCfg)
         if (!geomOk) {
             trackMismatchStreak = (trackMismatchStreak + 1).coerceAtMost(1000)
@@ -2610,12 +2713,22 @@ class OpenCVTrackerAnalyzer(
             trackMismatchStreak = 0
         }
 
-        if (frame != null && frameCounter % guardCfg.appearanceCheckIntervalFrames == 0L) {
-            val score = computePatchTemplateCorrelation(frame, current)
+        val shouldCheckAppearance =
+            frame != null &&
+                (smallTargetForGuard || frameCounter % guardCfg.appearanceCheckIntervalFrames == 0L)
+        if (shouldCheckAppearance) {
+            val guardFrame = frame ?: return false
+            val score = computePatchTemplateCorrelation(guardFrame, current)
             val anchorScore = trackAnchorAppearanceScore
             val anchorMinScore =
                 if (trackGuardAnchorEnabled && anchorScore.isFinite()) {
-                    val dynamicMin = anchorScore - trackGuardAnchorMaxDrop
+                    val anchorDrop =
+                        if (smallTargetForGuard) {
+                            (trackGuardAnchorMaxDrop * smallTargetAnchorDropScale).coerceAtLeast(0.05)
+                        } else {
+                            trackGuardAnchorMaxDrop
+                        }
+                    val dynamicMin = anchorScore - anchorDrop
                     if (trackGuardAnchorMinScore > -0.999) {
                         max(dynamicMin, trackGuardAnchorMinScore)
                     } else {
@@ -2631,7 +2744,7 @@ class OpenCVTrackerAnalyzer(
                     logDiag(
                         "TRACK",
                         "session=$diagSessionId stage=track_guard reason=appearance_fail streak=$trackAppearanceLowStreak conf=${fmt(confidence)} " +
-                            "score=${fmt(score)} min=${fmt(minAllowedScore)} anchor=${fmt(anchorScore)}"
+                            "score=${fmt(score)} min=${fmt(minAllowedScore)} anchor=${fmt(anchorScore)} smallTarget=$smallTargetForGuard"
                     )
                 }
             } else {
@@ -2639,10 +2752,19 @@ class OpenCVTrackerAnalyzer(
             }
         }
 
-        return trackMismatchStreak >= guardCfg.dropStreak || trackAppearanceLowStreak >= guardCfg.dropStreak
+        var requiredDropStreak = guardCfg.dropStreak
+        if (activeTrackBackend != TrackBackend.KCF && confidence >= trackVerifyNativeBypassConfidence) {
+            requiredDropStreak = max(requiredDropStreak, 2)
+        }
+        return trackMismatchStreak >= requiredDropStreak || trackAppearanceLowStreak >= requiredDropStreak
     }
 
     private fun evaluateNativeConfidence(confidence: Double): NativeConfidenceAction {
+        if (isNativeGapPassthroughActive()) {
+            metricsSearchLastReason = "native_gap_passthrough"
+            nativeLowConfidenceStreak = 0
+            return NativeConfidenceAction.ACCEPT
+        }
         val nativeCfg = heuristicConfig.nativeGate
         if (nativeFuseWarmupRemaining > 0) {
             nativeFuseWarmupRemaining = (nativeFuseWarmupRemaining - 1).coerceAtLeast(0)
@@ -2685,15 +2807,29 @@ class OpenCVTrackerAnalyzer(
     }
 
     private fun shouldRunNativeOrbVerify(): Boolean {
+        if (isNativeGapPassthroughActive()) return false
         return nativeOrbVerifyEnabled || isReplayInput
     }
 
-    private fun resolveNativeVerifyIntervalFrames(): Int {
+    private fun resolveNativeVerifyIntervalFrames(current: Rect? = null, frameW: Int = 0, frameH: Int = 0): Int {
         val base = heuristicConfig.trackVerify.intervalFrames.coerceAtLeast(1)
+        var interval = base
         if (isReplayInput && !nativeOrbVerifyEnabled) {
-            return min(base, REPLAY_NATIVE_VERIFY_INTERVAL_FRAMES)
+            interval = min(interval, REPLAY_NATIVE_VERIFY_INTERVAL_FRAMES)
         }
-        return base
+        if (current != null && isSmallTargetForExtraVerify(current, frameW, frameH)) {
+            interval = min(interval, smallTargetNativeVerifyIntervalFrames.coerceAtLeast(1))
+        }
+        return interval
+    }
+
+    private fun isSmallTargetForExtraVerify(current: Rect, frameW: Int, frameH: Int): Boolean {
+        if (frameW <= 0 || frameH <= 0) return false
+        val frameArea = (frameW.toDouble() * frameH.toDouble()).coerceAtLeast(1.0)
+        val boxArea = (current.width.toDouble() * current.height.toDouble()).coerceAtLeast(1.0)
+        val areaRatio = boxArea / frameArea
+        val threshold = (smallTargetAreaRatio * smallTargetNativeVerifyAreaScale).coerceIn(0.005, 0.25)
+        return areaRatio <= threshold
     }
 
     private fun recordNativeConfidenceSample(confidence: Double) {
@@ -2834,11 +2970,17 @@ class OpenCVTrackerAnalyzer(
                     metricsLockCount++
                     if (metricsFirstLockMs < 0L) {
                         metricsFirstLockMs = (SystemClock.elapsedRealtime() - metricsSessionStartMs).coerceAtLeast(0L)
+                        metricsFirstLockFrame = frameCounter
+                        if (isReplayInput && currentReplayPtsMs >= 0L) {
+                            metricsFirstLockReplayMs = currentReplayPtsMs
+                        }
                     }
                     Log.w(
                         TAG,
                         "EVAL_EVENT type=LOCK reason=$reason backend=${activeTrackBackend.name.lowercase(Locale.US)} " +
-                            "locks=$metricsLockCount firstLockSec=${fmt(metricsFirstLockMs.toDouble() / 1000.0)}"
+                            "locks=$metricsLockCount firstLockSec=${fmt(metricsFirstLockMs.toDouble() / 1000.0)} " +
+                            "firstLockReplaySec=${fmt(if (metricsFirstLockReplayMs >= 0L) metricsFirstLockReplayMs.toDouble() / 1000.0 else -1.0)} " +
+                            "firstLockFrame=$metricsFirstLockFrame"
                     )
                 }
                 Log.i(TAG, "Native tracker initialized ($reason): ${safe.x},${safe.y},${safe.width}x${safe.height}")
@@ -2884,11 +3026,17 @@ class OpenCVTrackerAnalyzer(
             metricsLockCount++
             if (metricsFirstLockMs < 0L) {
                 metricsFirstLockMs = (SystemClock.elapsedRealtime() - metricsSessionStartMs).coerceAtLeast(0L)
+                metricsFirstLockFrame = frameCounter
+                if (isReplayInput && currentReplayPtsMs >= 0L) {
+                    metricsFirstLockReplayMs = currentReplayPtsMs
+                }
             }
             Log.w(
                 TAG,
                 "EVAL_EVENT type=LOCK reason=$reason backend=${activeTrackBackend.name.lowercase(Locale.US)} " +
-                    "locks=$metricsLockCount firstLockSec=${fmt(metricsFirstLockMs.toDouble() / 1000.0)}"
+                    "locks=$metricsLockCount firstLockSec=${fmt(metricsFirstLockMs.toDouble() / 1000.0)} " +
+                    "firstLockReplaySec=${fmt(if (metricsFirstLockReplayMs >= 0L) metricsFirstLockReplayMs.toDouble() / 1000.0 else -1.0)} " +
+                    "firstLockFrame=$metricsFirstLockFrame"
             )
         }
 
@@ -2959,6 +3107,11 @@ class OpenCVTrackerAnalyzer(
         trackedBox: Rect,
         currentTrackConfidence: Double? = null
     ): TrackVerifyDecision? {
+        if (isNativeGapPassthroughActive()) {
+            trackVerifyFailStreak = 0
+            trackVerifyHardDriftStreak = 0
+            return null
+        }
         val verifyCfg = heuristicConfig.trackVerify
         if (verifyCfg.intervalFrames <= 0 || frameCounter % verifyCfg.intervalFrames.toLong() != 0L) {
             return null
@@ -4146,7 +4299,7 @@ class OpenCVTrackerAnalyzer(
         val roi = expandRectWithFactor(candidate.box, verifyCfg.localRoiExpandFactor, frame.cols(), frame.rows())
         val local = roi?.let { findOrbMatchInRoi(frame, it, loweRatioOverride = fallbackRefineCfg.loweRatio) }
         if (local == null) {
-            val fallbackPass = !isReplayInput && strongCandidate && strongAppearance
+            val fallbackPass = strongCandidate && strongAppearance
             logDiag(
                 "LOCK_GATE",
                 "$gatePrefix pass=$fallbackPass reason=local_missing score=${fmt(appearanceScore)}"
@@ -4167,7 +4320,7 @@ class OpenCVTrackerAnalyzer(
             val iouOk = iou >= minIou
             val confOk = local.confidence >= minLocalConf
             val geomPass = centerOk && iouOk && confOk
-            val geomOverride = !isReplayInput && strongCandidate && strongAppearance
+            val geomOverride = strongCandidate && strongAppearance
             if (!geomPass && !geomOverride) {
                 logDiag(
                     "LOCK_GATE",
@@ -4995,6 +5148,8 @@ class OpenCVTrackerAnalyzer(
             val avgMs = metricsTotalProcessMs.toDouble() / metricsFrames
             val trackRatio = metricsTrackingFrames.toDouble() / metricsFrames
             val firstLockSec = if (metricsFirstLockMs >= 0L) metricsFirstLockMs.toDouble() / 1000.0 else -1.0
+            val firstLockReplaySec = if (metricsFirstLockReplayMs >= 0L) metricsFirstLockReplayMs.toDouble() / 1000.0 else -1.0
+            val replayPtsSec = if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0
             val nativeConfAvg = if (metricsNativeConfSamples > 0L) metricsNativeConfSum / metricsNativeConfSamples else -1.0
             val nativeConfMin = if (metricsNativeConfSamples > 0L) metricsNativeConfMin else -1.0
             val nativeConfMax = if (metricsNativeConfSamples > 0L) metricsNativeConfMax else -1.0
@@ -5007,7 +5162,7 @@ class OpenCVTrackerAnalyzer(
                     "backendPref=${preferredTrackBackend.name.lowercase(Locale.US)} " +
                     "backendActive=${activeTrackBackend.name.lowercase(Locale.US)} " +
                     "avgFrameMs=${fmt(avgMs)} trackRatio=${fmt(trackRatio)} locks=$metricsLockCount " +
-                    "lost=$metricsLostCount firstLockSec=${fmt(firstLockSec)} " +
+                    "lost=$metricsLostCount replayPtsSec=${fmt(replayPtsSec)} firstLockSec=${fmt(firstLockSec)} firstLockReplaySec=${fmt(firstLockReplaySec)} firstLockFrame=$metricsFirstLockFrame " +
                     "nativeFuseSoft=$metricsNativeFuseSoftCount nativeFuseHard=$metricsNativeFuseHardCount " +
                     "nativeHold=$metricsNativeLowConfHoldCount kalmanPredHold=$metricsKalmanPredHoldCount nativeLowStreak=$nativeLowConfidenceStreak " +
                     "nativeWarmup=$nativeFuseWarmupRemaining " +
@@ -5305,6 +5460,8 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_NATIVE_FUSE_SOFT_STREAK = 3
         private const val DEFAULT_NATIVE_FUSE_WARMUP_FRAMES = 12
         private const val DEFAULT_NATIVE_HOLD_LAST_ON_SOFT_REJECT = true
+        private const val DEFAULT_NATIVE_GATE_USE_MEASUREMENT = true
+        private const val DEFAULT_NATIVE_GAP_PASSTHROUGH = false
         private const val DEFAULT_NATIVE_SCORE_LOG_INTERVAL_FRAMES = 20
         private const val DEFAULT_NATIVE_ORB_VERIFY_ENABLED = false
         private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_GOOD = 16
@@ -5316,7 +5473,7 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_AUTO_VERIFY_LOCAL_CENTER_FACTOR_LIVE = 0.75
         private const val DEFAULT_AUTO_VERIFY_LOCAL_CENTER_FACTOR_REPLAY = 1.80
         private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_IOU_LIVE = 0.40
-        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_IOU_REPLAY = 0.00
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_IOU_REPLAY = 0.15
         private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_SCALE_LIVE = 0.72
         private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_SCALE_REPLAY = 0.75
         private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_FLOOR_LIVE = 0.24
@@ -5327,7 +5484,7 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_AUTO_VERIFY_APPEAR_MEDIUM_GOOD = 20
         private const val DEFAULT_AUTO_VERIFY_APPEAR_MEDIUM_INLIERS = 8
         private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_MEDIUM = -0.25
-        private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_BASE = -0.18
+        private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_BASE = -0.25
         private const val DEFAULT_AUTO_VERIFY_APPEAR_LIVE_BIAS = 0.06
         private const val DEFAULT_KALMAN_ENABLED = false
         private const val DEFAULT_KALMAN_PROCESS_NOISE = 0.10
@@ -5345,7 +5502,7 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_KALMAN_PRIOR_ONLY_ON_UNCERTAIN = true
         private const val DEFAULT_KALMAN_PRIOR_MIN_IOU = 0.25
         private const val DEFAULT_KALMAN_PRIOR_STALE_MS = 100L
-        private const val DEFAULT_LOCK_HOLD_FRAMES = 0
+        private const val DEFAULT_LOCK_HOLD_FRAMES = 2
         private const val DEFAULT_LOST_OVERLAY_HOLD_MS = 120L
         private const val DEFAULT_FAST_FIRST_LOCK_FRAMES = 240
         private const val FAST_FIRST_LOCK_MIN_GOOD_MATCHES = 12
@@ -5366,16 +5523,19 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_TRACK_VERIFY_SWITCH_CONFIDENCE_MARGIN = 0.15
         private const val TRACK_VERIFY_HARD_MIN_GOOD_MATCHES = 5
         private const val DEFAULT_TRACK_VERIFY_HARD_DRIFT_TOLERANCE = 3
-        private const val DEFAULT_TRACK_VERIFY_NATIVE_BYPASS_CONFIDENCE = 0.75
-        private const val DEFAULT_TRACK_GUARD_MAX_CENTER_JUMP_FACTOR = 1.00
+        private const val DEFAULT_TRACK_VERIFY_NATIVE_BYPASS_CONFIDENCE = 0.55
+        private const val DEFAULT_TRACK_GUARD_MAX_CENTER_JUMP_FACTOR = 1.30
         private const val DEFAULT_TRACK_GUARD_MIN_AREA_RATIO = 0.35
         private const val DEFAULT_TRACK_GUARD_MAX_AREA_RATIO = 2.00
-        private const val DEFAULT_TRACK_GUARD_DROP_STREAK = 1
-        private const val DEFAULT_TRACK_GUARD_APPEARANCE_CHECK_INTERVAL = 4L
+        private const val DEFAULT_TRACK_GUARD_DROP_STREAK = 3
+        private const val DEFAULT_TRACK_GUARD_APPEARANCE_CHECK_INTERVAL = 2L
         private const val DEFAULT_TRACK_GUARD_MIN_APPEARANCE_SCORE = -0.12
         private const val DEFAULT_TRACK_GUARD_ANCHOR_ENABLED = true
         private const val DEFAULT_TRACK_GUARD_ANCHOR_MAX_DROP = 0.24
         private const val DEFAULT_TRACK_GUARD_ANCHOR_MIN_SCORE = -1.0
+        private const val DEFAULT_SMALL_TARGET_NATIVE_VERIFY_INTERVAL_FRAMES = 2
+        private const val DEFAULT_SMALL_TARGET_NATIVE_VERIFY_AREA_SCALE = 1.0
+        private const val DEFAULT_SMALL_TARGET_ANCHOR_DROP_SCALE = 0.65
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED = 0.24
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE = 0.32
         private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_RELAX = 0.03
