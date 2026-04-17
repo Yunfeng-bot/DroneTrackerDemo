@@ -881,6 +881,23 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
     outResult->confidence = clampFloat(bestConfidence * 0.70f + bestWindowedConfidence * 0.30f, 0.0f, 1.0f);
     return true;
 }
+
+bool NcnnTrackerImpl::setPrior(const TrackerBbox& bbox) {
+    if (!hasTemplate_) {
+        return false;
+    }
+    if (!std::isfinite(bbox.x) || !std::isfinite(bbox.y) ||
+        !std::isfinite(bbox.w) || !std::isfinite(bbox.h)) {
+        return false;
+    }
+
+    TrackerBbox prior = bbox;
+    prior.w = std::max(8.0f, prior.w);
+    prior.h = std::max(8.0f, prior.h);
+    lastBox_ = prior;
+    return true;
+}
+
 void NcnnTrackerImpl::reset() {
     hasTemplate_ = false;
     lastBox_ = TrackerBbox{};
@@ -1425,6 +1442,22 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
     outResult->ok = true;
     outResult->bbox = lastBox_;
     outResult->confidence = clampFloat((bestScore + 1.0f) * 0.5f, 0.0f, 1.0f);
+    return true;
+}
+
+bool NcnnTrackerImpl::setPrior(const TrackerBbox& bbox) {
+    if (!hasTemplate_) {
+        return false;
+    }
+    if (!std::isfinite(bbox.x) || !std::isfinite(bbox.y) ||
+        !std::isfinite(bbox.w) || !std::isfinite(bbox.h)) {
+        return false;
+    }
+
+    TrackerBbox prior = bbox;
+    prior.w = std::max(8.0f, prior.w);
+    prior.h = std::max(8.0f, prior.h);
+    lastBox_ = prior;
     return true;
 }
 

@@ -18,6 +18,12 @@ public:
     // Search branch: runs for each frame in high frequency.
     virtual bool track(const FrameBuffer& frame, TrackResult* outResult) = 0;
 
+    // Optional external prior update from upper fusion layer (for example Kalman prediction).
+    virtual bool setPrior(const TrackerBbox& bbox) {
+        (void)bbox;
+        return false;
+    }
+
     virtual void reset() = 0;
 
     virtual const char* name() const = 0;

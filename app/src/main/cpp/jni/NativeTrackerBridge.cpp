@@ -224,6 +224,23 @@ Java_com_example_dronetracker_nativebridge_NativeTrackerBridge_nativeTrack(
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_dronetracker_nativebridge_NativeTrackerBridge_nativeSetPriorBbox(
+    JNIEnv* /*env*/,
+    jobject /*thiz*/,
+    jfloat x,
+    jfloat y,
+    jfloat w,
+    jfloat h) {
+    TrackerBbox bbox;
+    bbox.x = x;
+    bbox.y = y;
+    bbox.w = w;
+    bbox.h = h;
+    const bool ok = NanoTrackerEngine::instance().setPrior(bbox);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_example_dronetracker_nativebridge_NativeTrackerBridge_nativeInitTargetGray(
     JNIEnv* env,
     jobject /*thiz*/,

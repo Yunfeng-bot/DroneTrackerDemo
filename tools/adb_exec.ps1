@@ -15,6 +15,7 @@ if (-not (Test-Path -LiteralPath $adbUserHome)) {
 # Force adb to use workspace-local home to avoid sandbox permission jitter on
 # C:\Users\CodexSandboxOffline\.android.
 $null = Remove-Item Env:ANDROID_PREFS_ROOT -ErrorAction SilentlyContinue
+$env:ANDROID_SDK_HOME = $adbHome
 $env:ANDROID_USER_HOME = $adbUserHome
 $env:ADB_VENDOR_KEYS = $adbUserHome
 $env:HOME = $adbHome

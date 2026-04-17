@@ -131,6 +131,21 @@ object NativeTrackerBridge {
         return NativeTrackResult(raw[0], raw[1], raw[2], raw[3], raw[4])
     }
 
+    fun setPriorBbox(bbox: Rect): Boolean {
+        if (!libraryLoaded) return false
+        return runCatching {
+            nativeSetPriorBbox(
+                bbox.left.toFloat(),
+                bbox.top.toFloat(),
+                bbox.width().toFloat(),
+                bbox.height().toFloat()
+            )
+        }.getOrElse {
+            Log.e(TAG, "setPriorBbox failed", it)
+            false
+        }
+    }
+
     fun initTargetGray(gray: ByteArray, width: Int, height: Int, bbox: Rect): Boolean {
         if (!libraryLoaded) return false
         if (gray.size < width * height || width <= 0 || height <= 0) return false
@@ -221,6 +236,13 @@ object NativeTrackerBridge {
         height: Int,
         rotation: Int
     ): FloatArray?
+
+    private external fun nativeSetPriorBbox(
+        x: Float,
+        y: Float,
+        w: Float,
+        h: Float
+    ): Boolean
 
     private external fun nativeInitTargetGray(
         grayBuffer: ByteArray,

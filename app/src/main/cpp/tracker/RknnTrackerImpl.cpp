@@ -35,6 +35,11 @@ bool RknnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
     return false;
 }
 
+bool RknnTrackerImpl::setPrior(const TrackerBbox& bbox) {
+    (void)bbox;
+    return false;
+}
+
 void RknnTrackerImpl::reset() {
     initialized_ = false;
 }

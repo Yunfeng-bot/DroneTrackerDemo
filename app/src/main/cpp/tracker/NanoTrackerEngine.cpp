@@ -70,6 +70,14 @@ bool NanoTrackerEngine::track(const FrameBuffer& frame, TrackResult* outResult) 
     return tracker_->track(frame, outResult);
 }
 
+bool NanoTrackerEngine::setPrior(const TrackerBbox& bbox) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!tracker_ || !modelReady_) {
+        return false;
+    }
+    return tracker_->setPrior(bbox);
+}
+
 void NanoTrackerEngine::reset() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (tracker_) {

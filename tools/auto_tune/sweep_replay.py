@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Replay auto-tuning helper for DroneTrackerDemo.
 
@@ -13,6 +13,7 @@ import csv
 import itertools
 import json
 import math
+import os
 import random
 import re
 import subprocess
@@ -103,6 +104,43 @@ def make_default_grid(preset: str) -> Dict[str, List[object]]:
             "small_target_min_inliers": [3, 4],
             "orb_ransac": [4.0, 6.0],
             "first_lock_min_iou": [0.55, 0.62],
+        }
+    if preset == "phase2_demo":
+        return {
+            # TrackGuard cluster
+            "track_guard_max_jump": [1.00, 1.10, 1.25],
+            "track_guard_min_area_ratio": [0.40, 0.45],
+            "track_guard_max_area_ratio": [2.00, 2.20],
+            "track_guard_min_appearance": [-0.12, -0.08],
+            # Temporal cluster
+            "temporal_min_conf_small_refined": [0.24, 0.28],
+            "temporal_min_conf_base": [0.32, 0.35],
+            "temporal_live_conf_relax": [0.02, 0.03],
+            # Kalman cluster
+            "kalman_r_scale_low": [6.0, 8.0],
+            "kalman_r_scale_occlusion": [10.0, 12.0],
+            "kalman_prior_min_iou": [0.25, 0.30],
+            "kalman_prior_stale_ms": [100, 140],
+        }
+    if preset == "phase2_overnight":
+        return {
+            # TrackGuard cluster
+            "track_guard_max_jump": [0.95, 1.00, 1.10, 1.20],
+            "track_guard_min_area_ratio": [0.35, 0.40, 0.45],
+            "track_guard_max_area_ratio": [1.80, 2.00, 2.20, 2.50],
+            "track_guard_drop_streak": [1, 2],
+            "track_guard_min_appearance": [-0.16, -0.12, -0.08, -0.04],
+            # Temporal cluster
+            "temporal_min_conf_small_refined": [0.22, 0.24, 0.28, 0.32],
+            "temporal_min_conf_base": [0.30, 0.34, 0.38],
+            "temporal_live_conf_relax": [0.01, 0.02, 0.03, 0.04],
+            "temporal_live_conf_floor": [0.08, 0.10, 0.12],
+            # Kalman cluster
+            "kalman_r_scale_high": [0.20, 0.25, 0.35],
+            "kalman_r_scale_low": [5.0, 7.0, 9.0, 12.0],
+            "kalman_r_scale_occlusion": [8.0, 12.0, 16.0],
+            "kalman_prior_min_iou": [0.20, 0.25, 0.30, 0.35],
+            "kalman_prior_stale_ms": [80, 120, 160, 220],
         }
     return {
         "fallback_refine_ratio": [0.78, 0.82, 0.86],
@@ -205,13 +243,113 @@ def compute_score(
     return score
 
 
+def _metric_first_lock_after_target_sec(row: Dict[str, object]) -> float:
+    raw = row.get("first_lock_after_target_sec")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    # missing/invalid first-lock is always worst on this axis (minimize).
+    return float("inf")
+
+
+def _metric_track_ratio(row: Dict[str, object]) -> float:
+    raw = row.get("track_ratio")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    # missing metrics are always worst on this axis (maximize).
+    return float("-inf")
+
+
+def _metric_avg_frame_ms(row: Dict[str, object]) -> float:
+    raw = row.get("avg_frame_ms")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    # missing metrics are always worst on this axis (minimize).
+    return float("inf")
+
+
+def _metric_lost(row: Dict[str, object]) -> float:
+    raw = row.get("lost")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    return float("inf")
+
+
+def pareto_dominates(a: Dict[str, object], b: Dict[str, object]) -> bool:
+    """
+    Multi-objective dominance:
+    - minimize: first_lock_after_target_sec, avg_frame_ms, lost
+    - maximize: track_ratio
+    """
+    a_first = _metric_first_lock_after_target_sec(a)
+    b_first = _metric_first_lock_after_target_sec(b)
+    a_ratio = _metric_track_ratio(a)
+    b_ratio = _metric_track_ratio(b)
+    a_ms = _metric_avg_frame_ms(a)
+    b_ms = _metric_avg_frame_ms(b)
+    a_lost = _metric_lost(a)
+    b_lost = _metric_lost(b)
+
+    not_worse = (
+        a_first <= b_first
+        and a_ratio >= b_ratio
+        and a_ms <= b_ms
+        and a_lost <= b_lost
+    )
+    strictly_better = (
+        a_first < b_first
+        or a_ratio > b_ratio
+        or a_ms < b_ms
+        or a_lost < b_lost
+    )
+    return not_worse and strictly_better
+
+
+def extract_pareto_front(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    front: List[Dict[str, object]] = []
+    for i, candidate in enumerate(rows):
+        dominated = False
+        for j, other in enumerate(rows):
+            if i == j:
+                continue
+            if pareto_dominates(other, candidate):
+                dominated = True
+                break
+        if not dominated:
+            front.append(candidate)
+    front.sort(
+        key=lambda r: (
+            -_metric_track_ratio(r),
+            _metric_avg_frame_ms(r),
+            _metric_lost(r),
+            _metric_first_lock_after_target_sec(r),
+            -float(r.get("score", 0.0)),
+        )
+    )
+    return front
+
+
 class AdbRunner:
     def __init__(self, repo_root: Path, mode: str) -> None:
         self.repo_root = repo_root
         self.mode = mode
         self.wrapper = repo_root / "tools" / "adb_exec.ps1"
+        self.android_home = repo_root / ".android_home"
 
     def run(self, args: List[str], timeout_sec: int = 30, check: bool = True) -> str:
+        env = os.environ.copy()
+        android_home = str(self.android_home)
+        env.pop("ANDROID_PREFS_ROOT", None)
+        # adb on some Windows setups still prefers ANDROID_SDK_HOME.
+        env["ANDROID_SDK_HOME"] = android_home
+        env["ANDROID_USER_HOME"] = android_home
+        env["ADB_VENDOR_KEYS"] = android_home
+        env["HOME"] = android_home
+        env["USERPROFILE"] = android_home
+        drive, tail = os.path.splitdrive(android_home)
+        if drive:
+            env["HOMEDRIVE"] = drive
+            env["HOMEPATH"] = tail if tail else "\\"
+
         if self.mode == "wrapper":
             cmd = [
                 "powershell",
@@ -224,14 +362,40 @@ class AdbRunner:
         else:
             cmd = ["adb", *args]
 
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(self.repo_root),
             text=True,
-            capture_output=True,
-            timeout=timeout_sec,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
         )
-        merged = (proc.stdout or "") + (proc.stderr or "")
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            # Python 3.14 + msys can hang when subprocess.run() handles timeout.
+            # Kill process tree first, then drain output to avoid deadlocks.
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    cwd=str(self.repo_root),
+                    text=True,
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=2)
+            except Exception:  # noqa: BLE001
+                stdout, stderr = "", ""
+            merged_timeout = (stdout or "") + (stderr or "")
+            raise RuntimeError(
+                f"adb command timeout ({timeout_sec}s): {' '.join(args)}\n{merged_timeout.strip()}"
+            )
+
+        merged = (stdout or "") + (stderr or "")
         if check and proc.returncode != 0:
             raise RuntimeError(f"adb command failed: {' '.join(args)}\n{merged.strip()}")
         return merged
@@ -383,7 +547,11 @@ def main() -> int:
     parser.add_argument("--duration-sec", type=float, default=10.0, help="effective scoring window (seconds) after target appears")
     parser.add_argument("--target-appear-sec", type=float, default=0.0, help="target appears after this offset in replay (seconds)")
     parser.add_argument("--cooldown-sec", type=float, default=1.0, help="pause between runs")
-    parser.add_argument("--preset", default="default", choices=["quick", "default", "overnight"])
+    parser.add_argument(
+        "--preset",
+        default="default",
+        choices=["quick", "default", "overnight", "phase2_demo", "phase2_overnight"],
+    )
     parser.add_argument("--grid", action="append", default=[], help="override/add grid key=val1|val2|...")
     parser.add_argument("--base-params", default="", help="extra fixed eval_params prefix")
     parser.add_argument("--max-runs", type=int, default=0, help="cap total runs after expansion (0 means no cap)")
@@ -395,7 +563,12 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    repo_root = Path(__file__).resolve().parents[2]
+    script_path = Path(__file__).resolve()
+    # Support both original location (tools/auto_tune/) and root hotfix copy.
+    if (script_path.parent / "tools" / "auto_tune").exists():
+        repo_root = script_path.parent
+    else:
+        repo_root = script_path.parents[2]
     run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_root = repo_root / args.output_dir
     run_dir = output_root / run_tag
@@ -506,20 +679,30 @@ def main() -> int:
                 if pid_out:
                     app_pid = pid_out.split()[0].strip()
                 time.sleep(total_wait_sec)
-                adb.run(force_stop_args, timeout_sec=20, check=False)
                 if app_pid:
                     dump_args = build_simple_args(serial, "logcat", "-d", f"--pid={app_pid}")
-                    log_text = adb.run(dump_args, timeout_sec=30, check=True)
+                    try:
+                        log_text = adb.run(dump_args, timeout_sec=45, check=True)
+                    except Exception as dump_exc:  # noqa: BLE001
+                        note = f"pid logcat fallback: {dump_exc}"
+                        error = f"{error}; {note}" if error else note
+                        log_text = adb.run(dump_log_args, timeout_sec=45, check=False)
                 else:
-                    log_text = adb.run(dump_log_args, timeout_sec=30, check=True)
+                    log_text = adb.run(dump_log_args, timeout_sec=45, check=True)
+                adb.run(force_stop_args, timeout_sec=20, check=False)
             except Exception as exc:  # noqa: BLE001
                 error = str(exc)
                 try:
                     if app_pid:
-                        dump_args = build_simple_args(serial, "logcat", "-d", f"--pid={app_pid}")
-                        log_text = adb.run(dump_args, timeout_sec=30, check=False)
+                        log_text = adb.run(dump_log_args, timeout_sec=45, check=False)
                     else:
-                        log_text = adb.run(dump_log_args, timeout_sec=30, check=False)
+                        log_text = adb.run(dump_log_args, timeout_sec=45, check=False)
+                except Exception:  # noqa: BLE001
+                    pass
+                if (not log_text) and ("EVAL_" in error or "Tracker" in error):
+                    log_text = error
+                try:
+                    adb.run(force_stop_args, timeout_sec=20, check=False)
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -611,6 +794,15 @@ def main() -> int:
     top10 = results_sorted[:10]
     top_path.write_text(json.dumps(top10, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    pareto_front = extract_pareto_front(results_sorted)
+    pareto_path = run_dir / "pareto.json"
+    pareto_path.write_text(json.dumps(pareto_front, indent=2, ensure_ascii=False), encoding="utf-8")
+    pareto_csv_path = run_dir / "pareto.csv"
+    with pareto_csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(pareto_front)
+
     print("\nTop candidates:")
     for i, row in enumerate(top10, start=1):
         top_first_raw = "NA" if row["first_lock_sec"] is None else f"{row['first_lock_sec']}s"
@@ -626,9 +818,25 @@ def main() -> int:
 
     print(f"\nSaved: {csv_path}")
     print(f"Saved: {top_path}")
+    print(f"Saved: {pareto_path}")
+    print(f"Saved: {pareto_csv_path}")
+    print(f"Pareto count: {len(pareto_front)}")
+    if pareto_front:
+        print("\nPareto front (top 10 by ratio->latency):")
+        for i, row in enumerate(pareto_front[:10], start=1):
+            p_first_after = (
+                "NA" if row["first_lock_after_target_sec"] is None else f"{row['first_lock_after_target_sec']}s"
+            )
+            print(
+                f"  P{i:02d}. ratio={row['track_ratio']} avgMs={row['avg_frame_ms']} "
+                f"lost={row['lost']} firstAfter={p_first_after} score={row['score']}"
+            )
+            print(f"      {row['params']}")
     print("Done.")
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

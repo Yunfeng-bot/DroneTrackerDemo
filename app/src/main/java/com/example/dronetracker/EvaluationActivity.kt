@@ -18,6 +18,7 @@ import com.example.dronetracker.nativebridge.NativeTrackerBridge
 import org.opencv.android.OpenCVLoader
 import org.opencv.core.Mat
 import java.io.File
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.LinkedHashSet
@@ -136,6 +137,7 @@ class EvaluationActivity : AppCompatActivity() {
         csvLogger?.append(frameId, latencyMs, prediction)
         if (frameId % CSV_FLUSH_INTERVAL == 0L) {
             csvLogger?.flush()
+            writeEvalSummaryFile()
         }
 
         if (frameId % STATUS_UPDATE_INTERVAL == 0L) {
@@ -294,6 +296,7 @@ class EvaluationActivity : AppCompatActivity() {
         csvLogger = null
 
         trackerAnalyzer.logEvalSummary("evaluation_destroy")
+        writeEvalSummaryFile()
 
         lastReplayBitmap?.let {
             if (!it.isRecycled) {
@@ -304,6 +307,43 @@ class EvaluationActivity : AppCompatActivity() {
 
         cameraExecutor.shutdown()
         super.onDestroy()
+    }
+
+    private fun writeEvalSummaryFile() {
+        val csv = csvOutputFile ?: return
+        val metrics = trackerAnalyzer.evalMetricsSnapshot()
+        val summary = resolveSummaryFile(csv)
+        val text = buildString {
+            appendLine("csv=${csv.absolutePath}")
+            appendLine("frames=${metrics.frames}")
+            appendLine("locks=${metrics.locks}")
+            appendLine("lost=${metrics.lost}")
+            appendLine(String.format(Locale.US, "trackRatio=%.4f", metrics.trackRatio))
+            appendLine(String.format(Locale.US, "avgFrameMs=%.4f", metrics.avgFrameMs))
+            appendLine(String.format(Locale.US, "firstLockSec=%.4f", metrics.firstLockSec))
+            appendLine("kalmanPredHold=${metrics.kalmanPredHold}")
+            appendLine(String.format(Locale.US, "kalmanPredHoldRatio=%.4f", metrics.kalmanPredHoldRatio))
+        }
+        try {
+            summary.writeText(text, Charsets.UTF_8)
+            Log.i(TAG, "Evaluation summary saved: ${summary.absolutePath}")
+        } catch (e: IOException) {
+            // Fallback to app-private eval dir if external custom path is not writable.
+            val fallbackDir = File(getExternalFilesDir(null), "eval").apply { mkdirs() }
+            val fallback = File(fallbackDir, "${csv.nameWithoutExtension}.summary.txt")
+            runCatching { fallback.writeText(text, Charsets.UTF_8) }
+                .onSuccess { Log.i(TAG, "Evaluation summary saved (fallback): ${fallback.absolutePath}") }
+                .onFailure { err -> Log.e(TAG, "writeEvalSummaryFile failed: ${summary.absolutePath}", err) }
+        }
+    }
+
+    private fun resolveSummaryFile(csv: File): File {
+        val parent = csv.parentFile
+        if (parent != null && (parent.exists() || parent.mkdirs()) && parent.canWrite()) {
+            return File(parent, "${csv.nameWithoutExtension}.summary.txt")
+        }
+        val fallbackDir = File(getExternalFilesDir(null), "eval").apply { mkdirs() }
+        return File(fallbackDir, "${csv.nameWithoutExtension}.summary.txt")
     }
 
     companion object {

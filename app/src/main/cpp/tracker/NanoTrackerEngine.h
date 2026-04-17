@@ -20,6 +20,7 @@ public:
     bool init(TrackerBackend backend, const std::string& modelParamPath, const std::string& modelBinPath);
     bool initTarget(const FrameBuffer& frame, const TrackerBbox& bbox);
     bool track(const FrameBuffer& frame, TrackResult* outResult);
+    bool setPrior(const TrackerBbox& bbox);
     void reset();
     void release();
 

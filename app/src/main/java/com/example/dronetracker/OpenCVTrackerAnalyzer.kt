@@ -168,9 +168,43 @@ class OpenCVTrackerAnalyzer(
         val allowFallbackLock: Boolean
     )
 
+    private data class FirstLockAdaptiveConfig(
+        val missRelaxHighStreak: Int,
+        val missRelaxHighFactor: Double,
+        val missRelaxMidStreak: Int,
+        val missRelaxMidFactor: Double,
+        val missRelaxLowStreak: Int,
+        val missRelaxLowFactor: Double,
+        val resetRelaxMinFrames: Int,
+        val resetRelaxMinIouResets: Int,
+        val resetRelaxFactor: Double,
+        val iouFloorStrongGood: Int,
+        val iouFloorStrongInliers: Int,
+        val iouFloorStrong: Double,
+        val iouFloorMediumGood: Int,
+        val iouFloorMediumInliers: Int,
+        val iouFloorMedium: Double,
+        val iouFloorBase: Double,
+        val centerRelaxGood: Int,
+        val centerRelaxInliers: Int,
+        val centerRelaxStrongFactor: Double,
+        val centerRelaxMissStreak: Int,
+        val centerRelaxMissFactor: Double,
+        val centerRelaxCapFactor: Double,
+        val confStrongGood: Int,
+        val confStrongInliers: Int,
+        val confStrongMin: Double,
+        val confMediumGood: Int,
+        val confMediumInliers: Int,
+        val confMediumMin: Double,
+        val confSmallMin: Double,
+        val confBaseMin: Double
+    )
+
     private data class TrackVerifyConfig(
         val intervalFrames: Int,
         val globalIntervalFrames: Int,
+        val enableGlobalFallback: Boolean,
         val localExpandFactor: Double,
         val minGoodMatches: Int,
         val minInliers: Int,
@@ -192,6 +226,52 @@ class OpenCVTrackerAnalyzer(
         val holdLastOnSoftReject: Boolean
     )
 
+    private data class AutoInitVerifyConfig(
+        val strongCandidateMinGood: Int,
+        val strongCandidateMinInliers: Int,
+        val strongCandidateMinConfidence: Double,
+        val strongAppearanceMinLive: Double,
+        val strongAppearanceMinReplay: Double,
+        val localRoiExpandFactor: Double,
+        val localCenterFactorLive: Double,
+        val localCenterFactorReplay: Double,
+        val localMinIouLive: Double,
+        val localMinIouReplay: Double,
+        val localMinConfScaleLive: Double,
+        val localMinConfScaleReplay: Double,
+        val localMinConfFloorLive: Double,
+        val localMinConfFloorReplay: Double,
+        val appearanceMinStrongGood: Int,
+        val appearanceMinStrongInliers: Int,
+        val appearanceMinStrong: Double,
+        val appearanceMinMediumGood: Int,
+        val appearanceMinMediumInliers: Int,
+        val appearanceMinMedium: Double,
+        val appearanceMinBase: Double,
+        val appearanceLiveBias: Double
+    )
+
+    private data class TemporalGateConfig(
+        val highGoodMatches: Int,
+        val highInliers: Int,
+        val minConfidenceHighGood: Double,
+        val mediumGoodMatches: Int,
+        val minConfidenceMedium: Double,
+        val minConfidenceSmallRefined: Double,
+        val minConfidenceBase: Double,
+        val liveConfidenceRelax: Double,
+        val liveConfidenceFloor: Double
+    )
+
+    private data class TrackGuardConfig(
+        val maxCenterJumpFactor: Double,
+        val minAreaRatio: Double,
+        val maxAreaRatio: Double,
+        val dropStreak: Int,
+        val appearanceCheckIntervalFrames: Long,
+        val minAppearanceScore: Double
+    )
+
     private data class HeuristicConfig(
         val orb: OrbThresholdConfig,
         val smallTarget: SmallTargetConfig,
@@ -199,8 +279,12 @@ class OpenCVTrackerAnalyzer(
         val softRelax: SoftRelaxConfig,
         val fallbackRefine: FallbackRefineConfig,
         val firstLock: FirstLockConfig,
+        val firstLockAdaptive: FirstLockAdaptiveConfig,
         val trackVerify: TrackVerifyConfig,
-        val nativeGate: NativeGateConfig
+        val nativeGate: NativeGateConfig,
+        val autoInitVerify: AutoInitVerifyConfig,
+        val temporalGate: TemporalGateConfig,
+        val trackGuard: TrackGuardConfig
     )
 
     private data class KalmanConfig(
@@ -208,7 +292,18 @@ class OpenCVTrackerAnalyzer(
         val processNoise: Double,
         val measurementNoise: Double,
         val maxPredictMs: Long,
-        val usePredictedHold: Boolean
+        val usePredictedHold: Boolean,
+        val dynamicMeasurementNoise: Boolean,
+        val highConfidenceThreshold: Double,
+        val lowConfidenceThreshold: Double,
+        val highConfidenceNoiseScale: Double,
+        val lowConfidenceNoiseScale: Double,
+        val occlusionNoiseScale: Double,
+        val feedNativePrior: Boolean,
+        val preTrackPriorFeed: Boolean,
+        val priorOnlyOnUncertain: Boolean,
+        val priorMinIou: Double,
+        val priorStaleMs: Long
     )
 
     private data class WeakFallbackStats(
@@ -235,6 +330,17 @@ class OpenCVTrackerAnalyzer(
         val height: Int,
         val confidence: Double,
         val tracking: Boolean
+    )
+
+    data class EvalMetricsSnapshot(
+        val frames: Long,
+        val locks: Int,
+        val lost: Int,
+        val trackRatio: Double,
+        val avgFrameMs: Double,
+        val firstLockSec: Double,
+        val kalmanPredHold: Int,
+        val kalmanPredHoldRatio: Double
     )
 
     private class TemplateLevel(
@@ -302,7 +408,7 @@ class OpenCVTrackerAnalyzer(
             return toRect(s)
         }
 
-        fun correct(box: Rect, timestampMs: Long, cfg: KalmanConfig): Rect {
+        fun correct(box: Rect, timestampMs: Long, cfg: KalmanConfig, measurementNoiseOverride: Double? = null): Rect {
             val current = state
             if (current == null) {
                 seed(box, timestampMs)
@@ -312,8 +418,9 @@ class OpenCVTrackerAnalyzer(
             predict(timestampMs, cfg)
             val s = state ?: return box
 
+            val measurementNoise = (measurementNoiseOverride ?: cfg.measurementNoise).coerceAtLeast(1e-6)
             val gainBase =
-                (cfg.processNoise / (cfg.processNoise + cfg.measurementNoise).coerceAtLeast(1e-6))
+                (cfg.processNoise / (cfg.processNoise + measurementNoise).coerceAtLeast(1e-6))
                     .coerceIn(0.08, 0.88)
 
             fun blend(measured: Double, predicted: Double): Double {
@@ -365,6 +472,7 @@ class OpenCVTrackerAnalyzer(
     private var isTracking = false
     private var trackingStage = TrackingStage.ACQUIRE
     private var lastTrackedBox: Rect? = null
+    private var lastMeasuredTrackBox: Rect? = null
     private var lastTrackerGcMs = 0L
     private var trackMismatchStreak = 0
     private var trackAppearanceLowStreak = 0
@@ -503,6 +611,7 @@ class OpenCVTrackerAnalyzer(
     private var nativeOrbVerifyEnabled = DEFAULT_NATIVE_ORB_VERIFY_ENABLED
     private var lockHoldFrames = DEFAULT_LOCK_HOLD_FRAMES
     private var lockHoldFramesRemaining = 0
+    private var lastNativeAcceptMs = 0L
     private var fastFirstLockFrames = DEFAULT_FAST_FIRST_LOCK_FRAMES
     private var fastFirstLockRemaining = 0
     private var lostOverlayHoldMs = DEFAULT_LOST_OVERLAY_HOLD_MS
@@ -521,6 +630,13 @@ class OpenCVTrackerAnalyzer(
     private var trackVerifyHardDriftStreak = 0
     private var trackVerifyHardDriftTolerance = DEFAULT_TRACK_VERIFY_HARD_DRIFT_TOLERANCE
     private var trackVerifyNativeBypassConfidence = DEFAULT_TRACK_VERIFY_NATIVE_BYPASS_CONFIDENCE
+    private var trackVerifyEnableGlobalFallback = DEFAULT_TRACK_VERIFY_ENABLE_GLOBAL_FALLBACK
+    private var trackGuardMaxCenterJumpFactor = DEFAULT_TRACK_GUARD_MAX_CENTER_JUMP_FACTOR
+    private var trackGuardMinAreaRatio = DEFAULT_TRACK_GUARD_MIN_AREA_RATIO
+    private var trackGuardMaxAreaRatio = DEFAULT_TRACK_GUARD_MAX_AREA_RATIO
+    private var trackGuardDropStreak = DEFAULT_TRACK_GUARD_DROP_STREAK
+    private var trackGuardAppearanceCheckInterval = DEFAULT_TRACK_GUARD_APPEARANCE_CHECK_INTERVAL
+    private var trackGuardMinAppearanceScore = DEFAULT_TRACK_GUARD_MIN_APPEARANCE_SCORE
 
     private var firstLockStableFrames = DEFAULT_FIRST_LOCK_STABLE_FRAMES
     private var firstLockStableMs = DEFAULT_FIRST_LOCK_STABLE_MS
@@ -562,6 +678,67 @@ class OpenCVTrackerAnalyzer(
     private var softRelaxMinGoodMatches = DEFAULT_SOFT_RELAX_MIN_GOOD_MATCHES
     private var softRelaxScaleThreshold = DEFAULT_SOFT_RELAX_SCALE_THRESHOLD
     private var softRelaxMaxRatio = DEFAULT_SOFT_RELAX_MAX_RATIO
+    private var firstLockMissRelaxHighStreak = DEFAULT_FIRST_LOCK_MISS_RELAX_HIGH_STREAK
+    private var firstLockMissRelaxHighFactor = DEFAULT_FIRST_LOCK_MISS_RELAX_HIGH_FACTOR
+    private var firstLockMissRelaxMidStreak = DEFAULT_FIRST_LOCK_MISS_RELAX_MID_STREAK
+    private var firstLockMissRelaxMidFactor = DEFAULT_FIRST_LOCK_MISS_RELAX_MID_FACTOR
+    private var firstLockMissRelaxLowStreak = DEFAULT_FIRST_LOCK_MISS_RELAX_LOW_STREAK
+    private var firstLockMissRelaxLowFactor = DEFAULT_FIRST_LOCK_MISS_RELAX_LOW_FACTOR
+    private var firstLockResetRelaxMinFrames = DEFAULT_FIRST_LOCK_RESET_RELAX_MIN_FRAMES
+    private var firstLockResetRelaxMinIouResets = DEFAULT_FIRST_LOCK_RESET_RELAX_MIN_IOU_RESETS
+    private var firstLockResetRelaxFactor = DEFAULT_FIRST_LOCK_RESET_RELAX_FACTOR
+    private var firstLockIouFloorStrongGood = DEFAULT_FIRST_LOCK_IOU_FLOOR_STRONG_GOOD
+    private var firstLockIouFloorStrongInliers = DEFAULT_FIRST_LOCK_IOU_FLOOR_STRONG_INLIERS
+    private var firstLockIouFloorStrong = DEFAULT_FIRST_LOCK_IOU_FLOOR_STRONG
+    private var firstLockIouFloorMediumGood = DEFAULT_FIRST_LOCK_IOU_FLOOR_MEDIUM_GOOD
+    private var firstLockIouFloorMediumInliers = DEFAULT_FIRST_LOCK_IOU_FLOOR_MEDIUM_INLIERS
+    private var firstLockIouFloorMedium = DEFAULT_FIRST_LOCK_IOU_FLOOR_MEDIUM
+    private var firstLockIouFloorBase = FIRST_LOCK_MIN_IOU_FLOOR
+    private var firstLockCenterRelaxStrongGood = DEFAULT_FIRST_LOCK_CENTER_RELAX_STRONG_GOOD
+    private var firstLockCenterRelaxStrongInliers = DEFAULT_FIRST_LOCK_CENTER_RELAX_STRONG_INLIERS
+    private var firstLockCenterRelaxStrongFactor = DEFAULT_FIRST_LOCK_CENTER_RELAX_STRONG_FACTOR
+    private var firstLockCenterRelaxMissStreak = DEFAULT_FIRST_LOCK_CENTER_RELAX_MISS_STREAK
+    private var firstLockCenterRelaxMissFactor = DEFAULT_FIRST_LOCK_CENTER_RELAX_MISS_FACTOR
+    private var firstLockCenterRelaxCapFactor = DEFAULT_FIRST_LOCK_CENTER_RELAX_CAP_FACTOR
+    private var firstLockConfStrongGood = DEFAULT_FIRST_LOCK_CONF_STRONG_GOOD
+    private var firstLockConfStrongInliers = DEFAULT_FIRST_LOCK_CONF_STRONG_INLIERS
+    private var firstLockConfStrongMin = DEFAULT_FIRST_LOCK_CONF_STRONG_MIN
+    private var firstLockConfMediumGood = DEFAULT_FIRST_LOCK_CONF_MEDIUM_GOOD
+    private var firstLockConfMediumInliers = DEFAULT_FIRST_LOCK_CONF_MEDIUM_INLIERS
+    private var firstLockConfMediumMin = DEFAULT_FIRST_LOCK_CONF_MEDIUM_MIN
+    private var firstLockConfSmallMin = DEFAULT_FIRST_LOCK_CONF_SMALL_MIN
+    private var firstLockConfBaseMin = DEFAULT_FIRST_LOCK_CONF_BASE_MIN
+    private var autoVerifyStrongMinGood = DEFAULT_AUTO_VERIFY_STRONG_MIN_GOOD
+    private var autoVerifyStrongMinInliers = DEFAULT_AUTO_VERIFY_STRONG_MIN_INLIERS
+    private var autoVerifyStrongMinConfidence = DEFAULT_AUTO_VERIFY_STRONG_MIN_CONFIDENCE
+    private var autoVerifyStrongAppearanceMinLive = DEFAULT_AUTO_VERIFY_STRONG_APPEARANCE_MIN_LIVE
+    private var autoVerifyStrongAppearanceMinReplay = DEFAULT_AUTO_VERIFY_STRONG_APPEARANCE_MIN_REPLAY
+    private var autoVerifyLocalRoiExpandFactor = DEFAULT_AUTO_VERIFY_LOCAL_ROI_EXPAND_FACTOR
+    private var autoVerifyLocalCenterFactorLive = DEFAULT_AUTO_VERIFY_LOCAL_CENTER_FACTOR_LIVE
+    private var autoVerifyLocalCenterFactorReplay = DEFAULT_AUTO_VERIFY_LOCAL_CENTER_FACTOR_REPLAY
+    private var autoVerifyLocalMinIouLive = DEFAULT_AUTO_VERIFY_LOCAL_MIN_IOU_LIVE
+    private var autoVerifyLocalMinIouReplay = DEFAULT_AUTO_VERIFY_LOCAL_MIN_IOU_REPLAY
+    private var autoVerifyLocalMinConfScaleLive = DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_SCALE_LIVE
+    private var autoVerifyLocalMinConfScaleReplay = DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_SCALE_REPLAY
+    private var autoVerifyLocalMinConfFloorLive = DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_FLOOR_LIVE
+    private var autoVerifyLocalMinConfFloorReplay = DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_FLOOR_REPLAY
+    private var autoVerifyAppearanceStrongGood = DEFAULT_AUTO_VERIFY_APPEAR_STRONG_GOOD
+    private var autoVerifyAppearanceStrongInliers = DEFAULT_AUTO_VERIFY_APPEAR_STRONG_INLIERS
+    private var autoVerifyAppearanceMinStrong = DEFAULT_AUTO_VERIFY_APPEAR_MIN_STRONG
+    private var autoVerifyAppearanceMediumGood = DEFAULT_AUTO_VERIFY_APPEAR_MEDIUM_GOOD
+    private var autoVerifyAppearanceMediumInliers = DEFAULT_AUTO_VERIFY_APPEAR_MEDIUM_INLIERS
+    private var autoVerifyAppearanceMinMedium = DEFAULT_AUTO_VERIFY_APPEAR_MIN_MEDIUM
+    private var autoVerifyAppearanceMinBase = DEFAULT_AUTO_VERIFY_APPEAR_MIN_BASE
+    private var autoVerifyAppearanceLiveBias = DEFAULT_AUTO_VERIFY_APPEAR_LIVE_BIAS
+    private var temporalHighGoodMatches = TEMPORAL_HIGH_GOOD_MATCHES
+    private var temporalHighInliers = TEMPORAL_HIGH_INLIERS
+    private var temporalMinConfidenceHighGood = TEMPORAL_MIN_CONFIDENCE_HIGH_GOOD
+    private var temporalMediumGoodMatches = TEMPORAL_MEDIUM_GOOD_MATCHES
+    private var temporalMinConfidenceMedium = TEMPORAL_MIN_CONFIDENCE_MEDIUM
+    private var temporalMinConfidenceSmallRefined = DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED
+    private var temporalMinConfidenceBase = DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE
+    private var temporalLiveConfidenceRelax = DEFAULT_TEMPORAL_LIVE_CONFIDENCE_RELAX
+    private var temporalLiveConfidenceFloor = DEFAULT_TEMPORAL_LIVE_CONFIDENCE_FLOOR
     private var firstLockCandidateBox: Rect? = null
     private var firstLockCandidateCenter = Point(0.0, 0.0)
     private var firstLockCandidateFrames = 0
@@ -583,7 +760,18 @@ class OpenCVTrackerAnalyzer(
         processNoise = DEFAULT_KALMAN_PROCESS_NOISE,
         measurementNoise = DEFAULT_KALMAN_MEASUREMENT_NOISE,
         maxPredictMs = DEFAULT_KALMAN_MAX_PREDICT_MS,
-        usePredictedHold = DEFAULT_KALMAN_USE_PREDICTED_HOLD
+        usePredictedHold = DEFAULT_KALMAN_USE_PREDICTED_HOLD,
+        dynamicMeasurementNoise = DEFAULT_KALMAN_DYNAMIC_MEASUREMENT_NOISE,
+        highConfidenceThreshold = DEFAULT_KALMAN_HIGH_CONFIDENCE_THRESHOLD,
+        lowConfidenceThreshold = DEFAULT_KALMAN_LOW_CONFIDENCE_THRESHOLD,
+        highConfidenceNoiseScale = DEFAULT_KALMAN_HIGH_CONFIDENCE_NOISE_SCALE,
+        lowConfidenceNoiseScale = DEFAULT_KALMAN_LOW_CONFIDENCE_NOISE_SCALE,
+        occlusionNoiseScale = DEFAULT_KALMAN_OCCLUSION_NOISE_SCALE,
+        feedNativePrior = DEFAULT_KALMAN_FEED_NATIVE_PRIOR,
+        preTrackPriorFeed = DEFAULT_KALMAN_PRETRACK_PRIOR_FEED,
+        priorOnlyOnUncertain = DEFAULT_KALMAN_PRIOR_ONLY_ON_UNCERTAIN,
+        priorMinIou = DEFAULT_KALMAN_PRIOR_MIN_IOU,
+        priorStaleMs = DEFAULT_KALMAN_PRIOR_STALE_MS
     )
     private val kalmanPredictor = BoxKalmanPredictor()
     private var latestKalmanPrediction: Rect? = null
@@ -687,11 +875,72 @@ class OpenCVTrackerAnalyzer(
                 "first_lock_temporal_hold" -> parseBoolean(value)?.let { firstLockHoldOnTemporalReject = it }
                 "first_lock_outlier_hold_max" -> value.toIntOrNull()?.let { firstLockOutlierHoldMax = it.coerceIn(1, 30) }
                 "allow_fallback_lock" -> parseBoolean(value)?.let { allowFallbackLock = it }
+                "first_lock_miss_relax_high_streak" -> value.toIntOrNull()?.let { firstLockMissRelaxHighStreak = it.coerceIn(1, 600) }
+                "first_lock_miss_relax_high_factor" -> value.toDoubleOrNull()?.let { firstLockMissRelaxHighFactor = it.coerceIn(0.40, 1.20) }
+                "first_lock_miss_relax_mid_streak" -> value.toIntOrNull()?.let { firstLockMissRelaxMidStreak = it.coerceIn(1, 600) }
+                "first_lock_miss_relax_mid_factor" -> value.toDoubleOrNull()?.let { firstLockMissRelaxMidFactor = it.coerceIn(0.40, 1.20) }
+                "first_lock_miss_relax_low_streak" -> value.toIntOrNull()?.let { firstLockMissRelaxLowStreak = it.coerceIn(1, 600) }
+                "first_lock_miss_relax_low_factor" -> value.toDoubleOrNull()?.let { firstLockMissRelaxLowFactor = it.coerceIn(0.40, 1.20) }
+                "first_lock_reset_relax_min_frames" -> value.toIntOrNull()?.let { firstLockResetRelaxMinFrames = it.coerceIn(1, 30) }
+                "first_lock_reset_relax_min_iou_resets" -> value.toIntOrNull()?.let { firstLockResetRelaxMinIouResets = it.coerceIn(1, 100) }
+                "first_lock_reset_relax_factor" -> value.toDoubleOrNull()?.let { firstLockResetRelaxFactor = it.coerceIn(0.40, 1.20) }
+                "first_lock_iou_floor_strong_good" -> value.toIntOrNull()?.let { firstLockIouFloorStrongGood = it.coerceIn(4, 80) }
+                "first_lock_iou_floor_strong_inliers" -> value.toIntOrNull()?.let { firstLockIouFloorStrongInliers = it.coerceIn(3, 80) }
+                "first_lock_iou_floor_strong" -> value.toDoubleOrNull()?.let { firstLockIouFloorStrong = it.coerceIn(0.0, 1.0) }
+                "first_lock_iou_floor_medium_good" -> value.toIntOrNull()?.let { firstLockIouFloorMediumGood = it.coerceIn(4, 80) }
+                "first_lock_iou_floor_medium_inliers" -> value.toIntOrNull()?.let { firstLockIouFloorMediumInliers = it.coerceIn(3, 80) }
+                "first_lock_iou_floor_medium" -> value.toDoubleOrNull()?.let { firstLockIouFloorMedium = it.coerceIn(0.0, 1.0) }
+                "first_lock_iou_floor_base" -> value.toDoubleOrNull()?.let { firstLockIouFloorBase = it.coerceIn(0.0, 1.0) }
+                "first_lock_center_relax_strong_good" -> value.toIntOrNull()?.let { firstLockCenterRelaxStrongGood = it.coerceIn(4, 80) }
+                "first_lock_center_relax_strong_inliers" -> value.toIntOrNull()?.let { firstLockCenterRelaxStrongInliers = it.coerceIn(3, 80) }
+                "first_lock_center_relax_strong_factor" -> value.toDoubleOrNull()?.let { firstLockCenterRelaxStrongFactor = it.coerceIn(1.0, 2.0) }
+                "first_lock_center_relax_miss_streak" -> value.toIntOrNull()?.let { firstLockCenterRelaxMissStreak = it.coerceIn(1, 600) }
+                "first_lock_center_relax_miss_factor" -> value.toDoubleOrNull()?.let { firstLockCenterRelaxMissFactor = it.coerceIn(1.0, 2.0) }
+                "first_lock_center_relax_cap_factor" -> value.toDoubleOrNull()?.let { firstLockCenterRelaxCapFactor = it.coerceIn(1.0, 2.0) }
+                "first_lock_conf_strong_good" -> value.toIntOrNull()?.let { firstLockConfStrongGood = it.coerceIn(4, 80) }
+                "first_lock_conf_strong_inliers" -> value.toIntOrNull()?.let { firstLockConfStrongInliers = it.coerceIn(3, 80) }
+                "first_lock_conf_strong_min" -> value.toDoubleOrNull()?.let { firstLockConfStrongMin = it.coerceIn(0.0, 1.0) }
+                "first_lock_conf_medium_good" -> value.toIntOrNull()?.let { firstLockConfMediumGood = it.coerceIn(4, 80) }
+                "first_lock_conf_medium_inliers" -> value.toIntOrNull()?.let { firstLockConfMediumInliers = it.coerceIn(3, 80) }
+                "first_lock_conf_medium_min" -> value.toDoubleOrNull()?.let { firstLockConfMediumMin = it.coerceIn(0.0, 1.0) }
+                "first_lock_conf_small_min" -> value.toDoubleOrNull()?.let { firstLockConfSmallMin = it.coerceIn(0.0, 1.0) }
+                "first_lock_conf_base_min" -> value.toDoubleOrNull()?.let { firstLockConfBaseMin = it.coerceIn(0.0, 1.0) }
                 "fallback_refine_expand" -> value.toDoubleOrNull()?.let { fallbackRefineExpandFactor = it.coerceIn(1.1, 3.0) }
                 "fallback_refine_min_good" -> value.toIntOrNull()?.let { fallbackRefineMinGoodMatches = it.coerceIn(4, 120) }
                 "fallback_refine_min_inliers" -> value.toIntOrNull()?.let { fallbackRefineMinInliers = it.coerceIn(3, 80) }
                 "fallback_refine_min_conf" -> value.toDoubleOrNull()?.let { fallbackRefineMinConfidence = it.coerceIn(0.0, 1.0) }
                 "fallback_refine_ratio" -> value.toDoubleOrNull()?.let { fallbackRefineLoweRatio = it.coerceIn(0.60, 0.95) }
+                "auto_verify_strong_min_good" -> value.toIntOrNull()?.let { autoVerifyStrongMinGood = it.coerceIn(4, 120) }
+                "auto_verify_strong_min_inliers" -> value.toIntOrNull()?.let { autoVerifyStrongMinInliers = it.coerceIn(3, 80) }
+                "auto_verify_strong_min_conf" -> value.toDoubleOrNull()?.let { autoVerifyStrongMinConfidence = it.coerceIn(0.0, 1.0) }
+                "auto_verify_strong_appearance_live" -> value.toDoubleOrNull()?.let { autoVerifyStrongAppearanceMinLive = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_strong_appearance_replay" -> value.toDoubleOrNull()?.let { autoVerifyStrongAppearanceMinReplay = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_local_roi_expand" -> value.toDoubleOrNull()?.let { autoVerifyLocalRoiExpandFactor = it.coerceIn(1.1, 4.0) }
+                "auto_verify_local_center_live" -> value.toDoubleOrNull()?.let { autoVerifyLocalCenterFactorLive = it.coerceIn(0.10, 2.0) }
+                "auto_verify_local_center_replay" -> value.toDoubleOrNull()?.let { autoVerifyLocalCenterFactorReplay = it.coerceIn(0.10, 2.0) }
+                "auto_verify_local_min_iou_live" -> value.toDoubleOrNull()?.let { autoVerifyLocalMinIouLive = it.coerceIn(0.0, 1.0) }
+                "auto_verify_local_min_iou_replay" -> value.toDoubleOrNull()?.let { autoVerifyLocalMinIouReplay = it.coerceIn(0.0, 1.0) }
+                "auto_verify_local_min_conf_scale_live" -> value.toDoubleOrNull()?.let { autoVerifyLocalMinConfScaleLive = it.coerceIn(0.0, 1.0) }
+                "auto_verify_local_min_conf_scale_replay" -> value.toDoubleOrNull()?.let { autoVerifyLocalMinConfScaleReplay = it.coerceIn(0.0, 1.0) }
+                "auto_verify_local_min_conf_floor_live" -> value.toDoubleOrNull()?.let { autoVerifyLocalMinConfFloorLive = it.coerceIn(0.0, 1.0) }
+                "auto_verify_local_min_conf_floor_replay" -> value.toDoubleOrNull()?.let { autoVerifyLocalMinConfFloorReplay = it.coerceIn(0.0, 1.0) }
+                "auto_verify_appear_strong_good" -> value.toIntOrNull()?.let { autoVerifyAppearanceStrongGood = it.coerceIn(4, 120) }
+                "auto_verify_appear_strong_inliers" -> value.toIntOrNull()?.let { autoVerifyAppearanceStrongInliers = it.coerceIn(3, 80) }
+                "auto_verify_appear_min_strong" -> value.toDoubleOrNull()?.let { autoVerifyAppearanceMinStrong = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_appear_medium_good" -> value.toIntOrNull()?.let { autoVerifyAppearanceMediumGood = it.coerceIn(4, 120) }
+                "auto_verify_appear_medium_inliers" -> value.toIntOrNull()?.let { autoVerifyAppearanceMediumInliers = it.coerceIn(3, 80) }
+                "auto_verify_appear_min_medium" -> value.toDoubleOrNull()?.let { autoVerifyAppearanceMinMedium = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_appear_min_base" -> value.toDoubleOrNull()?.let { autoVerifyAppearanceMinBase = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_appear_live_bias" -> value.toDoubleOrNull()?.let { autoVerifyAppearanceLiveBias = it.coerceIn(-1.0, 1.0) }
+                "temporal_high_good" -> value.toIntOrNull()?.let { temporalHighGoodMatches = it.coerceIn(4, 120) }
+                "temporal_high_inliers" -> value.toIntOrNull()?.let { temporalHighInliers = it.coerceIn(3, 80) }
+                "temporal_min_conf_high" -> value.toDoubleOrNull()?.let { temporalMinConfidenceHighGood = it.coerceIn(0.0, 1.0) }
+                "temporal_medium_good" -> value.toIntOrNull()?.let { temporalMediumGoodMatches = it.coerceIn(4, 120) }
+                "temporal_min_conf_medium" -> value.toDoubleOrNull()?.let { temporalMinConfidenceMedium = it.coerceIn(0.0, 1.0) }
+                "temporal_min_conf_small_refined" -> value.toDoubleOrNull()?.let { temporalMinConfidenceSmallRefined = it.coerceIn(0.0, 1.0) }
+                "temporal_min_conf_base" -> value.toDoubleOrNull()?.let { temporalMinConfidenceBase = it.coerceIn(0.0, 1.0) }
+                "temporal_live_conf_relax" -> value.toDoubleOrNull()?.let { temporalLiveConfidenceRelax = it.coerceIn(0.0, 1.0) }
+                "temporal_live_conf_floor" -> value.toDoubleOrNull()?.let { temporalLiveConfidenceFloor = it.coerceIn(0.0, 1.0) }
                 "small_target_area_ratio" -> value.toDoubleOrNull()?.let { smallTargetAreaRatio = it.coerceIn(0.005, 0.20) }
                 "small_target_min_good" -> value.toIntOrNull()?.let { smallTargetMinGoodMatches = it.coerceIn(4, 120) }
                 "small_target_min_inliers" -> value.toIntOrNull()?.let { smallTargetMinInliers = it.coerceIn(3, 80) }
@@ -727,6 +976,20 @@ class OpenCVTrackerAnalyzer(
                 "track_verify_recenter_px" -> value.toDoubleOrNull()?.let { trackVerifyRecenterPx = it.coerceIn(8.0, 360.0) }
                 "track_verify_min_iou" -> value.toDoubleOrNull()?.let { trackVerifyMinIou = it.coerceIn(0.0, 0.95) }
                 "track_verify_conf_margin" -> value.toDoubleOrNull()?.let { trackVerifySwitchConfidenceMargin = it.coerceIn(0.0, 0.60) }
+                "track_verify_global_fallback", "track_verify_enable_global_fallback" ->
+                    parseBoolean(value)?.let { trackVerifyEnableGlobalFallback = it }
+                "track_guard_max_jump" ->
+                    value.toDoubleOrNull()?.let { trackGuardMaxCenterJumpFactor = it.coerceIn(0.20, 5.0) }
+                "track_guard_min_area_ratio" ->
+                    value.toDoubleOrNull()?.let { trackGuardMinAreaRatio = it.coerceIn(0.05, 1.0) }
+                "track_guard_max_area_ratio" ->
+                    value.toDoubleOrNull()?.let { trackGuardMaxAreaRatio = it.coerceIn(1.0, 10.0) }
+                "track_guard_drop_streak" ->
+                    value.toIntOrNull()?.let { trackGuardDropStreak = it.coerceIn(1, 12) }
+                "track_guard_appearance_interval" ->
+                    value.toLongOrNull()?.let { trackGuardAppearanceCheckInterval = it.coerceIn(1L, 120L) }
+                "track_guard_min_appearance" ->
+                    value.toDoubleOrNull()?.let { trackGuardMinAppearanceScore = it.coerceIn(-1.0, 1.0) }
                 "track_backend", "tracker_backend" -> parseTrackBackend(value)?.let { preferredTrackBackend = it }
                 "native_failures" -> value.toIntOrNull()?.let { nativeMaxFailStreak = it.coerceIn(1, 10) }
                 "native_min_confidence", "native_min_conf" ->
@@ -765,6 +1028,42 @@ class OpenCVTrackerAnalyzer(
                     }
                 "kalman_use_predicted_hold", "kalman_loss_hold" ->
                     parseBoolean(value)?.let { kalmanConfig = kalmanConfig.copy(usePredictedHold = it) }
+                "kalman_dynamic_measurement", "kalman_dynamic_r" ->
+                    parseBoolean(value)?.let { kalmanConfig = kalmanConfig.copy(dynamicMeasurementNoise = it) }
+                "kalman_conf_high", "kalman_high_confidence_threshold" ->
+                    value.toDoubleOrNull()?.let {
+                        kalmanConfig = kalmanConfig.copy(highConfidenceThreshold = it.coerceIn(0.05, 1.0))
+                    }
+                "kalman_conf_low", "kalman_low_confidence_threshold" ->
+                    value.toDoubleOrNull()?.let {
+                        kalmanConfig = kalmanConfig.copy(lowConfidenceThreshold = it.coerceIn(0.0, 0.95))
+                    }
+                "kalman_r_scale_high", "kalman_high_conf_noise_scale" ->
+                    value.toDoubleOrNull()?.let {
+                        kalmanConfig = kalmanConfig.copy(highConfidenceNoiseScale = it.coerceIn(0.01, 10.0))
+                    }
+                "kalman_r_scale_low", "kalman_low_conf_noise_scale" ->
+                    value.toDoubleOrNull()?.let {
+                        kalmanConfig = kalmanConfig.copy(lowConfidenceNoiseScale = it.coerceIn(0.10, 100.0))
+                    }
+                "kalman_r_scale_occlusion", "kalman_occlusion_noise_scale" ->
+                    value.toDoubleOrNull()?.let {
+                        kalmanConfig = kalmanConfig.copy(occlusionNoiseScale = it.coerceIn(0.10, 200.0))
+                    }
+                "kalman_feed_native_prior", "kalman_prior_feedback" ->
+                    parseBoolean(value)?.let { kalmanConfig = kalmanConfig.copy(feedNativePrior = it) }
+                "kalman_pretrack_prior_feed", "kalman_prior_pretrack_feed" ->
+                    parseBoolean(value)?.let { kalmanConfig = kalmanConfig.copy(preTrackPriorFeed = it) }
+                "kalman_prior_only_on_uncertain", "kalman_prior_uncertain_only" ->
+                    parseBoolean(value)?.let { kalmanConfig = kalmanConfig.copy(priorOnlyOnUncertain = it) }
+                "kalman_prior_min_iou" ->
+                    value.toDoubleOrNull()?.let {
+                        kalmanConfig = kalmanConfig.copy(priorMinIou = it.coerceIn(0.0, 1.0))
+                    }
+                "kalman_prior_stale_ms" ->
+                    value.toLongOrNull()?.let {
+                        kalmanConfig = kalmanConfig.copy(priorStaleMs = it.coerceIn(0L, 3000L))
+                    }
                 "native_model_param", "native_param_path", "ncnn_param_path" -> {
                     nativeModelParamPathOverride = normalizeOptionalPath(value)
                 }
@@ -806,12 +1105,121 @@ class OpenCVTrackerAnalyzer(
         if (trackVerifyGlobalIntervalFrames < trackVerifyIntervalFrames) {
             trackVerifyGlobalIntervalFrames = trackVerifyIntervalFrames
         }
+        trackGuardMaxCenterJumpFactor = trackGuardMaxCenterJumpFactor.coerceIn(0.20, 5.0)
+        trackGuardMinAreaRatio = trackGuardMinAreaRatio.coerceIn(0.05, 1.0)
+        trackGuardMaxAreaRatio = trackGuardMaxAreaRatio.coerceIn(1.0, 10.0)
+        if (trackGuardMinAreaRatio > trackGuardMaxAreaRatio) {
+            trackGuardMinAreaRatio = trackGuardMaxAreaRatio
+        }
+        trackGuardDropStreak = trackGuardDropStreak.coerceIn(1, 12)
+        trackGuardAppearanceCheckInterval = trackGuardAppearanceCheckInterval.coerceIn(1L, 120L)
+        trackGuardMinAppearanceScore = trackGuardMinAppearanceScore.coerceIn(-1.0, 1.0)
         if (firstLockSmallCenterDriftRelaxedPx < firstLockSmallCenterDriftPx) {
             firstLockSmallCenterDriftRelaxedPx = firstLockSmallCenterDriftPx
         }
         firstLockSmallDynamicCenterFactor = firstLockSmallDynamicCenterFactor.coerceAtLeast(0.30)
         firstLockSmallRelaxedIouFloor = firstLockSmallRelaxedIouFloor.coerceIn(0.0, 0.60)
         firstLockOutlierHoldMax = firstLockOutlierHoldMax.coerceIn(1, 30)
+        firstLockMissRelaxHighStreak = firstLockMissRelaxHighStreak.coerceIn(1, 600)
+        firstLockMissRelaxMidStreak = firstLockMissRelaxMidStreak.coerceIn(1, 600)
+        firstLockMissRelaxLowStreak = firstLockMissRelaxLowStreak.coerceIn(1, 600)
+        if (firstLockMissRelaxMidStreak > firstLockMissRelaxHighStreak) {
+            firstLockMissRelaxMidStreak = firstLockMissRelaxHighStreak
+        }
+        if (firstLockMissRelaxLowStreak > firstLockMissRelaxMidStreak) {
+            firstLockMissRelaxLowStreak = firstLockMissRelaxMidStreak
+        }
+        firstLockMissRelaxHighFactor = firstLockMissRelaxHighFactor.coerceIn(0.40, 1.20)
+        firstLockMissRelaxMidFactor = firstLockMissRelaxMidFactor.coerceIn(0.40, 1.20)
+        firstLockMissRelaxLowFactor = firstLockMissRelaxLowFactor.coerceIn(0.40, 1.20)
+        firstLockResetRelaxMinFrames = firstLockResetRelaxMinFrames.coerceIn(1, 30)
+        firstLockResetRelaxMinIouResets = firstLockResetRelaxMinIouResets.coerceIn(1, 100)
+        firstLockResetRelaxFactor = firstLockResetRelaxFactor.coerceIn(0.40, 1.20)
+        firstLockIouFloorStrongGood = firstLockIouFloorStrongGood.coerceIn(4, 80)
+        firstLockIouFloorStrongInliers = firstLockIouFloorStrongInliers.coerceIn(3, 80)
+        firstLockIouFloorMediumGood = firstLockIouFloorMediumGood.coerceIn(4, 80)
+        firstLockIouFloorMediumInliers = firstLockIouFloorMediumInliers.coerceIn(3, 80)
+        firstLockIouFloorStrong = firstLockIouFloorStrong.coerceIn(0.0, 1.0)
+        firstLockIouFloorMedium = firstLockIouFloorMedium.coerceIn(0.0, 1.0)
+        firstLockIouFloorBase = firstLockIouFloorBase.coerceIn(0.0, 1.0)
+        if (firstLockIouFloorStrong > firstLockIouFloorMedium) {
+            firstLockIouFloorStrong = firstLockIouFloorMedium
+        }
+        if (firstLockIouFloorMedium > firstLockIouFloorBase) {
+            firstLockIouFloorMedium = firstLockIouFloorBase
+        }
+        firstLockCenterRelaxStrongGood = firstLockCenterRelaxStrongGood.coerceIn(4, 80)
+        firstLockCenterRelaxStrongInliers = firstLockCenterRelaxStrongInliers.coerceIn(3, 80)
+        firstLockCenterRelaxStrongFactor = firstLockCenterRelaxStrongFactor.coerceIn(1.0, 2.0)
+        firstLockCenterRelaxMissStreak = firstLockCenterRelaxMissStreak.coerceIn(1, 600)
+        firstLockCenterRelaxMissFactor = firstLockCenterRelaxMissFactor.coerceIn(1.0, 2.0)
+        firstLockCenterRelaxCapFactor = firstLockCenterRelaxCapFactor.coerceIn(1.0, 2.0)
+        firstLockConfStrongGood = firstLockConfStrongGood.coerceIn(4, 80)
+        firstLockConfStrongInliers = firstLockConfStrongInliers.coerceIn(3, 80)
+        firstLockConfMediumGood = firstLockConfMediumGood.coerceIn(4, 80)
+        firstLockConfMediumInliers = firstLockConfMediumInliers.coerceIn(3, 80)
+        firstLockConfStrongMin = firstLockConfStrongMin.coerceIn(0.0, 1.0)
+        firstLockConfMediumMin = firstLockConfMediumMin.coerceIn(0.0, 1.0)
+        firstLockConfSmallMin = firstLockConfSmallMin.coerceIn(0.0, 1.0)
+        firstLockConfBaseMin = firstLockConfBaseMin.coerceIn(0.0, 1.0)
+        if (firstLockConfStrongMin > firstLockConfMediumMin) {
+            firstLockConfStrongMin = firstLockConfMediumMin
+        }
+        if (firstLockConfMediumMin > firstLockConfSmallMin) {
+            firstLockConfMediumMin = firstLockConfSmallMin
+        }
+        if (firstLockConfSmallMin > firstLockConfBaseMin) {
+            firstLockConfSmallMin = firstLockConfBaseMin
+        }
+        autoVerifyStrongMinGood = autoVerifyStrongMinGood.coerceIn(4, 120)
+        autoVerifyStrongMinInliers = autoVerifyStrongMinInliers.coerceIn(3, 80)
+        autoVerifyStrongMinConfidence = autoVerifyStrongMinConfidence.coerceIn(0.0, 1.0)
+        autoVerifyStrongAppearanceMinLive = autoVerifyStrongAppearanceMinLive.coerceIn(-1.0, 1.0)
+        autoVerifyStrongAppearanceMinReplay = autoVerifyStrongAppearanceMinReplay.coerceIn(-1.0, 1.0)
+        autoVerifyLocalRoiExpandFactor = autoVerifyLocalRoiExpandFactor.coerceIn(1.1, 4.0)
+        autoVerifyLocalCenterFactorLive = autoVerifyLocalCenterFactorLive.coerceIn(0.10, 2.0)
+        autoVerifyLocalCenterFactorReplay = autoVerifyLocalCenterFactorReplay.coerceIn(0.10, 2.0)
+        autoVerifyLocalMinIouLive = autoVerifyLocalMinIouLive.coerceIn(0.0, 1.0)
+        autoVerifyLocalMinIouReplay = autoVerifyLocalMinIouReplay.coerceIn(0.0, 1.0)
+        autoVerifyLocalMinConfScaleLive = autoVerifyLocalMinConfScaleLive.coerceIn(0.0, 1.0)
+        autoVerifyLocalMinConfScaleReplay = autoVerifyLocalMinConfScaleReplay.coerceIn(0.0, 1.0)
+        autoVerifyLocalMinConfFloorLive = autoVerifyLocalMinConfFloorLive.coerceIn(0.0, 1.0)
+        autoVerifyLocalMinConfFloorReplay = autoVerifyLocalMinConfFloorReplay.coerceIn(0.0, 1.0)
+        autoVerifyAppearanceStrongGood = autoVerifyAppearanceStrongGood.coerceIn(4, 120)
+        autoVerifyAppearanceStrongInliers = autoVerifyAppearanceStrongInliers.coerceIn(3, 80)
+        autoVerifyAppearanceMediumGood = autoVerifyAppearanceMediumGood.coerceIn(4, 120)
+        autoVerifyAppearanceMediumInliers = autoVerifyAppearanceMediumInliers.coerceIn(3, 80)
+        autoVerifyAppearanceMinStrong = autoVerifyAppearanceMinStrong.coerceIn(-1.0, 1.0)
+        autoVerifyAppearanceMinMedium = autoVerifyAppearanceMinMedium.coerceIn(-1.0, 1.0)
+        autoVerifyAppearanceMinBase = autoVerifyAppearanceMinBase.coerceIn(-1.0, 1.0)
+        autoVerifyAppearanceLiveBias = autoVerifyAppearanceLiveBias.coerceIn(-1.0, 1.0)
+        if (autoVerifyAppearanceMinStrong > autoVerifyAppearanceMinMedium) {
+            autoVerifyAppearanceMinStrong = autoVerifyAppearanceMinMedium
+        }
+        if (autoVerifyAppearanceMinMedium > autoVerifyAppearanceMinBase) {
+            autoVerifyAppearanceMinMedium = autoVerifyAppearanceMinBase
+        }
+        temporalHighGoodMatches = temporalHighGoodMatches.coerceIn(4, 120)
+        temporalHighInliers = temporalHighInliers.coerceIn(3, 80)
+        temporalMediumGoodMatches = temporalMediumGoodMatches.coerceIn(4, temporalHighGoodMatches)
+        temporalMinConfidenceHighGood = temporalMinConfidenceHighGood.coerceIn(0.0, 1.0)
+        temporalMinConfidenceMedium = temporalMinConfidenceMedium.coerceIn(0.0, 1.0)
+        temporalMinConfidenceSmallRefined = temporalMinConfidenceSmallRefined.coerceIn(0.0, 1.0)
+        temporalMinConfidenceBase = temporalMinConfidenceBase.coerceIn(0.0, 1.0)
+        temporalLiveConfidenceRelax = temporalLiveConfidenceRelax.coerceIn(0.0, 1.0)
+        temporalLiveConfidenceFloor = temporalLiveConfidenceFloor.coerceIn(0.0, 1.0)
+        if (temporalMinConfidenceHighGood > temporalMinConfidenceMedium) {
+            temporalMinConfidenceHighGood = temporalMinConfidenceMedium
+        }
+        if (temporalMinConfidenceMedium > temporalMinConfidenceSmallRefined) {
+            temporalMinConfidenceMedium = temporalMinConfidenceSmallRefined
+        }
+        if (temporalMinConfidenceSmallRefined > temporalMinConfidenceBase) {
+            temporalMinConfidenceSmallRefined = temporalMinConfidenceBase
+        }
+        if (temporalLiveConfidenceFloor > temporalMinConfidenceBase) {
+            temporalLiveConfidenceFloor = temporalMinConfidenceBase
+        }
         orbSoftMinGoodMatches = orbSoftMinGoodMatches.coerceAtMost(orbMinGoodMatches).coerceAtLeast(3)
         orbSoftMinInliers = orbSoftMinInliers.coerceAtMost(orbMinInliers).coerceAtLeast(3)
         trackVerifyMinInliers = trackVerifyMinInliers.coerceAtMost(trackVerifyMinGoodMatches).coerceAtLeast(3)
@@ -839,8 +1247,21 @@ class OpenCVTrackerAnalyzer(
         kalmanConfig = kalmanConfig.copy(
             processNoise = kalmanConfig.processNoise.coerceIn(0.001, 1.0),
             measurementNoise = kalmanConfig.measurementNoise.coerceIn(0.001, 1.0),
-            maxPredictMs = kalmanConfig.maxPredictMs.coerceIn(30L, 2000L)
+            maxPredictMs = kalmanConfig.maxPredictMs.coerceIn(30L, 2000L),
+            highConfidenceThreshold = kalmanConfig.highConfidenceThreshold.coerceIn(0.05, 1.0),
+            lowConfidenceThreshold = kalmanConfig.lowConfidenceThreshold.coerceIn(0.0, 0.95),
+            highConfidenceNoiseScale = kalmanConfig.highConfidenceNoiseScale.coerceIn(0.01, 10.0),
+            lowConfidenceNoiseScale = kalmanConfig.lowConfidenceNoiseScale.coerceIn(0.10, 100.0),
+            occlusionNoiseScale = kalmanConfig.occlusionNoiseScale.coerceIn(0.10, 200.0),
+            priorMinIou = kalmanConfig.priorMinIou.coerceIn(0.0, 1.0),
+            priorStaleMs = kalmanConfig.priorStaleMs.coerceIn(0L, 3000L)
         )
+        if (kalmanConfig.lowConfidenceThreshold > kalmanConfig.highConfidenceThreshold) {
+            kalmanConfig = kalmanConfig.copy(lowConfidenceThreshold = kalmanConfig.highConfidenceThreshold)
+        }
+        if (kalmanConfig.highConfidenceNoiseScale > kalmanConfig.lowConfidenceNoiseScale) {
+            kalmanConfig = kalmanConfig.copy(highConfidenceNoiseScale = kalmanConfig.lowConfidenceNoiseScale)
+        }
         lockHoldFrames = lockHoldFrames.coerceIn(0, 180)
         lostOverlayHoldMs = lostOverlayHoldMs.coerceIn(0L, 3000L)
         fastFirstLockFrames = fastFirstLockFrames.coerceIn(0, 300)
@@ -912,9 +1333,42 @@ class OpenCVTrackerAnalyzer(
                 outlierHoldMax = firstLockOutlierHoldMax,
                 allowFallbackLock = allowFallbackLock
             ),
+            firstLockAdaptive = FirstLockAdaptiveConfig(
+                missRelaxHighStreak = firstLockMissRelaxHighStreak,
+                missRelaxHighFactor = firstLockMissRelaxHighFactor,
+                missRelaxMidStreak = firstLockMissRelaxMidStreak,
+                missRelaxMidFactor = firstLockMissRelaxMidFactor,
+                missRelaxLowStreak = firstLockMissRelaxLowStreak,
+                missRelaxLowFactor = firstLockMissRelaxLowFactor,
+                resetRelaxMinFrames = firstLockResetRelaxMinFrames,
+                resetRelaxMinIouResets = firstLockResetRelaxMinIouResets,
+                resetRelaxFactor = firstLockResetRelaxFactor,
+                iouFloorStrongGood = firstLockIouFloorStrongGood,
+                iouFloorStrongInliers = firstLockIouFloorStrongInliers,
+                iouFloorStrong = firstLockIouFloorStrong,
+                iouFloorMediumGood = firstLockIouFloorMediumGood,
+                iouFloorMediumInliers = firstLockIouFloorMediumInliers,
+                iouFloorMedium = firstLockIouFloorMedium,
+                iouFloorBase = firstLockIouFloorBase,
+                centerRelaxGood = firstLockCenterRelaxStrongGood,
+                centerRelaxInliers = firstLockCenterRelaxStrongInliers,
+                centerRelaxStrongFactor = firstLockCenterRelaxStrongFactor,
+                centerRelaxMissStreak = firstLockCenterRelaxMissStreak,
+                centerRelaxMissFactor = firstLockCenterRelaxMissFactor,
+                centerRelaxCapFactor = firstLockCenterRelaxCapFactor,
+                confStrongGood = firstLockConfStrongGood,
+                confStrongInliers = firstLockConfStrongInliers,
+                confStrongMin = firstLockConfStrongMin,
+                confMediumGood = firstLockConfMediumGood,
+                confMediumInliers = firstLockConfMediumInliers,
+                confMediumMin = firstLockConfMediumMin,
+                confSmallMin = firstLockConfSmallMin,
+                confBaseMin = firstLockConfBaseMin
+            ),
             trackVerify = TrackVerifyConfig(
                 intervalFrames = trackVerifyIntervalFrames,
                 globalIntervalFrames = trackVerifyGlobalIntervalFrames,
+                enableGlobalFallback = trackVerifyEnableGlobalFallback,
                 localExpandFactor = trackVerifyLocalExpandFactor,
                 minGoodMatches = trackVerifyMinGoodMatches,
                 minInliers = trackVerifyMinInliers,
@@ -933,6 +1387,49 @@ class OpenCVTrackerAnalyzer(
                 fuseSoftStreak = nativeFuseSoftStreak,
                 fuseWarmupFrames = nativeFuseWarmupFrames,
                 holdLastOnSoftReject = nativeHoldLastOnSoftReject
+            ),
+            autoInitVerify = AutoInitVerifyConfig(
+                strongCandidateMinGood = autoVerifyStrongMinGood,
+                strongCandidateMinInliers = autoVerifyStrongMinInliers,
+                strongCandidateMinConfidence = autoVerifyStrongMinConfidence,
+                strongAppearanceMinLive = autoVerifyStrongAppearanceMinLive,
+                strongAppearanceMinReplay = autoVerifyStrongAppearanceMinReplay,
+                localRoiExpandFactor = autoVerifyLocalRoiExpandFactor,
+                localCenterFactorLive = autoVerifyLocalCenterFactorLive,
+                localCenterFactorReplay = autoVerifyLocalCenterFactorReplay,
+                localMinIouLive = autoVerifyLocalMinIouLive,
+                localMinIouReplay = autoVerifyLocalMinIouReplay,
+                localMinConfScaleLive = autoVerifyLocalMinConfScaleLive,
+                localMinConfScaleReplay = autoVerifyLocalMinConfScaleReplay,
+                localMinConfFloorLive = autoVerifyLocalMinConfFloorLive,
+                localMinConfFloorReplay = autoVerifyLocalMinConfFloorReplay,
+                appearanceMinStrongGood = autoVerifyAppearanceStrongGood,
+                appearanceMinStrongInliers = autoVerifyAppearanceStrongInliers,
+                appearanceMinStrong = autoVerifyAppearanceMinStrong,
+                appearanceMinMediumGood = autoVerifyAppearanceMediumGood,
+                appearanceMinMediumInliers = autoVerifyAppearanceMediumInliers,
+                appearanceMinMedium = autoVerifyAppearanceMinMedium,
+                appearanceMinBase = autoVerifyAppearanceMinBase,
+                appearanceLiveBias = autoVerifyAppearanceLiveBias
+            ),
+            temporalGate = TemporalGateConfig(
+                highGoodMatches = temporalHighGoodMatches,
+                highInliers = temporalHighInliers,
+                minConfidenceHighGood = temporalMinConfidenceHighGood,
+                mediumGoodMatches = temporalMediumGoodMatches,
+                minConfidenceMedium = temporalMinConfidenceMedium,
+                minConfidenceSmallRefined = temporalMinConfidenceSmallRefined,
+                minConfidenceBase = temporalMinConfidenceBase,
+                liveConfidenceRelax = temporalLiveConfidenceRelax,
+                liveConfidenceFloor = temporalLiveConfidenceFloor
+            ),
+            trackGuard = TrackGuardConfig(
+                maxCenterJumpFactor = trackGuardMaxCenterJumpFactor,
+                minAreaRatio = trackGuardMinAreaRatio,
+                maxAreaRatio = trackGuardMaxAreaRatio,
+                dropStreak = trackGuardDropStreak,
+                appearanceCheckIntervalFrames = trackGuardAppearanceCheckInterval,
+                minAppearanceScore = trackGuardMinAppearanceScore
             )
         )
     }
@@ -967,12 +1464,91 @@ class OpenCVTrackerAnalyzer(
         }
     }
 
-    private fun correctKalman(box: Rect) {
-        if (!kalmanConfig.enabled) return
+    private fun resolveKalmanMeasurementNoise(confidence: Double, occluded: Boolean): Double {
+        val cfg = kalmanConfig
+        var scale = 1.0
+        if (cfg.dynamicMeasurementNoise) {
+            val c = confidence.coerceIn(0.0, 1.0)
+            val high = cfg.highConfidenceThreshold.coerceAtLeast(cfg.lowConfidenceThreshold + 1e-6)
+            val low = cfg.lowConfidenceThreshold.coerceIn(0.0, high)
+            scale = when {
+                c >= high -> cfg.highConfidenceNoiseScale
+                c <= low -> cfg.lowConfidenceNoiseScale
+                else -> {
+                    val t = (c - low) / (high - low)
+                    cfg.lowConfidenceNoiseScale + (cfg.highConfidenceNoiseScale - cfg.lowConfidenceNoiseScale) * t
+                }
+            }
+        }
+        if (occluded) {
+            scale *= cfg.occlusionNoiseScale
+        }
+        return (cfg.measurementNoise * scale).coerceAtLeast(1e-6)
+    }
+
+    private fun correctKalman(box: Rect, confidence: Double = 1.0, occluded: Boolean = false): Rect {
+        if (!kalmanConfig.enabled) return box
         val now = SystemClock.elapsedRealtime()
-        val corrected = kalmanPredictor.correct(box, now, kalmanConfig)
+        val measurementNoise = resolveKalmanMeasurementNoise(confidence, occluded)
+        val corrected = kalmanPredictor.correct(box, now, kalmanConfig, measurementNoise)
         lastKalmanMeasureMs = now
         latestKalmanPrediction = corrected
+        return corrected
+    }
+
+    private fun commitTrackingObservation(measured: Rect, confidence: Double, markNativeAccept: Boolean): Rect {
+        val fused = correctKalman(measured, confidence = confidence)
+        lastMeasuredTrackBox = measured
+        lastTrackedBox = fused
+        if (markNativeAccept) {
+            lastNativeAcceptMs = SystemClock.elapsedRealtime()
+        }
+        dispatchTrackedRect(fused)
+        updateLatestPrediction(fused, confidence.coerceIn(0.0, 1.0), tracking = true)
+        return fused
+    }
+
+    private fun feedNativePriorBox(prior: Rect, reason: String) {
+        if (!kalmanConfig.enabled || !kalmanConfig.feedNativePrior) return
+        if (!isTracking || activeTrackBackend == TrackBackend.KCF) return
+        if (prior.width < MIN_BOX_DIM || prior.height < MIN_BOX_DIM) return
+        if (kalmanConfig.priorOnlyOnUncertain && reason.startsWith("pre_track_")) {
+            val now = SystemClock.elapsedRealtime()
+            val sinceAccept = if (lastNativeAcceptMs > 0L) now - lastNativeAcceptMs else Long.MAX_VALUE
+            val uncertain =
+                consecutiveTrackerFailures > 0 ||
+                    nativeLowConfidenceStreak > 0 ||
+                    lockHoldFramesRemaining in 0 until lockHoldFrames ||
+                    sinceAccept > kalmanConfig.priorStaleMs
+            if (!uncertain) return
+            val measured = lastMeasuredTrackBox
+            if (measured != null && sinceAccept <= kalmanConfig.priorStaleMs) {
+                val iou = rectIou(prior, measured)
+                if (iou < kalmanConfig.priorMinIou) {
+                    if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                        logDiag(
+                            "KALMAN",
+                            "session=$diagSessionId action=prior_skip reason=$reason why=iou_gate iou=${fmt(iou)} min=${fmt(kalmanConfig.priorMinIou)}"
+                        )
+                    }
+                    return
+                }
+            }
+        }
+        val nativeRect = android.graphics.Rect(prior.x, prior.y, prior.x + prior.width, prior.y + prior.height)
+        val ok = NativeTrackerBridge.setPriorBbox(nativeRect)
+        if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+            logDiag(
+                "KALMAN",
+                "session=$diagSessionId action=prior_feed reason=$reason ok=$ok box=${prior.x},${prior.y},${prior.width}x${prior.height}"
+            )
+        }
+    }
+
+    private fun feedKalmanPriorToNative(reason: String) {
+        if (!kalmanConfig.preTrackPriorFeed) return
+        val prior = latestKalmanPrediction ?: lastMeasuredTrackBox ?: lastTrackedBox ?: return
+        feedNativePriorBox(prior, reason)
     }
 
     private fun parseBoolean(value: String): Boolean? {
@@ -1044,9 +1620,20 @@ class OpenCVTrackerAnalyzer(
                 "firstLockSmallRelaxIou=${fmt(cfg.firstLock.smallRelaxedIouFloor)} " +
                 "firstLockTemporalHold=${cfg.firstLock.holdOnTemporalReject} " +
                 "firstLockOutlierHoldMax=${cfg.firstLock.outlierHoldMax} " +
+                "flMissRelaxHigh=${cfg.firstLockAdaptive.missRelaxHighStreak}/${fmt(cfg.firstLockAdaptive.missRelaxHighFactor)} " +
+                "flMissRelaxMid=${cfg.firstLockAdaptive.missRelaxMidStreak}/${fmt(cfg.firstLockAdaptive.missRelaxMidFactor)} " +
+                "flMissRelaxLow=${cfg.firstLockAdaptive.missRelaxLowStreak}/${fmt(cfg.firstLockAdaptive.missRelaxLowFactor)} " +
+                "flIouFloor=${fmt(cfg.firstLockAdaptive.iouFloorStrong)}/${fmt(cfg.firstLockAdaptive.iouFloorMedium)}/${fmt(cfg.firstLockAdaptive.iouFloorBase)} " +
+                "flConfFloor=${fmt(cfg.firstLockAdaptive.confStrongMin)}/${fmt(cfg.firstLockAdaptive.confMediumMin)}/${fmt(cfg.firstLockAdaptive.confSmallMin)}/${fmt(cfg.firstLockAdaptive.confBaseMin)} " +
                 "fallbackRefineExpand=${fmt(cfg.fallbackRefine.expandFactor)} fallbackRefineGood=${cfg.fallbackRefine.minGoodMatches} " +
                 "fallbackRefineInliers=${cfg.fallbackRefine.minInliers} fallbackRefineConf=${fmt(cfg.fallbackRefine.minConfidence)} " +
                 "fallbackRefineRatio=${fmt(cfg.fallbackRefine.loweRatio)} " +
+                "autoVerifyStrong=${cfg.autoInitVerify.strongCandidateMinGood}/${cfg.autoInitVerify.strongCandidateMinInliers}/${fmt(cfg.autoInitVerify.strongCandidateMinConfidence)} " +
+                "autoVerifyLocal=${fmt(cfg.autoInitVerify.localCenterFactorLive)}/${fmt(cfg.autoInitVerify.localCenterFactorReplay)}@${fmt(cfg.autoInitVerify.localMinIouLive)}/${fmt(cfg.autoInitVerify.localMinIouReplay)} " +
+                "autoVerifyAppear=${fmt(cfg.autoInitVerify.appearanceMinStrong)}/${fmt(cfg.autoInitVerify.appearanceMinMedium)}/${fmt(cfg.autoInitVerify.appearanceMinBase)}+${fmt(cfg.autoInitVerify.appearanceLiveBias)} " +
+                "temporalGate=${cfg.temporalGate.highGoodMatches}/${cfg.temporalGate.highInliers}/${fmt(cfg.temporalGate.minConfidenceHighGood)} " +
+                "temporalMedium=${cfg.temporalGate.mediumGoodMatches}/${fmt(cfg.temporalGate.minConfidenceMedium)} " +
+                "temporalLow=${fmt(cfg.temporalGate.minConfidenceSmallRefined)}/${fmt(cfg.temporalGate.minConfidenceBase)} liveRelax=${fmt(cfg.temporalGate.liveConfidenceRelax)} floor=${fmt(cfg.temporalGate.liveConfidenceFloor)} " +
                 "smallArea=${fmt(cfg.smallTarget.areaRatio)} smallGood=${cfg.smallTarget.minGoodMatches} " +
                 "smallInliers=${cfg.smallTarget.minInliers} smallScale=${fmt(cfg.smallTarget.scaleThreshold)} " +
                 "weakFallbackMaxMatches=${cfg.weakFallback.maxMatches} weakFallbackMaxSpan=${fmt(cfg.weakFallback.maxSpanPx)} " +
@@ -1061,11 +1648,17 @@ class OpenCVTrackerAnalyzer(
                 "softRelaxGood=${cfg.softRelax.minGoodMatches} softRelaxScale=${fmt(cfg.softRelax.scaleThreshold)} " +
                 "softRelaxRatio=${fmt(cfg.softRelax.maxRatio)} " +
                 "firstLockGapMs=${cfg.firstLock.gapMs} verifyInt=${cfg.trackVerify.intervalFrames} verifyGlobal=${cfg.trackVerify.globalIntervalFrames} " +
+                "verifyGlobalFallback=${cfg.trackVerify.enableGlobalFallback} " +
                 "verifyExpand=${fmt(cfg.trackVerify.localExpandFactor)} verifyGood=${cfg.trackVerify.minGoodMatches} " +
                 "verifyInliers=${cfg.trackVerify.minInliers} verifyTol=${cfg.trackVerify.failTolerance} verifyHardTol=${cfg.trackVerify.hardDriftTolerance} " +
                 "verifyNativeBypassConf=${fmt(cfg.trackVerify.nativeBypassConfidence)} " +
                 "verifyRecenter=${fmt(cfg.trackVerify.recenterPx)} " +
                 "verifyIou=${fmt(cfg.trackVerify.minIou)} verifyConfMargin=${fmt(cfg.trackVerify.switchConfidenceMargin)} " +
+                "trackGuardJump=${fmt(cfg.trackGuard.maxCenterJumpFactor)} " +
+                "trackGuardArea=${fmt(cfg.trackGuard.minAreaRatio)}/${fmt(cfg.trackGuard.maxAreaRatio)} " +
+                "trackGuardDrop=${cfg.trackGuard.dropStreak} " +
+                "trackGuardAppearInt=${cfg.trackGuard.appearanceCheckIntervalFrames} " +
+                "trackGuardAppearMin=${fmt(cfg.trackGuard.minAppearanceScore)} " +
                 "trackBackend=${preferredTrackBackend.name.lowercase(Locale.US)} " +
                 "kcfFail=$kcfMaxFailStreak nativeFail=${cfg.nativeGate.maxFailStreak} nativeMinConf=${fmt(cfg.nativeGate.minConfidence)} " +
                 "nativeFuseSoft=${fmt(cfg.nativeGate.fuseSoftConfidence)} nativeFuseHard=${fmt(cfg.nativeGate.fuseHardConfidence)} " +
@@ -1078,7 +1671,15 @@ class OpenCVTrackerAnalyzer(
                 "trackerGc=$forceTrackerGcOnDrop " +
                 "kalmanEnable=${kalmanConfig.enabled} kalmanQ=${fmt(kalmanConfig.processNoise)} " +
                 "kalmanR=${fmt(kalmanConfig.measurementNoise)} kalmanMaxMs=${kalmanConfig.maxPredictMs} " +
-                "kalmanPredHold=${kalmanConfig.usePredictedHold}"
+                "kalmanPredHold=${kalmanConfig.usePredictedHold} " +
+                "kalmanDynR=${kalmanConfig.dynamicMeasurementNoise} " +
+                "kalmanConf=${fmt(kalmanConfig.lowConfidenceThreshold)}/${fmt(kalmanConfig.highConfidenceThreshold)} " +
+                "kalmanRScale=${fmt(kalmanConfig.highConfidenceNoiseScale)}/${fmt(kalmanConfig.lowConfidenceNoiseScale)}/${fmt(kalmanConfig.occlusionNoiseScale)} " +
+                "kalmanFeedNativePrior=${kalmanConfig.feedNativePrior} " +
+                "kalmanPreTrackPriorFeed=${kalmanConfig.preTrackPriorFeed} " +
+                "kalmanPriorUncertainOnly=${kalmanConfig.priorOnlyOnUncertain} " +
+                "kalmanPriorMinIou=${fmt(kalmanConfig.priorMinIou)} " +
+                "kalmanPriorStaleMs=${kalmanConfig.priorStaleMs}"
         )
     }
 
@@ -1312,6 +1913,7 @@ class OpenCVTrackerAnalyzer(
         releaseTracker("reset", requestGc = true)
         pendingInitBox = null
         lastTrackedBox = null
+        lastMeasuredTrackBox = null
         trackingStage = TrackingStage.ACQUIRE
         trackMismatchStreak = 0
         trackAppearanceLowStreak = 0
@@ -1324,6 +1926,7 @@ class OpenCVTrackerAnalyzer(
         nativeFuseWarmupRemaining = 0
         lockHoldFramesRemaining = 0
         fastFirstLockRemaining = fastFirstLockFrames
+        lastNativeAcceptMs = 0L
         overlayResetToken++
         clearFirstLockCandidate("reset")
         latestSearchFrame?.release()
@@ -1348,6 +1951,7 @@ class OpenCVTrackerAnalyzer(
         activeTrackBackend = TrackBackend.KCF
         nativeLowConfidenceStreak = 0
         nativeFuseWarmupRemaining = 0
+        lastNativeAcceptMs = 0L
         if (!hadTracker && !hadNativeTracking) return
 
         Log.d(TAG, "EVAL_EVENT type=TRACKER_RELEASE reason=$reason")
@@ -1405,6 +2009,25 @@ class OpenCVTrackerAnalyzer(
             tracking = latestPredictionTracking
         )
     }
+
+    @Synchronized
+    fun evalMetricsSnapshot(): EvalMetricsSnapshot {
+        val frames = metricsFrames
+        val trackRatio = if (frames > 0) metricsTrackingFrames.toDouble() / frames else 0.0
+        val avgFrameMs = if (frames > 0) metricsTotalProcessMs.toDouble() / frames else 0.0
+        val firstLockSec = if (metricsFirstLockMs >= 0L) metricsFirstLockMs.toDouble() / 1000.0 else -1.0
+        val kalmanPredHoldRatio = if (frames > 0) metricsKalmanPredHoldCount.toDouble() / frames else 0.0
+        return EvalMetricsSnapshot(
+            frames = frames,
+            locks = metricsLockCount,
+            lost = metricsLostCount,
+            trackRatio = trackRatio,
+            avgFrameMs = avgFrameMs,
+            firstLockSec = firstLockSec,
+            kalmanPredHold = metricsKalmanPredHoldCount,
+            kalmanPredHoldRatio = kalmanPredHoldRatio
+        )
+    }
     override fun analyze(image: ImageProxy) {
         val startMs = SystemClock.elapsedRealtime()
         var frame: Mat? = null
@@ -1414,6 +2037,7 @@ class OpenCVTrackerAnalyzer(
             updateScaleFactors(logicalSize.first, logicalSize.second)
             if (isTracking && activeTrackBackend != TrackBackend.KCF && pendingInitBox == null) {
                 frameCounter++
+                updateKalmanPrediction(SystemClock.elapsedRealtime())
                 trackFrameNativeImage(image, logicalSize.first, logicalSize.second)
             } else {
                 frame = imageToMat(image)
@@ -1668,8 +2292,10 @@ class OpenCVTrackerAnalyzer(
             Log.w(TAG, "KCF update failed: streak=$consecutiveTrackerFailures")
             if (consecutiveTrackerFailures < kcfMaxFailStreak) {
                 lastTrackedBox?.let {
-                    dispatchTrackedRect(it)
-                    updateLatestPrediction(it, 0.55, tracking = true)
+                    val held = correctKalman(it, confidence = 0.55, occluded = true)
+                    lastTrackedBox = held
+                    dispatchTrackedRect(held)
+                    updateLatestPrediction(held, 0.55, tracking = true)
                 }
                 return
             }
@@ -1682,8 +2308,10 @@ class OpenCVTrackerAnalyzer(
             consecutiveTrackerFailures++
             if (consecutiveTrackerFailures < kcfMaxFailStreak) {
                 lastTrackedBox?.let {
-                    dispatchTrackedRect(it)
-                    updateLatestPrediction(it, 0.55, tracking = true)
+                    val held = correctKalman(it, confidence = 0.55, occluded = true)
+                    lastTrackedBox = held
+                    dispatchTrackedRect(held)
+                    updateLatestPrediction(held, 0.55, tracking = true)
                 }
                 return
             }
@@ -1711,9 +2339,7 @@ class OpenCVTrackerAnalyzer(
             }
         }
 
-        lastTrackedBox = safe
-        dispatchTrackedRect(safe)
-        updateLatestPrediction(safe, 1.0, tracking = true)
+        commitTrackingObservation(safe, confidence = 1.0, markNativeAccept = false)
     }
 
     private fun trackFrameNative(frame: Mat) {
@@ -1802,13 +2428,12 @@ class OpenCVTrackerAnalyzer(
             }
         }
 
-        lastTrackedBox = safe
-        dispatchTrackedRect(safe)
-        updateLatestPrediction(safe, result.confidence.toDouble(), tracking = true)
+        commitTrackingObservation(safe, confidence = result.confidence.toDouble(), markNativeAccept = true)
     }
 
     private fun trackFrameNativeImage(image: ImageProxy, frameW: Int, frameH: Int) {
         val nativeCfg = heuristicConfig.nativeGate
+        feedKalmanPriorToNative("pre_track_image")
         val result = NativeTrackerBridge.track(image)
         if (result == null) {
             consecutiveTrackerFailures++
@@ -1903,30 +2528,29 @@ class OpenCVTrackerAnalyzer(
         }
 
         consecutiveTrackerFailures = 0
-        lastTrackedBox = safe
-        dispatchTrackedRect(safe)
-        updateLatestPrediction(safe, result.confidence.toDouble(), tracking = true)
+        commitTrackingObservation(safe, confidence = result.confidence.toDouble(), markNativeAccept = true)
     }
 
 
-    private fun evaluateTrackBoxConsistency(current: Rect, previous: Rect?): Boolean {
+    private fun evaluateTrackBoxConsistency(current: Rect, previous: Rect?, cfg: TrackGuardConfig): Boolean {
         val prev = previous ?: return true
         val currCenter = rectCenter(current)
         val prevCenter = rectCenter(prev)
         val jump = pointDistance(currCenter, prevCenter)
         val ref = max(min(prev.width, prev.height), min(current.width, current.height)).toDouble().coerceAtLeast(1.0)
-        val maxJump = ref * TRACK_MAX_CENTER_JUMP_FACTOR
+        val maxJump = ref * cfg.maxCenterJumpFactor
 
         val prevArea = (prev.width.toDouble() * prev.height.toDouble()).coerceAtLeast(1.0)
         val currArea = (current.width.toDouble() * current.height.toDouble()).coerceAtLeast(1.0)
         val areaRatio = currArea / prevArea
-        val areaOk = areaRatio in TRACK_MIN_AREA_RATIO..TRACK_MAX_AREA_RATIO
+        val areaOk = areaRatio in cfg.minAreaRatio..cfg.maxAreaRatio
         return jump <= maxJump && areaOk
     }
 
     private fun shouldDropOnTrackGuard(frame: Mat?, current: Rect, confidence: Double): Boolean {
-        val prev = lastTrackedBox
-        val geomOk = evaluateTrackBoxConsistency(current, prev)
+        val guardCfg = heuristicConfig.trackGuard
+        val prev = lastMeasuredTrackBox
+        val geomOk = evaluateTrackBoxConsistency(current, prev, guardCfg)
         if (!geomOk) {
             trackMismatchStreak = (trackMismatchStreak + 1).coerceAtMost(1000)
             if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
@@ -1940,14 +2564,14 @@ class OpenCVTrackerAnalyzer(
             trackMismatchStreak = 0
         }
 
-        if (frame != null && frameCounter % TRACK_APPEARANCE_CHECK_INTERVAL == 0L) {
+        if (frame != null && frameCounter % guardCfg.appearanceCheckIntervalFrames == 0L) {
             val score = computePatchTemplateCorrelation(frame, current)
-            if (score < TRACK_MIN_APPEARANCE_SCORE) {
+            if (score < guardCfg.minAppearanceScore) {
                 trackAppearanceLowStreak = (trackAppearanceLowStreak + 1).coerceAtMost(1000)
                 if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
                     logDiag(
                         "TRACK",
-                        "session=$diagSessionId stage=track_guard reason=appearance_fail streak=$trackAppearanceLowStreak conf=${fmt(confidence)} score=${fmt(score)} min=${fmt(TRACK_MIN_APPEARANCE_SCORE)}"
+                        "session=$diagSessionId stage=track_guard reason=appearance_fail streak=$trackAppearanceLowStreak conf=${fmt(confidence)} score=${fmt(score)} min=${fmt(guardCfg.minAppearanceScore)}"
                     )
                 }
             } else {
@@ -1955,7 +2579,7 @@ class OpenCVTrackerAnalyzer(
             }
         }
 
-        return trackMismatchStreak >= TRACK_DROP_STREAK || trackAppearanceLowStreak >= TRACK_DROP_STREAK
+        return trackMismatchStreak >= guardCfg.dropStreak || trackAppearanceLowStreak >= guardCfg.dropStreak
     }
 
     private fun evaluateNativeConfidence(confidence: Double): NativeConfidenceAction {
@@ -2010,9 +2634,8 @@ class OpenCVTrackerAnalyzer(
 
     private fun holdCurrentBoxOnTransientLoss(reason: String, confidence: Double): Boolean {
         if (!isTracking) return false
-        if (activeTrackBackend != TrackBackend.KCF) return false
         if (lockHoldFramesRemaining <= 0) return false
-        val box = lastTrackedBox ?: return false
+        val box = lastMeasuredTrackBox ?: lastTrackedBox ?: return false
         val eligible =
             reason.startsWith("verify_") ||
                 reason.startsWith("native_conf_") ||
@@ -2025,14 +2648,17 @@ class OpenCVTrackerAnalyzer(
         consecutiveTrackerFailures = 0
         trackVerifyFailStreak = 0
         trackVerifyHardDriftStreak = 0
-        dispatchTrackedRect(box)
-        updateLatestPrediction(box, confidence.coerceIn(0.20, 0.99), tracking = true)
+        val held = correctKalman(box, confidence.coerceIn(0.0, 1.0), occluded = true)
+        lastTrackedBox = held
+        dispatchTrackedRect(held)
+        updateLatestPrediction(held, confidence.coerceIn(0.20, 0.99), tracking = true)
+        feedNativePriorBox(held, "transient_hold")
         metricsSearchLastReason = "loss_grace_hold"
         if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
             Log.w(
                 TAG,
                 "EVAL_EVENT type=LOSS_GRACE reason=$reason remaining=$lockHoldFramesRemaining " +
-                    "box=${box.x},${box.y},${box.width}x${box.height}"
+                    "box=${held.x},${held.y},${held.width}x${held.height}"
             )
         }
         return true
@@ -2048,7 +2674,9 @@ class OpenCVTrackerAnalyzer(
         nativeLowConfidenceStreak = 0
         nativeFuseWarmupRemaining = 0
         lockHoldFramesRemaining = 0
+        lastNativeAcceptMs = 0L
         lastTrackedBox = null
+        lastMeasuredTrackBox = null
         trackingStage = TrackingStage.ACQUIRE
         trackMismatchStreak = 0
         trackAppearanceLowStreak = 0
@@ -2100,12 +2728,9 @@ class OpenCVTrackerAnalyzer(
                 nativeLowConfidenceStreak = 0
                 nativeFuseWarmupRemaining = heuristicConfig.nativeGate.fuseWarmupFrames
                 lockHoldFramesRemaining = lockHoldFrames
-        fastFirstLockRemaining = 0
+                fastFirstLockRemaining = 0
                 overlayResetToken++
-                lastTrackedBox = safe
-                correctKalman(safe)
-                dispatchTrackedRect(safe)
-                updateLatestPrediction(safe, 1.0, tracking = true)
+                commitTrackingObservation(safe, confidence = 1.0, markNativeAccept = true)
                 if (!wasTracking) {
                     metricsLockCount++
                     if (metricsFirstLockMs < 0L) {
@@ -2151,12 +2776,10 @@ class OpenCVTrackerAnalyzer(
         nativeLowConfidenceStreak = 0
         nativeFuseWarmupRemaining = 0
         lockHoldFramesRemaining = lockHoldFrames
+        lastNativeAcceptMs = 0L
         fastFirstLockRemaining = 0
         overlayResetToken++
-        lastTrackedBox = safe
-        correctKalman(safe)
-        dispatchTrackedRect(safe)
-        updateLatestPrediction(safe, 1.0, tracking = true)
+        commitTrackingObservation(safe, confidence = 1.0, markNativeAccept = false)
 
         if (!wasTracking) {
             metricsLockCount++
@@ -2207,6 +2830,7 @@ class OpenCVTrackerAnalyzer(
     }
 
     private fun nativeTrackOnFrame(frame: Mat): NativeTrackerBridge.NativeTrackResult? {
+        feedKalmanPriorToNative("pre_track_gray")
         val rgb = frameToRgbBytes(frame)
         return NativeTrackerBridge.trackGray(rgb, frame.cols(), frame.rows())
     }
@@ -2327,7 +2951,11 @@ class OpenCVTrackerAnalyzer(
             }
         }
 
-        if (verifyCfg.globalIntervalFrames > 0 && frameCounter % verifyCfg.globalIntervalFrames.toLong() == 0L) {
+        if (
+            verifyCfg.enableGlobalFallback &&
+            verifyCfg.globalIntervalFrames > 0 &&
+            frameCounter % verifyCfg.globalIntervalFrames.toLong() == 0L
+        ) {
             val globalCandidate = findOrbMatch(frame)
             val globalHealthy =
                 globalCandidate != null &&
@@ -2491,6 +3119,7 @@ class OpenCVTrackerAnalyzer(
 
     private fun accumulateFirstLockCandidate(candidate: OrbMatchCandidate, frameW: Int, frameH: Int): OrbMatchCandidate? {
         val firstLockCfg = heuristicConfig.firstLock
+        val adaptiveCfg = heuristicConfig.firstLockAdaptive
         if (!isCandidateEligibleForTemporal(candidate)) return null
         val now = SystemClock.elapsedRealtime()
         val candidateCenter = Point(
@@ -2522,16 +3151,19 @@ class OpenCVTrackerAnalyzer(
         }
         val adaptiveIouBase = computeAdaptiveFirstLockIou(candidate.box, frameW, frameH)
         val adaptiveIouRelax = when {
-            searchMissStreak >= 30 -> 0.72
-            searchMissStreak >= 15 -> 0.80
-            searchMissStreak >= 8 -> 0.90
-            firstLockCandidateFrames >= 2 && metricsSearchResetIouCount >= 3 -> 0.92
+            searchMissStreak >= adaptiveCfg.missRelaxHighStreak -> adaptiveCfg.missRelaxHighFactor
+            searchMissStreak >= adaptiveCfg.missRelaxMidStreak -> adaptiveCfg.missRelaxMidFactor
+            searchMissStreak >= adaptiveCfg.missRelaxLowStreak -> adaptiveCfg.missRelaxLowFactor
+            firstLockCandidateFrames >= adaptiveCfg.resetRelaxMinFrames &&
+                metricsSearchResetIouCount >= adaptiveCfg.resetRelaxMinIouResets -> adaptiveCfg.resetRelaxFactor
             else -> 1.0
         }
         val iouFloor = when {
-            candidate.goodMatches >= 24 && candidate.inlierCount >= 10 -> 0.50
-            candidate.goodMatches >= 20 && candidate.inlierCount >= 8 -> 0.53
-            else -> FIRST_LOCK_MIN_IOU_FLOOR
+            candidate.goodMatches >= adaptiveCfg.iouFloorStrongGood &&
+                candidate.inlierCount >= adaptiveCfg.iouFloorStrongInliers -> adaptiveCfg.iouFloorStrong
+            candidate.goodMatches >= adaptiveCfg.iouFloorMediumGood &&
+                candidate.inlierCount >= adaptiveCfg.iouFloorMediumInliers -> adaptiveCfg.iouFloorMedium
+            else -> adaptiveCfg.iouFloorBase
         }
         val adaptiveIou = (adaptiveIouBase * adaptiveIouRelax).coerceAtLeast(iouFloor)
         val centerDrift = pointDistance(firstLockCandidateCenter, candidateCenter)
@@ -2548,18 +3180,22 @@ class OpenCVTrackerAnalyzer(
                 centerDrift <= effectiveStablePx &&
                 iouWithPrevious >= firstLockCfg.smallRelaxedIouFloor
         val centerRelaxFactor = when {
-            useCenterRule && candidate.goodMatches >= 20 && candidate.inlierCount >= 8 -> 1.25
-            useCenterRule && searchMissStreak >= 10 -> 1.15
+            useCenterRule && candidate.goodMatches >= adaptiveCfg.centerRelaxGood &&
+                candidate.inlierCount >= adaptiveCfg.centerRelaxInliers -> adaptiveCfg.centerRelaxStrongFactor
+            useCenterRule && searchMissStreak >= adaptiveCfg.centerRelaxMissStreak -> adaptiveCfg.centerRelaxMissFactor
             else -> 1.0
         }
-        val effectiveCenterThreshold = (dynamicCenterDriftPx * centerRelaxFactor).coerceAtMost(effectiveStablePx * 1.2)
+        val effectiveCenterThreshold = (dynamicCenterDriftPx * centerRelaxFactor)
+            .coerceAtMost(effectiveStablePx * adaptiveCfg.centerRelaxCapFactor)
         val centerRulePass = !useCenterRule || centerDrift <= effectiveCenterThreshold || relaxedSmallIouPass
         val iouPass = useCenterRule || iouWithPrevious >= adaptiveIou
         val confThreshold = when {
-            candidate.goodMatches >= 24 && candidate.inlierCount >= 8 -> 0.24
-            candidate.goodMatches >= 16 && candidate.inlierCount >= 6 -> 0.28
-            useCenterRule -> 0.30
-            else -> 0.32
+            candidate.goodMatches >= adaptiveCfg.confStrongGood &&
+                candidate.inlierCount >= adaptiveCfg.confStrongInliers -> adaptiveCfg.confStrongMin
+            candidate.goodMatches >= adaptiveCfg.confMediumGood &&
+                candidate.inlierCount >= adaptiveCfg.confMediumInliers -> adaptiveCfg.confMediumMin
+            useCenterRule -> adaptiveCfg.confSmallMin
+            else -> adaptiveCfg.confBaseMin
         }
         val confPass = candidate.confidence >= confThreshold
 
@@ -3430,15 +4066,20 @@ class OpenCVTrackerAnalyzer(
 
     private fun passesAutoInitVerification(frame: Mat, candidate: OrbMatchCandidate): Boolean {
         val fallbackRefineCfg = heuristicConfig.fallbackRefine
+        val verifyCfg = heuristicConfig.autoInitVerify
         val gatePrefix = "session=$diagSessionId stage=auto_verify good=${candidate.goodMatches} inliers=${candidate.inlierCount} conf=${fmt(candidate.confidence)}"
         val appearanceScore = computePatchTemplateCorrelation(frame, candidate.box)
         val strongCandidate =
-            candidate.goodMatches >= 18 &&
-                candidate.inlierCount >= 7 &&
-                candidate.confidence >= 0.42
-        val strongAppearance = if (!isReplayInput) appearanceScore >= 0.16 else appearanceScore >= 0.10
+            candidate.goodMatches >= verifyCfg.strongCandidateMinGood &&
+                candidate.inlierCount >= verifyCfg.strongCandidateMinInliers &&
+                candidate.confidence >= verifyCfg.strongCandidateMinConfidence
+        val strongAppearance = if (!isReplayInput) {
+            appearanceScore >= verifyCfg.strongAppearanceMinLive
+        } else {
+            appearanceScore >= verifyCfg.strongAppearanceMinReplay
+        }
 
-        val roi = expandRectWithFactor(candidate.box, 1.6, frame.cols(), frame.rows())
+        val roi = expandRectWithFactor(candidate.box, verifyCfg.localRoiExpandFactor, frame.cols(), frame.rows())
         val local = roi?.let { findOrbMatchInRoi(frame, it, loweRatioOverride = fallbackRefineCfg.loweRatio) }
         if (local == null) {
             val fallbackPass = !isReplayInput && strongCandidate && strongAppearance
@@ -3451,9 +4092,13 @@ class OpenCVTrackerAnalyzer(
             val iou = rectIou(candidate.box, local.box)
             val centerDist = pointDistance(rectCenter(candidate.box), rectCenter(local.box))
             val side = min(candidate.box.width, candidate.box.height).toDouble().coerceAtLeast(1.0)
-            val centerFactor = if (!isReplayInput) 0.75 else 0.65
-            val minIou = if (!isReplayInput) 0.40 else 0.45
-            val minLocalConf = if (!isReplayInput) max(candidate.confidence * 0.72, 0.24) else max(candidate.confidence * 0.80, 0.30)
+            val centerFactor = if (!isReplayInput) verifyCfg.localCenterFactorLive else verifyCfg.localCenterFactorReplay
+            val minIou = if (!isReplayInput) verifyCfg.localMinIouLive else verifyCfg.localMinIouReplay
+            val minLocalConf = if (!isReplayInput) {
+                max(candidate.confidence * verifyCfg.localMinConfScaleLive, verifyCfg.localMinConfFloorLive)
+            } else {
+                max(candidate.confidence * verifyCfg.localMinConfScaleReplay, verifyCfg.localMinConfFloorReplay)
+            }
             val centerOk = centerDist <= side * centerFactor
             val iouOk = iou >= minIou
             val confOk = local.confidence >= minLocalConf
@@ -3475,12 +4120,14 @@ class OpenCVTrackerAnalyzer(
         }
 
         var minAppearanceScore = when {
-            candidate.goodMatches >= 24 && candidate.inlierCount >= 10 -> -0.06
-            candidate.goodMatches >= 20 && candidate.inlierCount >= 8 -> -0.02
-            else -> 0.02
+            candidate.goodMatches >= verifyCfg.appearanceMinStrongGood &&
+                candidate.inlierCount >= verifyCfg.appearanceMinStrongInliers -> verifyCfg.appearanceMinStrong
+            candidate.goodMatches >= verifyCfg.appearanceMinMediumGood &&
+                candidate.inlierCount >= verifyCfg.appearanceMinMediumInliers -> verifyCfg.appearanceMinMedium
+            else -> verifyCfg.appearanceMinBase
         }
         if (!isReplayInput) {
-            minAppearanceScore += 0.06
+            minAppearanceScore += verifyCfg.appearanceLiveBias
         }
         val appearanceOk = appearanceScore >= minAppearanceScore
         if (!appearanceOk && frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
@@ -3511,6 +4158,7 @@ class OpenCVTrackerAnalyzer(
 
     private fun isCandidateEligibleForTemporal(candidate: OrbMatchCandidate): Boolean {
         val cfg = heuristicConfig
+        val temporalCfg = cfg.temporalGate
         var temporalMinGoodMatches = computeTemporalMinGoodMatches(candidate)
         if (!isReplayInput) {
             temporalMinGoodMatches = (temporalMinGoodMatches - 1).coerceAtLeast(max(cfg.orb.softMinGoodMatches, 3))
@@ -3535,15 +4183,16 @@ class OpenCVTrackerAnalyzer(
                     candidate.box.width.toDouble() * candidate.box.height.toDouble() <= FIRST_LOCK_SMALL_BOX_AREA_PX
             val isRefinedFallback = candidate.fallbackReason?.startsWith("refined_") == true
             var minTemporalConfidence = when {
-                candidate.goodMatches >= TEMPORAL_HIGH_GOOD_MATCHES &&
-                    candidate.inlierCount >= TEMPORAL_HIGH_INLIERS -> TEMPORAL_MIN_CONFIDENCE_HIGH_GOOD
-                candidate.goodMatches >= TEMPORAL_MEDIUM_GOOD_MATCHES &&
-                    candidate.inlierCount >= cfg.orb.softMinInliers -> TEMPORAL_MIN_CONFIDENCE_MEDIUM
-                isSmallCandidate && isRefinedFallback -> min(0.28, cfg.fallbackRefine.minConfidence)
-                else -> min(0.35, cfg.fallbackRefine.minConfidence)
+                candidate.goodMatches >= temporalCfg.highGoodMatches &&
+                    candidate.inlierCount >= temporalCfg.highInliers -> temporalCfg.minConfidenceHighGood
+                candidate.goodMatches >= temporalCfg.mediumGoodMatches &&
+                    candidate.inlierCount >= cfg.orb.softMinInliers -> temporalCfg.minConfidenceMedium
+                isSmallCandidate && isRefinedFallback -> min(temporalCfg.minConfidenceSmallRefined, cfg.fallbackRefine.minConfidence)
+                else -> min(temporalCfg.minConfidenceBase, cfg.fallbackRefine.minConfidence)
             }
             if (!isReplayInput) {
-                minTemporalConfidence = (minTemporalConfidence - 0.03).coerceAtLeast(0.10)
+                minTemporalConfidence = (minTemporalConfidence - temporalCfg.liveConfidenceRelax)
+                    .coerceAtLeast(temporalCfg.liveConfidenceFloor)
             }
             if (candidate.confidence < minTemporalConfidence) return false
         }
@@ -4195,9 +4844,6 @@ class OpenCVTrackerAnalyzer(
         if (!isTracking && frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
             logDiag("OVERLAY", "session=$diagSessionId action=draw_while_not_tracking box=${box.x},${box.y},${box.width}x${box.height}")
         }
-        if (isTracking && kalmanConfig.enabled) {
-            correctKalman(box)
-        }
         val rect = RectF(
             box.x * scaleX + offsetX,
             box.y * scaleY + offsetY,
@@ -4235,8 +4881,10 @@ class OpenCVTrackerAnalyzer(
             if (predicted != null && predicted.width >= MIN_BOX_DIM && predicted.height >= MIN_BOX_DIM) {
                 metricsKalmanPredHoldCount++
                 metricsSearchLastReason = "kalman_pred_hold"
+                lastTrackedBox = predicted
                 dispatchTrackedRect(predicted)
                 updateLatestPrediction(predicted, confidence.coerceIn(0.0, 1.0), tracking = true)
+                feedNativePriorBox(predicted, "hold_predict")
                 if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
                     logDiag(
                         "KALMAN",
@@ -4513,14 +5161,43 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_FIRST_LOCK_STABLE_FRAMES = 3
         private const val DEFAULT_FIRST_LOCK_STABLE_MS = 240L
         private const val DEFAULT_FIRST_LOCK_STABLE_PX = 54.0
-        private const val DEFAULT_FIRST_LOCK_MIN_IOU = 0.70
+        private const val DEFAULT_FIRST_LOCK_MIN_IOU = 0.40
         private const val DEFAULT_FIRST_LOCK_GAP_MS = 650L
         private const val DEFAULT_FIRST_LOCK_SMALL_CENTER_DRIFT_PX = 20.0
         private const val DEFAULT_FIRST_LOCK_SMALL_CENTER_DRIFT_RELAXED_PX = 34.0
         private const val DEFAULT_FIRST_LOCK_SMALL_STABLE_PX = 84.0
         private const val DEFAULT_FIRST_LOCK_SMALL_RELAX_MISS_STREAK = 8
         private const val DEFAULT_FIRST_LOCK_SMALL_DYNAMIC_CENTER_FACTOR = 1.2
-        private const val DEFAULT_FIRST_LOCK_SMALL_RELAXED_IOU_FLOOR = 0.06
+        private const val DEFAULT_FIRST_LOCK_SMALL_RELAXED_IOU_FLOOR = 0.00
+        private const val DEFAULT_FIRST_LOCK_MISS_RELAX_HIGH_STREAK = 30
+        private const val DEFAULT_FIRST_LOCK_MISS_RELAX_HIGH_FACTOR = 0.72
+        private const val DEFAULT_FIRST_LOCK_MISS_RELAX_MID_STREAK = 15
+        private const val DEFAULT_FIRST_LOCK_MISS_RELAX_MID_FACTOR = 0.80
+        private const val DEFAULT_FIRST_LOCK_MISS_RELAX_LOW_STREAK = 8
+        private const val DEFAULT_FIRST_LOCK_MISS_RELAX_LOW_FACTOR = 0.90
+        private const val DEFAULT_FIRST_LOCK_RESET_RELAX_MIN_FRAMES = 2
+        private const val DEFAULT_FIRST_LOCK_RESET_RELAX_MIN_IOU_RESETS = 3
+        private const val DEFAULT_FIRST_LOCK_RESET_RELAX_FACTOR = 0.92
+        private const val DEFAULT_FIRST_LOCK_IOU_FLOOR_STRONG_GOOD = 24
+        private const val DEFAULT_FIRST_LOCK_IOU_FLOOR_STRONG_INLIERS = 10
+        private const val DEFAULT_FIRST_LOCK_IOU_FLOOR_STRONG = 0.50
+        private const val DEFAULT_FIRST_LOCK_IOU_FLOOR_MEDIUM_GOOD = 20
+        private const val DEFAULT_FIRST_LOCK_IOU_FLOOR_MEDIUM_INLIERS = 8
+        private const val DEFAULT_FIRST_LOCK_IOU_FLOOR_MEDIUM = 0.53
+        private const val DEFAULT_FIRST_LOCK_CENTER_RELAX_STRONG_GOOD = 20
+        private const val DEFAULT_FIRST_LOCK_CENTER_RELAX_STRONG_INLIERS = 8
+        private const val DEFAULT_FIRST_LOCK_CENTER_RELAX_STRONG_FACTOR = 1.25
+        private const val DEFAULT_FIRST_LOCK_CENTER_RELAX_MISS_STREAK = 10
+        private const val DEFAULT_FIRST_LOCK_CENTER_RELAX_MISS_FACTOR = 1.15
+        private const val DEFAULT_FIRST_LOCK_CENTER_RELAX_CAP_FACTOR = 1.2
+        private const val DEFAULT_FIRST_LOCK_CONF_STRONG_GOOD = 24
+        private const val DEFAULT_FIRST_LOCK_CONF_STRONG_INLIERS = 8
+        private const val DEFAULT_FIRST_LOCK_CONF_STRONG_MIN = 0.24
+        private const val DEFAULT_FIRST_LOCK_CONF_MEDIUM_GOOD = 16
+        private const val DEFAULT_FIRST_LOCK_CONF_MEDIUM_INLIERS = 6
+        private const val DEFAULT_FIRST_LOCK_CONF_MEDIUM_MIN = 0.28
+        private const val DEFAULT_FIRST_LOCK_CONF_SMALL_MIN = 0.30
+        private const val DEFAULT_FIRST_LOCK_CONF_BASE_MIN = 0.03
         private const val DEFAULT_FIRST_LOCK_HOLD_ON_TEMPORAL_REJECT = true
         private const val DEFAULT_FIRST_LOCK_OUTLIER_HOLD_MAX = 2
         private const val DEFAULT_ALLOW_FALLBACK_LOCK = true
@@ -4530,8 +5207,8 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_FALLBACK_REFINE_MIN_CONFIDENCE = 0.40
         private const val DEFAULT_FALLBACK_REFINE_LOWE_RATIO = 0.84
         private const val DEFAULT_SMALL_TARGET_AREA_RATIO = 0.05
-        private const val DEFAULT_SMALL_TARGET_MIN_GOOD_MATCHES = 5
-        private const val DEFAULT_SMALL_TARGET_MIN_INLIERS = 4
+        private const val DEFAULT_SMALL_TARGET_MIN_GOOD_MATCHES = 4
+        private const val DEFAULT_SMALL_TARGET_MIN_INLIERS = 3
         private const val DEFAULT_SMALL_TARGET_SCALE_THRESHOLD = 0.55
         private const val DEFAULT_WEAK_FALLBACK_MAX_MATCHES = 6
         private const val DEFAULT_WEAK_FALLBACK_MAX_SPAN_PX = 96.0
@@ -4561,14 +5238,47 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_NATIVE_FUSE_WARMUP_FRAMES = 12
         private const val DEFAULT_NATIVE_HOLD_LAST_ON_SOFT_REJECT = true
         private const val DEFAULT_NATIVE_ORB_VERIFY_ENABLED = false
+        private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_GOOD = 18
+        private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_INLIERS = 7
+        private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_CONFIDENCE = 0.42
+        private const val DEFAULT_AUTO_VERIFY_STRONG_APPEARANCE_MIN_LIVE = 0.16
+        private const val DEFAULT_AUTO_VERIFY_STRONG_APPEARANCE_MIN_REPLAY = 0.10
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_ROI_EXPAND_FACTOR = 1.6
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_CENTER_FACTOR_LIVE = 0.75
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_CENTER_FACTOR_REPLAY = 1.80
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_IOU_LIVE = 0.40
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_IOU_REPLAY = 0.00
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_SCALE_LIVE = 0.72
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_SCALE_REPLAY = 0.80
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_FLOOR_LIVE = 0.24
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_FLOOR_REPLAY = 0.30
+        private const val DEFAULT_AUTO_VERIFY_APPEAR_STRONG_GOOD = 24
+        private const val DEFAULT_AUTO_VERIFY_APPEAR_STRONG_INLIERS = 10
+        private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_STRONG = -0.06
+        private const val DEFAULT_AUTO_VERIFY_APPEAR_MEDIUM_GOOD = 20
+        private const val DEFAULT_AUTO_VERIFY_APPEAR_MEDIUM_INLIERS = 8
+        private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_MEDIUM = -0.25
+        private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_BASE = -0.18
+        private const val DEFAULT_AUTO_VERIFY_APPEAR_LIVE_BIAS = 0.06
         private const val DEFAULT_KALMAN_ENABLED = false
         private const val DEFAULT_KALMAN_PROCESS_NOISE = 0.10
         private const val DEFAULT_KALMAN_MEASUREMENT_NOISE = 0.24
         private const val DEFAULT_KALMAN_MAX_PREDICT_MS = 280L
         private const val DEFAULT_KALMAN_USE_PREDICTED_HOLD = false
+        private const val DEFAULT_KALMAN_DYNAMIC_MEASUREMENT_NOISE = true
+        private const val DEFAULT_KALMAN_HIGH_CONFIDENCE_THRESHOLD = 0.80
+        private const val DEFAULT_KALMAN_LOW_CONFIDENCE_THRESHOLD = 0.20
+        private const val DEFAULT_KALMAN_HIGH_CONFIDENCE_NOISE_SCALE = 0.25
+        private const val DEFAULT_KALMAN_LOW_CONFIDENCE_NOISE_SCALE = 8.0
+        private const val DEFAULT_KALMAN_OCCLUSION_NOISE_SCALE = 12.0
+        private const val DEFAULT_KALMAN_FEED_NATIVE_PRIOR = true
+        private const val DEFAULT_KALMAN_PRETRACK_PRIOR_FEED = false
+        private const val DEFAULT_KALMAN_PRIOR_ONLY_ON_UNCERTAIN = true
+        private const val DEFAULT_KALMAN_PRIOR_MIN_IOU = 0.30
+        private const val DEFAULT_KALMAN_PRIOR_STALE_MS = 120L
         private const val DEFAULT_LOCK_HOLD_FRAMES = 0
         private const val DEFAULT_LOST_OVERLAY_HOLD_MS = 120L
-        private const val DEFAULT_FAST_FIRST_LOCK_FRAMES = 0
+        private const val DEFAULT_FAST_FIRST_LOCK_FRAMES = 240
         private const val FAST_FIRST_LOCK_MIN_GOOD_MATCHES = 12
         private const val FAST_FIRST_LOCK_MIN_INLIERS = 4
         private const val FAST_FIRST_LOCK_MIN_CONFIDENCE = 0.24
@@ -4586,15 +5296,20 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_TRACK_VERIFY_RECENTER_PX = 48.0
         private const val DEFAULT_TRACK_VERIFY_MIN_IOU = 0.35
         private const val DEFAULT_TRACK_VERIFY_SWITCH_CONFIDENCE_MARGIN = 0.15
+        private const val DEFAULT_TRACK_VERIFY_ENABLE_GLOBAL_FALLBACK = false
         private const val TRACK_VERIFY_HARD_MIN_GOOD_MATCHES = 5
         private const val DEFAULT_TRACK_VERIFY_HARD_DRIFT_TOLERANCE = 3
         private const val DEFAULT_TRACK_VERIFY_NATIVE_BYPASS_CONFIDENCE = 0.75
-        private const val TRACK_MAX_CENTER_JUMP_FACTOR = 1.10
-        private const val TRACK_MIN_AREA_RATIO = 0.45
-        private const val TRACK_MAX_AREA_RATIO = 2.20
-        private const val TRACK_DROP_STREAK = 1
-        private const val TRACK_APPEARANCE_CHECK_INTERVAL = 4L
-        private const val TRACK_MIN_APPEARANCE_SCORE = -0.08
+        private const val DEFAULT_TRACK_GUARD_MAX_CENTER_JUMP_FACTOR = 1.10
+        private const val DEFAULT_TRACK_GUARD_MIN_AREA_RATIO = 0.35
+        private const val DEFAULT_TRACK_GUARD_MAX_AREA_RATIO = 2.20
+        private const val DEFAULT_TRACK_GUARD_DROP_STREAK = 1
+        private const val DEFAULT_TRACK_GUARD_APPEARANCE_CHECK_INTERVAL = 4L
+        private const val DEFAULT_TRACK_GUARD_MIN_APPEARANCE_SCORE = -0.12
+        private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED = 0.28
+        private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE = 0.35
+        private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_RELAX = 0.03
+        private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_FLOOR = 0.10
 
         private const val SEARCH_DIAG_INTERVAL_FRAMES = 20
         private const val PERF_LOG_INTERVAL_FRAMES = 10
