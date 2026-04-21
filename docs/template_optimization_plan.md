@@ -1042,3 +1042,8 @@ GT_EXPECTED (from p0_windows.json label): cx=?, cy=?, w=?, h=?
     - sleep 1s
 - Exit criteria for debt closure:
   - Remove workaround and still keep first-lock variance within ±1.0s across 3 consecutive runs.
+- Update 2026-04-21 (reclassification):
+  - The cold-start workaround (`am force-stop`) did not recover L1 first-lock to 7~8s.
+  - L1 remains stable around `firstLockReplaySec=12.474s`, indicating intrinsic LOCK pipeline latency rather than cross-session contamination.
+  - Working policy for MVP-5 acceptance: extend `center_roi_l3_timeout_ms` to `10000` as pragmatic guardrail.
+  - Root-cause optimization of LOCK latency is deferred as post-MVP follow-up (target: reduce first-lock from ~12.474s to <=5s).

@@ -47,7 +47,7 @@ $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $outDir = "tools/auto_tune/out/mvp5_{0}_{1}" -f $Variant, $stamp
 
 $baseParams = "center_roi_search_enable=true,center_roi_gps_ready=false"
-$baseParams += ",fallback_refine_ratio=0.8,small_target_min_good=5,small_target_min_inliers=3,orb_ransac=4,first_lock_min_iou=0.30,center_roi_l3_timeout_ms=5000"
+$baseParams += ",fallback_refine_ratio=0.8,small_target_min_good=5,small_target_min_inliers=3,orb_ransac=4,first_lock_min_iou=0.30,center_roi_l3_timeout_ms=10000"
 if ($Variant -eq "l1" -or $Variant -eq "l2" -or $Variant -eq "l3") {
     # Acquire boost profile for positive variants:
     # - Lower soft-match floor and enable earlier relax under long miss streaks

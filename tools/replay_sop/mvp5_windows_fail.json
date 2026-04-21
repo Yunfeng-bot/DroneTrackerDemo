@@ -1,0 +1,16 @@
+﻿{
+  "schema_version": 1,
+  "video_id": "scene_mvp5_fail_20260420",
+  "description": "MVP-5 FAIL acceptance window (no target in frame, expect FAIL at 14.0s ± 1.0s).",
+  "expected_final_state": "FAIL",
+  "windows": [
+    {
+      "name": "fail_window",
+      "start_sec": 2.0,
+      "end_sec": 15.5,
+      "expected_final_state": "FAIL",
+      "expected_fail_at_sec": 14.0,
+      "fail_tolerance_sec": 1.0
+    }
+  ]
+}
