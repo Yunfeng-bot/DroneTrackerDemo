@@ -5,7 +5,7 @@ param(
     [double]$GpsReadyAtSec = 2.0,
     [int]$ReplayFps = 15,
     [string]$TrackerMode = "enhanced",
-    [double]$DurationSec = 30.0,
+    [double]$DurationSec = 32.0,
     [double]$TargetAppearSec = 2.0,
     [switch]$StrictFirstLockCenter
 )
@@ -32,6 +32,10 @@ if (-not (Test-Path -LiteralPath $windowsLocal)) {
 
 $videoRemote = "/sdcard/Download/Video_Search/scene_mvp5_{0}_{1}.mp4" -f $Variant, $Date
 $targetRemote = "/sdcard/Download/Video_Search/target_rooftop_{0}.jpg" -f $Date
+
+Write-Host "[mvp5] force-stop app for cold session"
+& "$repoRoot/tools/adb_exec.ps1" shell am force-stop com.example.dronetracker
+Start-Sleep -Seconds 1
 
 Write-Host "[mvp5] push video => $videoRemote"
 & "$repoRoot/tools/adb_exec.ps1" push "$videoLocal" "/sdcard/Download/Video_Search/"
