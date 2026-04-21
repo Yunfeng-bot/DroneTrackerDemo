@@ -685,6 +685,8 @@ def parse_tracker_log(text: str) -> Dict[str, object]:
     replay_first_frame_seen = False
     replay_fatal_seen = False
     replay_stop_seen = False
+    replay_stop_last_pts_ms: int | None = None
+    replay_max_pts_ms: int | None = None
     replay_decoded_frames: int | None = None
     replay_null_frames: int | None = None
     replay_frame_w: int | None = None
@@ -695,6 +697,14 @@ def parse_tracker_log(text: str) -> Dict[str, object]:
     perf_samples: List[Dict[str, object]] = []
     cand_dump_events: List[Dict[str, object]] = []
     descend_offset_events: List[Dict[str, object]] = []
+
+    def _update_replay_max(raw: str | None) -> None:
+        nonlocal replay_max_pts_ms
+        value = to_int(raw)
+        if value is None:
+            return
+        if replay_max_pts_ms is None or value > replay_max_pts_ms:
+            replay_max_pts_ms = value
 
     for line in text.splitlines():
         if "EVAL_SUMMARY" in line:
@@ -738,6 +748,8 @@ def parse_tracker_log(text: str) -> Dict[str, object]:
             replay_lines.append(line)
             kv = parse_kv(line)
             state = kv.get("state", "")
+            _update_replay_max(kv.get("replayPtsMs"))
+            _update_replay_max(kv.get("lastReplayPtsMs"))
             if state == "first_frame":
                 replay_first_frame_seen = True
                 size = parse_size(kv.get("size"))
@@ -747,6 +759,7 @@ def parse_tracker_log(text: str) -> Dict[str, object]:
                 replay_fatal_seen = True
             elif state == "stop":
                 replay_stop_seen = True
+                replay_stop_last_pts_ms = to_int(kv.get("lastReplayPtsMs"))
             if state in {"fatal", "stop"}:
                 replay_decoded_frames = to_int(kv.get("decoded"))
                 replay_null_frames = to_int(kv.get("nullCount"))
@@ -802,6 +815,13 @@ def parse_tracker_log(text: str) -> Dict[str, object]:
                 }
             )
 
+    for sample in perf_samples:
+        ts = sample.get("replay_pts_sec")
+        if isinstance(ts, (int, float)):
+            ms = int(float(ts) * 1000.0)
+            if replay_max_pts_ms is None or ms > replay_max_pts_ms:
+                replay_max_pts_ms = ms
+
     summary_kv = parse_kv(summary_lines[-1]) if summary_lines else {}
     perf_kv = parse_kv(perf_lines[-1]) if perf_lines else {}
     lock_kv = parse_kv(lock_lines[-1]) if lock_lines else {}
@@ -841,6 +861,18 @@ def parse_tracker_log(text: str) -> Dict[str, object]:
     replay_pts_sec = to_float(summary_kv.get("replayPtsSec"))
     if replay_pts_sec is None:
         replay_pts_sec = to_float(perf_kv.get("replayPtsSec"))
+    if replay_stop_last_pts_ms is not None:
+        replay_pts_sec = replay_stop_last_pts_ms / 1000.0
+        replay_stop_missing = False
+    else:
+        replay_stop_missing = True
+        replay_pts_candidates: List[float] = []
+        if replay_pts_sec is not None:
+            replay_pts_candidates.append(float(replay_pts_sec))
+        if replay_max_pts_ms is not None:
+            replay_pts_candidates.append(float(replay_max_pts_ms) / 1000.0)
+        if replay_pts_candidates:
+            replay_pts_sec = max(replay_pts_candidates)
 
     descend_offset_first_t: float | None = None
     descend_offset_last_state = ""
@@ -885,6 +917,9 @@ def parse_tracker_log(text: str) -> Dict[str, object]:
         "replay_first_frame_seen": replay_first_frame_seen,
         "replay_fatal_seen": replay_fatal_seen,
         "replay_stop_seen": replay_stop_seen,
+        "replay_stop_missing": replay_stop_missing,
+        "replay_stop_last_pts_ms": replay_stop_last_pts_ms,
+        "replay_max_pts_ms": replay_max_pts_ms,
         "replay_decoded_frames": replay_decoded_frames,
         "replay_null_frames": replay_null_frames,
         "replay_event_count": len(replay_lines),
@@ -977,6 +1012,8 @@ def _compute_s1_with_windows_label(
                 if isinstance(ts, (int, float)):
                     perf_samples.append(item)
     perf_samples.sort(key=lambda it: float(it.get("replay_pts_sec", 0.0)))
+    replay_end_sec_raw = parsed.get("replay_pts_sec")
+    replay_end_sec = float(replay_end_sec_raw) if isinstance(replay_end_sec_raw, (int, float)) else None
 
     relock_latency: Dict[str, float | None] = {}
     total_track_samples = 0
@@ -1111,10 +1148,13 @@ def _compute_s1_with_windows_label(
                 total_wrong_samples += 1
 
         # Track-ratio KPI aligned with window labels (for MVP-5 steady window acceptance).
+        effective_window_end = end_sec
+        if replay_end_sec is not None:
+            effective_window_end = min(effective_window_end, replay_end_sec)
         samples_in_window = [
             s
             for s in perf_samples
-            if start_sec <= float(s.get("replay_pts_sec", -1.0)) <= end_sec
+            if start_sec <= float(s.get("replay_pts_sec", -1.0)) <= effective_window_end
         ]
         tracked_count = 0
         if samples_in_window:
@@ -1308,6 +1348,26 @@ def analyze_candidate_dumps(
             diagnosis = "gate_or_temporal_layer"
     summary["diagnosis"] = diagnosis
     return summary
+
+
+def compute_required_replay_sec(
+    target_appear_sec: float,
+    duration_sec: float,
+    window_labels: List[Dict[str, object]],
+) -> float:
+    if window_labels:
+        ends: List[float] = []
+        for window in window_labels:
+            start_sec = float(window.get("start_sec", 0.0))
+            end_sec_raw = window.get("end_sec")
+            if isinstance(end_sec_raw, (int, float)) and float(end_sec_raw) > start_sec:
+                ends.append(float(end_sec_raw))
+            else:
+                eval_window_sec = float(window.get("eval_window_sec", 4.0))
+                ends.append(start_sec + max(0.1, eval_window_sec))
+        if ends:
+            return max(ends)
+    return max(0.0, target_appear_sec) + max(0.1, duration_sec)
 
 
 def _compute_s1_fallback(
@@ -1868,6 +1928,11 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"[sweep] failed to load p0 window labels: {exc}")
             window_labels = []
+    required_replay_sec_global = compute_required_replay_sec(
+        target_appear_sec=max(0.0, args.target_appear_sec),
+        duration_sec=max(0.1, args.duration_sec),
+        window_labels=window_labels,
+    )
 
     grid = make_default_grid(args.preset)
     for item in args.grid:
@@ -1906,6 +1971,7 @@ def main() -> int:
         "s1_window_sec": args.s1_window_sec,
         "s1_relock_max_sec": args.s1_relock_max_sec,
         "s1_wrong_lock_horizon_sec": args.s1_wrong_lock_horizon_sec,
+        "required_replay_sec": required_replay_sec_global,
         "cooldown_sec": args.cooldown_sec,
         "video_path": args.video_path,
         "target_path": args.target_path,
@@ -2044,7 +2110,10 @@ def main() -> int:
         log_file = logs_dir / f"run_{idx:03d}.log"
         wait_sec = total_wait_sec
         low_replay_retry_left = max(0, int(args.retry_low_replay))
-        required_replay_sec = max(0.0, args.target_appear_sec) + max(0.1, args.duration_sec)
+        required_replay_sec = required_replay_sec_global
+        required_replay_cov_ratio = (
+            1.0 if window_labels else max(0.0, min(1.0, float(args.min_replay_coverage)))
+        )
         best_log_text = ""
         best_parsed: Dict[str, object] = {}
         best_log_file: Path | None = None
@@ -2143,7 +2212,7 @@ def main() -> int:
                     best_frames = frames_value
             has_replay_window = (
                 isinstance(replay_pts, (int, float))
-                and replay_pts >= required_replay_sec * max(0.0, min(1.0, args.min_replay_coverage))
+                and replay_pts >= required_replay_sec * required_replay_cov_ratio
             )
             if has_metrics and (not has_replay_window) and low_replay_retry_left > 0:
                 low_replay_retry_left -= 1
@@ -2155,7 +2224,7 @@ def main() -> int:
                 wait_sec = min(max(5.0, next_wait), max(5.0, float(args.max_wait_sec)))
                 print(
                     f"  -> replay coverage low: replayPts={replay_pts} need>="
-                    f"{required_replay_sec * args.min_replay_coverage:.2f}s "
+                    f"{required_replay_sec * required_replay_cov_ratio:.2f}s "
                     f"(wait {prev_wait:.1f}s -> {wait_sec:.1f}s), retrying..."
                 )
                 time.sleep(0.6)
@@ -2182,7 +2251,7 @@ def main() -> int:
         replay_pts_final = parsed.get("replay_pts_sec")
         replay_window_ok = (
             isinstance(replay_pts_final, (int, float))
-            and replay_pts_final >= required_replay_sec * max(0.0, min(1.0, args.min_replay_coverage))
+            and replay_pts_final >= required_replay_sec * required_replay_cov_ratio
         )
 
         first_lock_after_target = compute_first_lock_after_target(
@@ -2314,6 +2383,9 @@ def main() -> int:
             "replay_input_state": parsed.get("replay_input_state"),
             "replay_first_frame_seen": int(bool(parsed.get("replay_first_frame_seen"))),
             "replay_stop_seen": int(bool(parsed.get("replay_stop_seen"))),
+            "replay_stop_missing": int(bool(parsed.get("replay_stop_missing"))),
+            "replay_stop_last_pts_ms": parsed.get("replay_stop_last_pts_ms"),
+            "replay_max_pts_ms": parsed.get("replay_max_pts_ms"),
             "replay_fatal_seen": int(bool(parsed.get("replay_fatal_seen"))),
             "replay_decoded_frames": parsed.get("replay_decoded_frames"),
             "replay_null_frames": parsed.get("replay_null_frames"),
@@ -2399,6 +2471,9 @@ def main() -> int:
         "replay_input_state",
         "replay_first_frame_seen",
         "replay_stop_seen",
+        "replay_stop_missing",
+        "replay_stop_last_pts_ms",
+        "replay_max_pts_ms",
         "replay_fatal_seen",
         "replay_decoded_frames",
         "replay_null_frames",
@@ -2449,6 +2524,8 @@ def main() -> int:
             "frames": best.get("frames"),
             "replay_window_ok": best.get("replay_window_ok"),
             "replay_pts_sec": best.get("replay_pts_sec"),
+            "replay_stop_missing": bool(best.get("replay_stop_missing", 0)),
+            "replay_stop_last_pts_ms": best.get("replay_stop_last_pts_ms"),
             "wrong_lock_ratio_in_windows": best.get("wrong_lock_ratio_in_windows"),
             "window_track_ratio": best.get("window_track_ratio"),
             "window_track_ratio_min": best.get("window_track_ratio_min"),
