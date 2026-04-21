@@ -29,6 +29,7 @@ import org.opencv.imgproc.Imgproc
 import org.opencv.tracking.TrackerKCF
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -51,6 +52,27 @@ class OpenCVTrackerAnalyzer(
         TRACK
     }
 
+    private enum class CenterRoiLevel {
+        L1,
+        L2,
+        L3
+    }
+
+    private enum class DescendOffsetState {
+        L1,
+        L2,
+        L3,
+        TRACKING,
+        LOST,
+        FAIL
+    }
+
+    private enum class PromotedRelockTier {
+        NONE,
+        NEAR,
+        FAR
+    }
+
     private enum class NativeConfidenceAction {
         ACCEPT,
         HOLD,
@@ -69,6 +91,42 @@ class OpenCVTrackerAnalyzer(
         val fallbackReason: String?,
         val matcherType: String,
         val isStrong: Boolean
+    )
+
+    private data class SearchAnchorHint(
+        val point: Point,
+        val radius: Double,
+        val source: String
+    )
+
+    private data class SpatialPrior(
+        val box: Rect,
+        val source: String
+    )
+
+    private data class SpatialScore(
+        val score: Double,
+        val distance2: Double,
+        val source: String
+    )
+
+    private data class LostPriorGeometry(
+        val prior: Rect,
+        val framesAgo: Long,
+        val iou: Double,
+        val centerDist: Double,
+        val side: Double,
+        val near: Boolean
+    )
+
+    private data class OrbCandidateDumpRow(
+        val candidate: OrbMatchCandidate,
+        val appearanceScore: Double,
+        val spatialScore: Double?,
+        val spatialDistance2: Double?,
+        val fusionScore: Double,
+        val tier: PromotedRelockTier,
+        val source: String
     )
 
     private data class BoxMatchQuality(
@@ -230,6 +288,8 @@ class OpenCVTrackerAnalyzer(
         val strongCandidateMinConfidence: Double,
         val strongAppearanceMinLive: Double,
         val strongAppearanceMinReplay: Double,
+        val localMissingMinConfLive: Double,
+        val localMissingMinConfReplay: Double,
         val localRoiExpandFactor: Double,
         val localCenterFactorLive: Double,
         val localCenterFactorReplay: Double,
@@ -497,6 +557,8 @@ class OpenCVTrackerAnalyzer(
     private var scaleY = 1f
     private var offsetX = 0f
     private var offsetY = 0f
+    private var currentFrameWidth = 0
+    private var currentFrameHeight = 0
     private var frameCounter = 0L
     private var consecutiveTrackerFailures = 0
     private var lastTemplateReadyState = true
@@ -563,6 +625,31 @@ class OpenCVTrackerAnalyzer(
     private var metricsNativeSimMax = 0.0
     private var metricsSearchLastReason = "none"
     private var currentReplayPtsMs = -1L
+    private var replayTargetAppearMs = -1L
+    private var centerRoiSearchEnabled = DEFAULT_CENTER_ROI_SEARCH_ENABLED
+    private var centerRoiGpsReady = DEFAULT_CENTER_ROI_GPS_READY
+    private var centerRoiL1Range = DEFAULT_CENTER_ROI_L1_RANGE
+    private var centerRoiL2Range = DEFAULT_CENTER_ROI_L2_RANGE
+    private var centerRoiL1TimeoutMs = DEFAULT_CENTER_ROI_L1_TIMEOUT_MS
+    private var centerRoiL2TimeoutMs = DEFAULT_CENTER_ROI_L2_TIMEOUT_MS
+    private var centerRoiL3TimeoutMs = DEFAULT_CENTER_ROI_L3_TIMEOUT_MS
+    private var centerRoiLevel = CenterRoiLevel.L1
+    private var centerRoiLevelStartMs = 0L
+    private var centerRoiSessionStartMs = 0L
+    private var centerRoiTimeoutRaised = false
+    private var centerRoiLastScope = "full"
+    private var centerRoiL1ElapsedMs = 0L
+    private var centerRoiL2ElapsedMs = 0L
+    private var centerRoiL3ElapsedMs = 0L
+    private var centerRoiFailEmittedThisSession = false
+    private var centerRoiFailLatched = false
+    private var descendLastState: DescendOffsetState? = null
+    private var descendLastEmitMs = 0L
+    private var descendCacheX = Double.NaN
+    private var descendCacheY = Double.NaN
+    private var descendCacheConf = Double.NaN
+    private var descendLostActive = false
+    private var descendLostStartMs = 0L
 
     private var orbMaxFeatures = DEFAULT_ORB_FEATURES
     private var orbFeatureHardCap = DEFAULT_ORB_FEATURE_HARD_CAP
@@ -595,6 +682,7 @@ class OpenCVTrackerAnalyzer(
     private var homographyScaleMax = DEFAULT_HOMOGRAPHY_SCALE_MAX
     private var homographyMinJacobianDet = DEFAULT_HOMOGRAPHY_MIN_JACOBIAN_DET
     private var templateMinTextureScore = DEFAULT_TEMPLATE_MIN_TEXTURE_SCORE
+    private var templatePoseAugmentEnabled = DEFAULT_TEMPLATE_POSE_AUGMENT_ENABLED
     private var orbFarBoostFeatures = DEFAULT_ORB_FAR_BOOST_FEATURES
     private var orbFarBoostMultiTemplateCap = DEFAULT_ORB_FAR_BOOST_MULTI_TEMPLATE_CAP
 
@@ -646,7 +734,12 @@ class OpenCVTrackerAnalyzer(
     private var trackGuardAnchorEnabled = DEFAULT_TRACK_GUARD_ANCHOR_ENABLED
     private var trackGuardAnchorMaxDrop = DEFAULT_TRACK_GUARD_ANCHOR_MAX_DROP
     private var trackGuardAnchorMinScore = DEFAULT_TRACK_GUARD_ANCHOR_MIN_SCORE
+    private var trackGuardAccelGraceFrames = DEFAULT_TRACK_GUARD_ACCEL_GRACE_FRAMES
+    private var trackGuardHardMismatch = false
+    private var trackAccelGraceFramesRemaining = 0
     private var trackAnchorAppearanceScore = Double.NaN
+    private var lastLostBox: Rect? = null
+    private var lastLostFrameId = -1L
     private var smallTargetNativeVerifyIntervalFrames = DEFAULT_SMALL_TARGET_NATIVE_VERIFY_INTERVAL_FRAMES
     private var smallTargetNativeVerifyAreaScale = DEFAULT_SMALL_TARGET_NATIVE_VERIFY_AREA_SCALE
     private var smallTargetAnchorDropScale = DEFAULT_SMALL_TARGET_ANCHOR_DROP_SCALE
@@ -726,6 +819,8 @@ class OpenCVTrackerAnalyzer(
     private var autoVerifyStrongMinConfidence = DEFAULT_AUTO_VERIFY_STRONG_MIN_CONFIDENCE
     private var autoVerifyStrongAppearanceMinLive = DEFAULT_AUTO_VERIFY_STRONG_APPEARANCE_MIN_LIVE
     private var autoVerifyStrongAppearanceMinReplay = DEFAULT_AUTO_VERIFY_STRONG_APPEARANCE_MIN_REPLAY
+    private var autoVerifyLocalMissingMinConfLive = DEFAULT_AUTO_VERIFY_LOCAL_MISSING_MIN_CONF_LIVE
+    private var autoVerifyLocalMissingMinConfReplay = DEFAULT_AUTO_VERIFY_LOCAL_MISSING_MIN_CONF_REPLAY
     private var autoVerifyLocalRoiExpandFactor = DEFAULT_AUTO_VERIFY_LOCAL_ROI_EXPAND_FACTOR
     private var autoVerifyLocalCenterFactorLive = DEFAULT_AUTO_VERIFY_LOCAL_CENTER_FACTOR_LIVE
     private var autoVerifyLocalCenterFactorReplay = DEFAULT_AUTO_VERIFY_LOCAL_CENTER_FACTOR_REPLAY
@@ -743,6 +838,54 @@ class OpenCVTrackerAnalyzer(
     private var autoVerifyAppearanceMinMedium = DEFAULT_AUTO_VERIFY_APPEAR_MIN_MEDIUM
     private var autoVerifyAppearanceMinBase = DEFAULT_AUTO_VERIFY_APPEAR_MIN_BASE
     private var autoVerifyAppearanceLiveBias = DEFAULT_AUTO_VERIFY_APPEAR_LIVE_BIAS
+    private var autoVerifyRejectFlipReplay = DEFAULT_AUTO_VERIFY_REJECT_FLIP_REPLAY
+    private var autoVerifyRelockMinConfLive = DEFAULT_AUTO_VERIFY_RELOCK_MIN_CONF_LIVE
+    private var autoVerifyRelockMinConfReplay = DEFAULT_AUTO_VERIFY_RELOCK_MIN_CONF_REPLAY
+    private var autoVerifyLostPriorMaxFramesLive = DEFAULT_AUTO_VERIFY_LOST_PRIOR_MAX_FRAMES_LIVE
+    private var autoVerifyLostPriorMaxFramesReplay = DEFAULT_AUTO_VERIFY_LOST_PRIOR_MAX_FRAMES_REPLAY
+    private var autoVerifyLostPriorCenterFactorLive = DEFAULT_AUTO_VERIFY_LOST_PRIOR_CENTER_FACTOR_LIVE
+    private var autoVerifyLostPriorCenterFactorReplay = DEFAULT_AUTO_VERIFY_LOST_PRIOR_CENTER_FACTOR_REPLAY
+    private var autoVerifyLostPriorMinIouLive = DEFAULT_AUTO_VERIFY_LOST_PRIOR_MIN_IOU_LIVE
+    private var autoVerifyLostPriorMinIouReplay = DEFAULT_AUTO_VERIFY_LOST_PRIOR_MIN_IOU_REPLAY
+    private var autoVerifyLostPriorCenterBoostFrames = DEFAULT_AUTO_VERIFY_LOST_PRIOR_CENTER_BOOST_FRAMES
+    private var autoVerifyLostPriorCenterBoostCap = DEFAULT_AUTO_VERIFY_LOST_PRIOR_CENTER_BOOST_CAP
+    private var autoVerifyLostAnchorNearFactorLive = DEFAULT_AUTO_VERIFY_LOST_ANCHOR_NEAR_FACTOR_LIVE
+    private var autoVerifyLostAnchorNearFactorReplay = DEFAULT_AUTO_VERIFY_LOST_ANCHOR_NEAR_FACTOR_REPLAY
+    private var autoVerifyLostFarRecoverMinGood = DEFAULT_AUTO_VERIFY_LOST_FAR_RECOVER_MIN_GOOD
+    private var autoVerifyLostFarRecoverMinInliers = DEFAULT_AUTO_VERIFY_LOST_FAR_RECOVER_MIN_INLIERS
+    private var autoVerifyLostFarRecoverMinConfLive = DEFAULT_AUTO_VERIFY_LOST_FAR_RECOVER_MIN_CONF_LIVE
+    private var autoVerifyLostFarRecoverMinConfReplay = DEFAULT_AUTO_VERIFY_LOST_FAR_RECOVER_MIN_CONF_REPLAY
+    private var autoVerifyLostFarRecoverMinAppearance = DEFAULT_AUTO_VERIFY_LOST_FAR_RECOVER_MIN_APPEARANCE
+    private var autoVerifyFirstLockAppearanceMinLive = DEFAULT_AUTO_VERIFY_FIRST_LOCK_APPEAR_MIN_LIVE
+    private var autoVerifyFirstLockAppearanceMinReplay = DEFAULT_AUTO_VERIFY_FIRST_LOCK_APPEAR_MIN_REPLAY
+    private var autoVerifyFirstLockMinInliersReplay = DEFAULT_AUTO_VERIFY_FIRST_LOCK_MIN_INLIERS_REPLAY
+    private var autoVerifyFirstLockRequireLocalLive = DEFAULT_AUTO_VERIFY_FIRST_LOCK_REQUIRE_LOCAL_LIVE
+    private var autoVerifyFirstLockRequireLocalReplay = DEFAULT_AUTO_VERIFY_FIRST_LOCK_REQUIRE_LOCAL_REPLAY
+    private var autoVerifyFirstLockCenterGuardReplay = DEFAULT_AUTO_VERIFY_FIRST_LOCK_CENTER_GUARD_REPLAY
+    private var autoVerifyFirstLockCenterFactorReplay = DEFAULT_AUTO_VERIFY_FIRST_LOCK_CENTER_FACTOR_REPLAY
+    private var spatialGateEnabled = DEFAULT_SPATIAL_GATE_ENABLED
+    private var spatialGateWeight = DEFAULT_SPATIAL_GATE_WEIGHT
+    private var spatialGateCenterSigmaFactor = DEFAULT_SPATIAL_GATE_CENTER_SIGMA_FACTOR
+    private var spatialGateSizeSigmaFactor = DEFAULT_SPATIAL_GATE_SIZE_SIGMA_FACTOR
+    private var spatialGateRelockMinScoreLive = DEFAULT_SPATIAL_GATE_RELOCK_MIN_SCORE_LIVE
+    private var spatialGateRelockMinScoreReplay = DEFAULT_SPATIAL_GATE_RELOCK_MIN_SCORE_REPLAY
+    private var spatialGateRelockBypassConf = DEFAULT_SPATIAL_GATE_RELOCK_BYPASS_CONF
+    private var spatialGateRelockBypassAppearance = DEFAULT_SPATIAL_GATE_RELOCK_BYPASS_APPEARANCE
+    private var autoVerifyRelockSpatialRelaxStreakLive = AUTO_VERIFY_RELOCK_SPATIAL_RELAX_STREAK_LIVE
+    private var autoVerifyRelockSpatialRelaxStreakReplay = AUTO_VERIFY_RELOCK_SPATIAL_RELAX_STREAK_REPLAY
+    private var autoVerifyRelockSpatialRelaxMinScore = AUTO_VERIFY_RELOCK_SPATIAL_RELAX_MIN_SCORE
+    private var autoVerifyRelockSpatialRelaxMinAppearance = AUTO_VERIFY_RELOCK_SPATIAL_RELAX_MIN_APPEARANCE
+    private var candDumpEnable = false
+    private var candDumpWindowOnly = true
+    private var candDumpStartSec = 20.0
+    private var candDumpEndSec = 28.0
+    private var candDumpTopK = 5
+    private var candDumpExpectedXMin = 0.30
+    private var candDumpExpectedXMax = 0.50
+    private var s2SuppressKcfFallbackEnabled = DEFAULT_S2_SUPPRESS_KCF_FALLBACK_ENABLED
+    private var s3PromotedNearGateEnabled = DEFAULT_S3_PROMOTED_NEAR_GATE_ENABLED
+    private var s3PromotedFarGateEnabled = DEFAULT_S3_PROMOTED_FAR_GATE_ENABLED
+    private var s3PromotedNearAnchorVetoEnabled = DEFAULT_S3_PROMOTED_NEAR_ANCHOR_VETO_ENABLED
     private var temporalHighGoodMatches = TEMPORAL_HIGH_GOOD_MATCHES
     private var temporalHighInliers = TEMPORAL_HIGH_INLIERS
     private var temporalMinConfidenceHighGood = TEMPORAL_MIN_CONFIDENCE_HIGH_GOOD
@@ -764,6 +907,7 @@ class OpenCVTrackerAnalyzer(
     private var firstLockCandidateAppearanceMin = 1.0
     private var firstLockCandidateAppearanceLast = 0.0
     private var firstLockOutlierHoldStreak = 0
+    private var relockSpatialRejectStreak = 0
     private var lastSearchDiagReason = "none"
 
     @Volatile
@@ -860,6 +1004,25 @@ class OpenCVTrackerAnalyzer(
                 "search_ultra_high_res_short_edge" -> value.toIntOrNull()?.let { searchUltraHighResShortEdge = it.coerceIn(480, 1400) }
                 "search_max_long_edge" -> value.toIntOrNull()?.let { searchMaxLongEdge = it.coerceIn(320, 1400) }
                 "search_multi_max_long_edge" -> value.toIntOrNull()?.let { searchMultiTemplateMaxLongEdge = it.coerceIn(320, 1200) }
+                "center_roi_search_enable", "mvp_center_roi_search_enable" ->
+                    parseBoolean(value)?.let {
+                        centerRoiSearchEnabled = it
+                        if (!it) {
+                            resetCenterRoiSearchState("override_disable")
+                        }
+                    }
+                "center_roi_gps_ready", "mvp_gps_ready" ->
+                    parseBoolean(value)?.let { setCenterRoiGpsReady(it, "override") }
+                "center_roi_l1_range", "mvp_roi_l1_range" ->
+                    value.toDoubleOrNull()?.let { centerRoiL1Range = it.coerceIn(0.05, 0.45) }
+                "center_roi_l2_range", "mvp_roi_l2_range" ->
+                    value.toDoubleOrNull()?.let { centerRoiL2Range = it.coerceIn(0.10, 0.49) }
+                "center_roi_l1_timeout_ms", "mvp_roi_l1_timeout_ms" ->
+                    value.toLongOrNull()?.let { centerRoiL1TimeoutMs = it.coerceIn(100L, 5_000L) }
+                "center_roi_l2_timeout_ms", "mvp_roi_l2_timeout_ms" ->
+                    value.toLongOrNull()?.let { centerRoiL2TimeoutMs = it.coerceIn(100L, 5_000L) }
+                "center_roi_l3_timeout_ms", "mvp_roi_l3_timeout_ms" ->
+                    value.toLongOrNull()?.let { centerRoiL3TimeoutMs = it.coerceIn(200L, 10_000L) }
                 "init_box" -> value.toIntOrNull()?.let { initBoxSize = it.coerceIn(48, 360) }
                 "fallback_box_min" -> value.toIntOrNull()?.let { fallbackMinBoxSize = it.coerceIn(32, 240) }
                 "fallback_box_max" -> value.toIntOrNull()?.let { fallbackMaxBoxSize = it.coerceIn(64, 420) }
@@ -868,14 +1031,15 @@ class OpenCVTrackerAnalyzer(
                 "homography_scale_max" -> value.toDoubleOrNull()?.let { homographyScaleMax = it.coerceIn(0.60, 3.0) }
                 "homography_min_det" -> value.toDoubleOrNull()?.let { homographyMinJacobianDet = it.coerceIn(1e-7, 1e-2) }
                 "template_min_texture" -> value.toDoubleOrNull()?.let { templateMinTextureScore = it.coerceIn(0.0, 200.0) }
+                "template_pose_aug", "template_rotation_aug" -> parseBoolean(value)?.let { templatePoseAugmentEnabled = it }
                 "orb_clahe" -> parseBoolean(value)?.let { orbUseClahe = it }
                 "orb_far_features" -> value.toIntOrNull()?.let { orbFarBoostFeatures = it.coerceIn(700, 2800) }
                 "orb_far_features_multi_cap" -> value.toIntOrNull()?.let { orbFarBoostMultiTemplateCap = it.coerceIn(600, 2600) }
                 "first_lock_stable_frames" -> value.toIntOrNull()?.let { firstLockStableFrames = it.coerceIn(1, 90) }
                 "first_lock_stable_ms" -> value.toLongOrNull()?.let { firstLockStableMs = it.coerceIn(120L, 3_500L) }
                 "first_lock_stable_px" -> value.toDoubleOrNull()?.let { firstLockStablePx = it.coerceIn(8.0, 240.0) }
-                "first_lock_min_iou" -> value.toDoubleOrNull()?.let { firstLockMinIou = it.coerceIn(0.40, 0.98) }
-                "first_lock_gap_ms" -> value.toLongOrNull()?.let { firstLockGapMs = it.coerceIn(80L, 1_200L) }
+                "first_lock_min_iou" -> value.toDoubleOrNull()?.let { firstLockMinIou = it.coerceIn(0.30, 0.98) }
+                "first_lock_gap_ms" -> value.toLongOrNull()?.let { firstLockGapMs = it.coerceIn(80L, 2_500L) }
                 "first_lock_small_center_px" -> value.toDoubleOrNull()?.let { firstLockSmallCenterDriftPx = it.coerceIn(8.0, 120.0) }
                 "first_lock_small_center_relaxed_px" ->
                     value.toDoubleOrNull()?.let { firstLockSmallCenterDriftRelaxedPx = it.coerceIn(12.0, 200.0) }
@@ -928,6 +1092,8 @@ class OpenCVTrackerAnalyzer(
                 "auto_verify_strong_min_conf" -> value.toDoubleOrNull()?.let { autoVerifyStrongMinConfidence = it.coerceIn(0.0, 1.0) }
                 "auto_verify_strong_appearance_live" -> value.toDoubleOrNull()?.let { autoVerifyStrongAppearanceMinLive = it.coerceIn(-1.0, 1.0) }
                 "auto_verify_strong_appearance_replay" -> value.toDoubleOrNull()?.let { autoVerifyStrongAppearanceMinReplay = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_local_missing_min_conf_live" -> value.toDoubleOrNull()?.let { autoVerifyLocalMissingMinConfLive = it.coerceIn(0.0, 1.0) }
+                "auto_verify_local_missing_min_conf_replay" -> value.toDoubleOrNull()?.let { autoVerifyLocalMissingMinConfReplay = it.coerceIn(0.0, 1.0) }
                 "auto_verify_local_roi_expand" -> value.toDoubleOrNull()?.let { autoVerifyLocalRoiExpandFactor = it.coerceIn(1.1, 4.0) }
                 "auto_verify_local_center_live" -> value.toDoubleOrNull()?.let { autoVerifyLocalCenterFactorLive = it.coerceIn(0.10, 2.0) }
                 "auto_verify_local_center_replay" -> value.toDoubleOrNull()?.let { autoVerifyLocalCenterFactorReplay = it.coerceIn(0.10, 2.0) }
@@ -945,6 +1111,84 @@ class OpenCVTrackerAnalyzer(
                 "auto_verify_appear_min_medium" -> value.toDoubleOrNull()?.let { autoVerifyAppearanceMinMedium = it.coerceIn(-1.0, 1.0) }
                 "auto_verify_appear_min_base" -> value.toDoubleOrNull()?.let { autoVerifyAppearanceMinBase = it.coerceIn(-1.0, 1.0) }
                 "auto_verify_appear_live_bias" -> value.toDoubleOrNull()?.let { autoVerifyAppearanceLiveBias = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_reject_flip_replay" -> parseBoolean(value)?.let { autoVerifyRejectFlipReplay = it }
+                "auto_verify_relock_min_conf_live" -> value.toDoubleOrNull()?.let { autoVerifyRelockMinConfLive = it.coerceIn(0.0, 1.0) }
+                "auto_verify_relock_min_conf_replay" -> value.toDoubleOrNull()?.let { autoVerifyRelockMinConfReplay = it.coerceIn(0.0, 1.0) }
+                "auto_verify_lost_prior_max_frames_live" -> value.toLongOrNull()?.let { autoVerifyLostPriorMaxFramesLive = it.coerceIn(1L, 600L) }
+                "auto_verify_lost_prior_max_frames_replay" -> value.toLongOrNull()?.let { autoVerifyLostPriorMaxFramesReplay = it.coerceIn(1L, 900L) }
+                "auto_verify_lost_prior_center_live" -> value.toDoubleOrNull()?.let { autoVerifyLostPriorCenterFactorLive = it.coerceIn(0.5, 8.0) }
+                "auto_verify_lost_prior_center_replay" -> value.toDoubleOrNull()?.let { autoVerifyLostPriorCenterFactorReplay = it.coerceIn(0.5, 8.0) }
+                "auto_verify_lost_prior_min_iou_live" -> value.toDoubleOrNull()?.let { autoVerifyLostPriorMinIouLive = it.coerceIn(0.0, 1.0) }
+                "auto_verify_lost_prior_min_iou_replay" -> value.toDoubleOrNull()?.let { autoVerifyLostPriorMinIouReplay = it.coerceIn(0.0, 1.0) }
+                "auto_verify_lost_prior_center_boost_frames" -> value.toLongOrNull()?.let { autoVerifyLostPriorCenterBoostFrames = it.coerceIn(1L, 1200L) }
+                "auto_verify_lost_prior_center_boost_cap" -> value.toDoubleOrNull()?.let { autoVerifyLostPriorCenterBoostCap = it.coerceIn(0.0, 4.0) }
+                "auto_verify_lost_anchor_near_live" -> value.toDoubleOrNull()?.let { autoVerifyLostAnchorNearFactorLive = it.coerceIn(0.5, 10.0) }
+                "auto_verify_lost_anchor_near_replay" -> value.toDoubleOrNull()?.let { autoVerifyLostAnchorNearFactorReplay = it.coerceIn(0.5, 10.0) }
+                "auto_verify_lost_far_recover_min_good" -> value.toIntOrNull()?.let { autoVerifyLostFarRecoverMinGood = it.coerceIn(4, 120) }
+                "auto_verify_lost_far_recover_min_inliers" -> value.toIntOrNull()?.let { autoVerifyLostFarRecoverMinInliers = it.coerceIn(3, 80) }
+                "auto_verify_lost_far_recover_min_conf_live" -> value.toDoubleOrNull()?.let { autoVerifyLostFarRecoverMinConfLive = it.coerceIn(0.0, 1.0) }
+                "auto_verify_lost_far_recover_min_conf_replay" -> value.toDoubleOrNull()?.let { autoVerifyLostFarRecoverMinConfReplay = it.coerceIn(0.0, 1.0) }
+                "auto_verify_lost_far_recover_min_appearance" -> value.toDoubleOrNull()?.let { autoVerifyLostFarRecoverMinAppearance = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_first_lock_appear_live" ->
+                    value.toDoubleOrNull()?.let { autoVerifyFirstLockAppearanceMinLive = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_first_lock_appear_replay" ->
+                    value.toDoubleOrNull()?.let { autoVerifyFirstLockAppearanceMinReplay = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_first_lock_min_inliers_replay" ->
+                    value.toIntOrNull()?.let { autoVerifyFirstLockMinInliersReplay = it.coerceIn(3, 20) }
+                "auto_verify_first_lock_require_local_live" ->
+                    parseBoolean(value)?.let { autoVerifyFirstLockRequireLocalLive = it }
+                "auto_verify_first_lock_require_local_replay" ->
+                    parseBoolean(value)?.let { autoVerifyFirstLockRequireLocalReplay = it }
+                "auto_verify_first_lock_center_guard_replay" ->
+                    parseBoolean(value)?.let { autoVerifyFirstLockCenterGuardReplay = it }
+                "auto_verify_first_lock_center_factor_replay" ->
+                    value.toDoubleOrNull()?.let { autoVerifyFirstLockCenterFactorReplay = it.coerceIn(0.05, 0.45) }
+                "spatial_gate_enable", "spatial_gate_enabled", "mahal_gate_enable", "mahal_enabled" ->
+                    parseBoolean(value)?.let { spatialGateEnabled = it }
+                "spatial_gate_weight", "mahal_gate_weight", "mahal_weight" ->
+                    value.toDoubleOrNull()?.let { spatialGateWeight = it.coerceIn(0.0, 0.90) }
+                "spatial_gate_center_sigma", "mahal_center_sigma" ->
+                    value.toDoubleOrNull()?.let { spatialGateCenterSigmaFactor = it.coerceIn(0.20, 4.0) }
+                "spatial_gate_size_sigma", "mahal_size_sigma" ->
+                    value.toDoubleOrNull()?.let { spatialGateSizeSigmaFactor = it.coerceIn(0.20, 4.0) }
+                "spatial_gate_relock_min_live", "mahal_relock_min_live" ->
+                    value.toDoubleOrNull()?.let { spatialGateRelockMinScoreLive = it.coerceIn(0.0, 1.0) }
+                "spatial_gate_relock_min_replay", "mahal_relock_min_replay" ->
+                    value.toDoubleOrNull()?.let { spatialGateRelockMinScoreReplay = it.coerceIn(0.0, 1.0) }
+                "spatial_gate_relock_bypass_conf", "mahal_relock_bypass_conf" ->
+                    value.toDoubleOrNull()?.let { spatialGateRelockBypassConf = it.coerceIn(0.0, 1.0) }
+                "spatial_gate_relock_bypass_appearance", "mahal_relock_bypass_appearance" ->
+                    value.toDoubleOrNull()?.let { spatialGateRelockBypassAppearance = it.coerceIn(-1.0, 1.0) }
+                "auto_verify_relock_spatial_relax_streak_live" ->
+                    value.toIntOrNull()?.let { autoVerifyRelockSpatialRelaxStreakLive = it.coerceIn(1, 256) }
+                "auto_verify_relock_spatial_relax_streak_replay" ->
+                    value.toIntOrNull()?.let { autoVerifyRelockSpatialRelaxStreakReplay = it.coerceIn(1, 512) }
+                "auto_verify_relock_spatial_relax_min_score" ->
+                    value.toDoubleOrNull()?.let { autoVerifyRelockSpatialRelaxMinScore = it.coerceIn(0.0, 1.0) }
+                "auto_verify_relock_spatial_relax_min_appearance" ->
+                    value.toDoubleOrNull()?.let { autoVerifyRelockSpatialRelaxMinAppearance = it.coerceIn(-1.0, 1.0) }
+                "cand_dump_enable" ->
+                    parseBoolean(value)?.let { candDumpEnable = it }
+                "cand_dump_window_only" ->
+                    parseBoolean(value)?.let { candDumpWindowOnly = it }
+                "cand_dump_start_sec" ->
+                    value.toDoubleOrNull()?.let { candDumpStartSec = it.coerceIn(0.0, 1200.0) }
+                "cand_dump_end_sec" ->
+                    value.toDoubleOrNull()?.let { candDumpEndSec = it.coerceIn(0.0, 1200.0) }
+                "cand_dump_top_k" ->
+                    value.toIntOrNull()?.let { candDumpTopK = it.coerceIn(1, 12) }
+                "cand_dump_expected_x_min" ->
+                    value.toDoubleOrNull()?.let { candDumpExpectedXMin = it.coerceIn(0.0, 1.0) }
+                "cand_dump_expected_x_max" ->
+                    value.toDoubleOrNull()?.let { candDumpExpectedXMax = it.coerceIn(0.0, 1.0) }
+                "s2_suppress_kcf_fallback", "native_init_retry_no_kcf" ->
+                    parseBoolean(value)?.let { s2SuppressKcfFallbackEnabled = it }
+                "s3_promoted_near_gate", "s3_near_gate" ->
+                    parseBoolean(value)?.let { s3PromotedNearGateEnabled = it }
+                "s3_promoted_far_gate", "s3_far_gate" ->
+                    parseBoolean(value)?.let { s3PromotedFarGateEnabled = it }
+                "s3_promoted_near_anchor_veto", "s3_near_anchor_veto" ->
+                    parseBoolean(value)?.let { s3PromotedNearAnchorVetoEnabled = it }
                 "temporal_high_good" -> value.toIntOrNull()?.let { temporalHighGoodMatches = it.coerceIn(4, 120) }
                 "temporal_high_inliers" -> value.toIntOrNull()?.let { temporalHighInliers = it.coerceIn(3, 80) }
                 "temporal_min_conf_high" -> value.toDoubleOrNull()?.let { temporalMinConfidenceHighGood = it.coerceIn(0.0, 1.0) }
@@ -1000,6 +1244,8 @@ class OpenCVTrackerAnalyzer(
                     value.toDoubleOrNull()?.let { trackGuardMaxAreaRatio = it.coerceIn(1.0, 10.0) }
                 "track_guard_drop_streak" ->
                     value.toIntOrNull()?.let { trackGuardDropStreak = it.coerceIn(1, 12) }
+                "track_guard_accel_grace", "track_guard_accel_grace_frames" ->
+                    value.toIntOrNull()?.let { trackGuardAccelGraceFrames = it.coerceIn(0, 30) }
                 "track_guard_appearance_interval" ->
                     value.toLongOrNull()?.let { trackGuardAppearanceCheckInterval = it.coerceIn(1L, 120L) }
                 "track_guard_min_appearance" ->
@@ -1211,6 +1457,8 @@ class OpenCVTrackerAnalyzer(
         autoVerifyStrongMinConfidence = autoVerifyStrongMinConfidence.coerceIn(0.0, 1.0)
         autoVerifyStrongAppearanceMinLive = autoVerifyStrongAppearanceMinLive.coerceIn(-1.0, 1.0)
         autoVerifyStrongAppearanceMinReplay = autoVerifyStrongAppearanceMinReplay.coerceIn(-1.0, 1.0)
+        autoVerifyLocalMissingMinConfLive = autoVerifyLocalMissingMinConfLive.coerceIn(0.0, 1.0)
+        autoVerifyLocalMissingMinConfReplay = autoVerifyLocalMissingMinConfReplay.coerceIn(0.0, 1.0)
         autoVerifyLocalRoiExpandFactor = autoVerifyLocalRoiExpandFactor.coerceIn(1.1, 4.0)
         autoVerifyLocalCenterFactorLive = autoVerifyLocalCenterFactorLive.coerceIn(0.10, 2.0)
         autoVerifyLocalCenterFactorReplay = autoVerifyLocalCenterFactorReplay.coerceIn(0.10, 2.0)
@@ -1228,12 +1476,67 @@ class OpenCVTrackerAnalyzer(
         autoVerifyAppearanceMinMedium = autoVerifyAppearanceMinMedium.coerceIn(-1.0, 1.0)
         autoVerifyAppearanceMinBase = autoVerifyAppearanceMinBase.coerceIn(-1.0, 1.0)
         autoVerifyAppearanceLiveBias = autoVerifyAppearanceLiveBias.coerceIn(-1.0, 1.0)
-        if (autoVerifyAppearanceMinStrong > autoVerifyAppearanceMinMedium) {
+        if (autoVerifyAppearanceMinStrong < autoVerifyAppearanceMinMedium) {
             autoVerifyAppearanceMinStrong = autoVerifyAppearanceMinMedium
         }
-        if (autoVerifyAppearanceMinMedium > autoVerifyAppearanceMinBase) {
+        if (autoVerifyAppearanceMinMedium < autoVerifyAppearanceMinBase) {
             autoVerifyAppearanceMinMedium = autoVerifyAppearanceMinBase
         }
+        autoVerifyRelockMinConfLive = autoVerifyRelockMinConfLive.coerceIn(0.0, 1.0)
+        autoVerifyRelockMinConfReplay = autoVerifyRelockMinConfReplay.coerceIn(0.0, 1.0)
+        autoVerifyLostPriorMaxFramesLive = autoVerifyLostPriorMaxFramesLive.coerceIn(1L, 600L)
+        autoVerifyLostPriorMaxFramesReplay = autoVerifyLostPriorMaxFramesReplay.coerceIn(1L, 900L)
+        autoVerifyLostPriorCenterFactorLive = autoVerifyLostPriorCenterFactorLive.coerceIn(0.5, 8.0)
+        autoVerifyLostPriorCenterFactorReplay = autoVerifyLostPriorCenterFactorReplay.coerceIn(0.5, 8.0)
+        autoVerifyLostPriorMinIouLive = autoVerifyLostPriorMinIouLive.coerceIn(0.0, 1.0)
+        autoVerifyLostPriorMinIouReplay = autoVerifyLostPriorMinIouReplay.coerceIn(0.0, 1.0)
+        autoVerifyLostPriorCenterBoostFrames = autoVerifyLostPriorCenterBoostFrames.coerceIn(1L, 1200L)
+        autoVerifyLostPriorCenterBoostCap = autoVerifyLostPriorCenterBoostCap.coerceIn(0.0, 4.0)
+        autoVerifyLostAnchorNearFactorLive = autoVerifyLostAnchorNearFactorLive.coerceIn(0.5, 10.0)
+        autoVerifyLostAnchorNearFactorReplay = autoVerifyLostAnchorNearFactorReplay.coerceIn(0.5, 10.0)
+        autoVerifyLostFarRecoverMinGood = autoVerifyLostFarRecoverMinGood.coerceIn(4, 120)
+        autoVerifyLostFarRecoverMinInliers = autoVerifyLostFarRecoverMinInliers.coerceIn(3, 80)
+        autoVerifyLostFarRecoverMinConfLive = autoVerifyLostFarRecoverMinConfLive.coerceIn(0.0, 1.0)
+        autoVerifyLostFarRecoverMinConfReplay = autoVerifyLostFarRecoverMinConfReplay.coerceIn(0.0, 1.0)
+        autoVerifyLostFarRecoverMinAppearance = autoVerifyLostFarRecoverMinAppearance.coerceIn(-1.0, 1.0)
+        autoVerifyFirstLockAppearanceMinLive = autoVerifyFirstLockAppearanceMinLive.coerceIn(-1.0, 1.0)
+        autoVerifyFirstLockAppearanceMinReplay = autoVerifyFirstLockAppearanceMinReplay.coerceIn(-1.0, 1.0)
+        autoVerifyFirstLockMinInliersReplay = autoVerifyFirstLockMinInliersReplay.coerceIn(3, 20)
+        autoVerifyFirstLockCenterFactorReplay = autoVerifyFirstLockCenterFactorReplay.coerceIn(0.05, 0.45)
+        spatialGateWeight = spatialGateWeight.coerceIn(0.0, 0.90)
+        spatialGateCenterSigmaFactor = spatialGateCenterSigmaFactor.coerceIn(0.20, 4.0)
+        spatialGateSizeSigmaFactor = spatialGateSizeSigmaFactor.coerceIn(0.20, 4.0)
+        spatialGateRelockMinScoreLive = spatialGateRelockMinScoreLive.coerceIn(0.0, 1.0)
+        spatialGateRelockMinScoreReplay = spatialGateRelockMinScoreReplay.coerceIn(0.0, 1.0)
+        spatialGateRelockBypassConf = spatialGateRelockBypassConf.coerceIn(0.0, 1.0)
+        spatialGateRelockBypassAppearance = spatialGateRelockBypassAppearance.coerceIn(-1.0, 1.0)
+        autoVerifyRelockSpatialRelaxStreakLive = autoVerifyRelockSpatialRelaxStreakLive.coerceIn(1, 256)
+        autoVerifyRelockSpatialRelaxStreakReplay = autoVerifyRelockSpatialRelaxStreakReplay.coerceIn(1, 512)
+        autoVerifyRelockSpatialRelaxMinScore = autoVerifyRelockSpatialRelaxMinScore.coerceIn(0.0, 1.0)
+        autoVerifyRelockSpatialRelaxMinAppearance = autoVerifyRelockSpatialRelaxMinAppearance.coerceIn(-1.0, 1.0)
+        candDumpStartSec = candDumpStartSec.coerceIn(0.0, 1200.0)
+        candDumpEndSec = candDumpEndSec.coerceIn(0.0, 1200.0)
+        if (candDumpEndSec < candDumpStartSec) {
+            val tmp = candDumpStartSec
+            candDumpStartSec = candDumpEndSec
+            candDumpEndSec = tmp
+        }
+        candDumpTopK = candDumpTopK.coerceIn(1, 12)
+        candDumpExpectedXMin = candDumpExpectedXMin.coerceIn(0.0, 1.0)
+        candDumpExpectedXMax = candDumpExpectedXMax.coerceIn(0.0, 1.0)
+        if (candDumpExpectedXMax < candDumpExpectedXMin) {
+            val tmp = candDumpExpectedXMin
+            candDumpExpectedXMin = candDumpExpectedXMax
+            candDumpExpectedXMax = tmp
+        }
+        centerRoiL1Range = centerRoiL1Range.coerceIn(0.05, 0.45)
+        centerRoiL2Range = centerRoiL2Range.coerceIn(0.10, 0.49)
+        if (centerRoiL2Range <= centerRoiL1Range) {
+            centerRoiL2Range = (centerRoiL1Range + 0.05).coerceAtMost(0.49)
+        }
+        centerRoiL1TimeoutMs = centerRoiL1TimeoutMs.coerceIn(100L, 5_000L)
+        centerRoiL2TimeoutMs = centerRoiL2TimeoutMs.coerceIn(100L, 5_000L)
+        centerRoiL3TimeoutMs = centerRoiL3TimeoutMs.coerceIn(200L, 10_000L)
         temporalHighGoodMatches = temporalHighGoodMatches.coerceIn(4, 120)
         temporalHighInliers = temporalHighInliers.coerceIn(3, 80)
         temporalMediumGoodMatches = temporalMediumGoodMatches.coerceIn(4, temporalHighGoodMatches)
@@ -1300,6 +1603,9 @@ class OpenCVTrackerAnalyzer(
         lockHoldFrames = lockHoldFrames.coerceIn(0, 180)
         lostOverlayHoldMs = lostOverlayHoldMs.coerceIn(0L, 3000L)
         fastFirstLockFrames = fastFirstLockFrames.coerceIn(0, 300)
+        if (!centerRoiSearchEnabled || !centerRoiGpsReady) {
+            resetCenterRoiSearchState("override_sync")
+        }
 
         configureOrbDetector(orbMaxFeatures)
         refreshHeuristicConfig()
@@ -1307,6 +1613,30 @@ class OpenCVTrackerAnalyzer(
             rebuildTemplatePyramid(templateSourceGrays)
         }
         logEffectiveParams("override")
+    }
+
+    fun setReplayTargetAppearSec(seconds: Double) {
+        replayTargetAppearMs =
+            if (seconds > 0.0) {
+                (seconds * 1000.0).toLong().coerceAtLeast(0L)
+            } else {
+                -1L
+            }
+    }
+
+    fun isCenterRoiGpsReady(): Boolean = centerRoiGpsReady
+
+    fun setCenterRoiGpsReady(ready: Boolean, reason: String = "external") {
+        if (centerRoiGpsReady == ready && !(ready && centerRoiFailLatched)) return
+        centerRoiGpsReady = ready
+        centerRoiFailLatched = false
+        centerRoiFailEmittedThisSession = false
+        resetCenterRoiSearchState(if (ready) "gps_ready" else "gps_not_ready")
+        resetDescendOffsetState(if (ready) "gps_ready" else "gps_not_ready")
+        Log.w(
+            TAG,
+            "EVAL_EVENT type=ROI_SEARCH state=gps_ready ready=$ready reason=$reason enabled=$centerRoiSearchEnabled"
+        )
     }
 
     private fun buildHeuristicConfig(): HeuristicConfig {
@@ -1427,6 +1757,8 @@ class OpenCVTrackerAnalyzer(
                 strongCandidateMinConfidence = autoVerifyStrongMinConfidence,
                 strongAppearanceMinLive = autoVerifyStrongAppearanceMinLive,
                 strongAppearanceMinReplay = autoVerifyStrongAppearanceMinReplay,
+                localMissingMinConfLive = autoVerifyLocalMissingMinConfLive,
+                localMissingMinConfReplay = autoVerifyLocalMissingMinConfReplay,
                 localRoiExpandFactor = autoVerifyLocalRoiExpandFactor,
                 localCenterFactorLive = autoVerifyLocalCenterFactorLive,
                 localCenterFactorReplay = autoVerifyLocalCenterFactorReplay,
@@ -1642,7 +1974,7 @@ class OpenCVTrackerAnalyzer(
                 "searchMaxLong=$searchMaxLongEdge searchMultiMaxLong=$searchMultiTemplateMaxLongEdge " +
                 "initBox=$initBoxSize fallbackMin=$fallbackMinBoxSize fallbackMax=$fallbackMaxBoxSize " +
                 "hDist=${fmt(homographyMaxDistortion)} hScaleMin=${fmt(homographyScaleMin)} hScaleMax=${fmt(homographyScaleMax)} " +
-                "hDet=${fmt(homographyMinJacobianDet)} tplTextureMin=${fmt(templateMinTextureScore)} clahe=$orbUseClahe " +
+                "hDet=${fmt(homographyMinJacobianDet)} tplTextureMin=${fmt(templateMinTextureScore)} tplPoseAug=$templatePoseAugmentEnabled clahe=$orbUseClahe " +
                 "farBoostFeatures=$orbFarBoostFeatures farBoostMultiCap=$orbFarBoostMultiTemplateCap " +
                 "firstLockFrames=${cfg.firstLock.stableFrames} firstLockMs=${cfg.firstLock.stableMs} firstLockPx=${fmt(cfg.firstLock.stablePx)} " +
                 "firstLockIou=${fmt(cfg.firstLock.minIou)} allowFallbackLock=${cfg.firstLock.allowFallbackLock} " +
@@ -1662,8 +1994,34 @@ class OpenCVTrackerAnalyzer(
                 "fallbackRefineInliers=${cfg.fallbackRefine.minInliers} fallbackRefineConf=${fmt(cfg.fallbackRefine.minConfidence)} " +
                 "fallbackRefineRatio=${fmt(cfg.fallbackRefine.loweRatio)} " +
                 "autoVerifyStrong=${cfg.autoInitVerify.strongCandidateMinGood}/${cfg.autoInitVerify.strongCandidateMinInliers}/${fmt(cfg.autoInitVerify.strongCandidateMinConfidence)} " +
+                "autoVerifyMissingConf=${fmt(cfg.autoInitVerify.localMissingMinConfLive)}/${fmt(cfg.autoInitVerify.localMissingMinConfReplay)} " +
                 "autoVerifyLocal=${fmt(cfg.autoInitVerify.localCenterFactorLive)}/${fmt(cfg.autoInitVerify.localCenterFactorReplay)}@${fmt(cfg.autoInitVerify.localMinIouLive)}/${fmt(cfg.autoInitVerify.localMinIouReplay)} " +
                 "autoVerifyAppear=${fmt(cfg.autoInitVerify.appearanceMinStrong)}/${fmt(cfg.autoInitVerify.appearanceMinMedium)}/${fmt(cfg.autoInitVerify.appearanceMinBase)}+${fmt(cfg.autoInitVerify.appearanceLiveBias)} " +
+                "autoVerifyRejectFlipReplay=$autoVerifyRejectFlipReplay " +
+                "autoVerifyRelockConf=${fmt(autoVerifyRelockMinConfLive)}/${fmt(autoVerifyRelockMinConfReplay)} " +
+                "autoVerifyLostPriorFrames=${autoVerifyLostPriorMaxFramesLive}/${autoVerifyLostPriorMaxFramesReplay} " +
+                "autoVerifyLostPriorCenter=${fmt(autoVerifyLostPriorCenterFactorLive)}/${fmt(autoVerifyLostPriorCenterFactorReplay)} " +
+                "autoVerifyLostPriorIou=${fmt(autoVerifyLostPriorMinIouLive)}/${fmt(autoVerifyLostPriorMinIouReplay)} " +
+                "autoVerifyLostAnchorNear=${fmt(autoVerifyLostAnchorNearFactorLive)}/${fmt(autoVerifyLostAnchorNearFactorReplay)} " +
+                "autoVerifyLostFarRecover=${autoVerifyLostFarRecoverMinGood}/${autoVerifyLostFarRecoverMinInliers}/" +
+                "${fmt(autoVerifyLostFarRecoverMinConfLive)}/${fmt(autoVerifyLostFarRecoverMinConfReplay)}/" +
+                "${fmt(autoVerifyLostFarRecoverMinAppearance)} " +
+                "autoVerifyFirstLockAppear=${fmt(autoVerifyFirstLockAppearanceMinLive)}/${fmt(autoVerifyFirstLockAppearanceMinReplay)} " +
+                "autoVerifyFirstLockMinInliersReplay=$autoVerifyFirstLockMinInliersReplay " +
+                "autoVerifyFirstLockRequireLocal=$autoVerifyFirstLockRequireLocalLive/$autoVerifyFirstLockRequireLocalReplay " +
+                "autoVerifyFirstLockCenterReplay=$autoVerifyFirstLockCenterGuardReplay/${fmt(autoVerifyFirstLockCenterFactorReplay)} " +
+                "spatialGate=$spatialGateEnabled/${fmt(spatialGateWeight)} " +
+                "spatialSigma=${fmt(spatialGateCenterSigmaFactor)}/${fmt(spatialGateSizeSigmaFactor)} " +
+                "spatialRelock=${fmt(spatialGateRelockMinScoreLive)}/${fmt(spatialGateRelockMinScoreReplay)} " +
+                "spatialBypass=${fmt(spatialGateRelockBypassConf)}/${fmt(spatialGateRelockBypassAppearance)} " +
+                "spatialRelax=${autoVerifyRelockSpatialRelaxStreakLive}/${autoVerifyRelockSpatialRelaxStreakReplay}/${fmt(autoVerifyRelockSpatialRelaxMinScore)}/${fmt(autoVerifyRelockSpatialRelaxMinAppearance)} " +
+                "centerRoi=$centerRoiSearchEnabled/$centerRoiGpsReady level=${centerRoiLevel.name.lowercase(Locale.US)} " +
+                "centerRoiRange=${fmt(centerRoiL1Range)}/${fmt(centerRoiL2Range)} " +
+                "centerRoiTimeoutMs=${centerRoiL1TimeoutMs}/${centerRoiL2TimeoutMs}/${centerRoiL3TimeoutMs} " +
+                "candDump=$candDumpEnable/$candDumpWindowOnly ${fmt(candDumpStartSec)}-${fmt(candDumpEndSec)} topK=$candDumpTopK " +
+                "candDumpExpectedX=${fmt(candDumpExpectedXMin)}:${fmt(candDumpExpectedXMax)} " +
+                "s2NoKcfFallback=$s2SuppressKcfFallbackEnabled " +
+                "s3NearGate=$s3PromotedNearGateEnabled s3FarGate=$s3PromotedFarGateEnabled s3NearAnchorVeto=$s3PromotedNearAnchorVetoEnabled " +
                 "temporalGate=${cfg.temporalGate.highGoodMatches}/${cfg.temporalGate.highInliers}/${fmt(cfg.temporalGate.minConfidenceHighGood)} " +
                 "temporalMedium=${cfg.temporalGate.mediumGoodMatches}/${fmt(cfg.temporalGate.minConfidenceMedium)} " +
                 "temporalLow=${fmt(cfg.temporalGate.minConfidenceSmallRefined)}/${fmt(cfg.temporalGate.minConfidenceBase)} liveRelax=${fmt(cfg.temporalGate.liveConfidenceRelax)} floor=${fmt(cfg.temporalGate.liveConfidenceFloor)} " +
@@ -1689,6 +2047,7 @@ class OpenCVTrackerAnalyzer(
                 "trackGuardJump=${fmt(cfg.trackGuard.maxCenterJumpFactor)} " +
                 "trackGuardArea=${fmt(cfg.trackGuard.minAreaRatio)}/${fmt(cfg.trackGuard.maxAreaRatio)} " +
                 "trackGuardDrop=${cfg.trackGuard.dropStreak} " +
+                "trackGuardAccelGrace=$trackGuardAccelGraceFrames " +
                 "trackGuardAppearInt=${cfg.trackGuard.appearanceCheckIntervalFrames} " +
                 "trackGuardAppearMin=${fmt(cfg.trackGuard.minAppearanceScore)} " +
                 "trackGuardAnchor=$trackGuardAnchorEnabled/${fmt(trackGuardAnchorMaxDrop)}/${fmt(trackGuardAnchorMinScore)} " +
@@ -1746,6 +2105,7 @@ class OpenCVTrackerAnalyzer(
         }
 
         val pendingSources = ArrayList<Mat>(bitmaps.size)
+        val enablePoseAugment = templatePoseAugmentEnabled && bitmaps.size == 1
         try {
             for (bitmap in bitmaps) {
                 val rgba = Mat()
@@ -1754,7 +2114,11 @@ class OpenCVTrackerAnalyzer(
                     Utils.bitmapToMat(bitmap, rgba)
                     Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
                     val normalized = normalizeTemplateSize(gray)
-                    pendingSources += normalized
+                    try {
+                        pendingSources.addAll(buildPoseAugmentedTemplates(normalized, enablePoseAugment))
+                    } finally {
+                        normalized.release()
+                    }
                 } finally {
                     gray.release()
                     rgba.release()
@@ -1769,6 +2133,9 @@ class OpenCVTrackerAnalyzer(
             templateSourceGrays.addAll(pendingSources)
             templateLibrarySize = templateSourceGrays.size
             pendingSources.clear()
+            if (enablePoseAugment && templateLibrarySize > 1) {
+                logDiag("TEMPLATE", "session=$diagSessionId action=pose_augment variants=$templateLibrarySize")
+            }
 
             templateGray?.release()
             templateGray = if (templateSourceGrays.isNotEmpty()) {
@@ -1952,9 +2319,11 @@ class OpenCVTrackerAnalyzer(
         trackingStage = TrackingStage.ACQUIRE
         trackMismatchStreak = 0
         trackAppearanceLowStreak = 0
+        trackAccelGraceFramesRemaining = 0
         consecutiveTrackerFailures = 0
         trackVerifyFailStreak = 0
         trackVerifyHardDriftStreak = 0
+        trackGuardHardMismatch = false
         searchMissStreak = 0
         searchBudgetCooldownFrames = 0
         nativeLowConfidenceStreak = 0
@@ -1962,6 +2331,14 @@ class OpenCVTrackerAnalyzer(
         lockHoldFramesRemaining = 0
         fastFirstLockRemaining = fastFirstLockFrames
         lastNativeAcceptMs = 0L
+        relockSpatialRejectStreak = 0
+        trackAnchorAppearanceScore = Double.NaN
+        lastLostBox = null
+        lastLostFrameId = -1L
+        centerRoiFailEmittedThisSession = false
+        centerRoiFailLatched = false
+        resetCenterRoiSearchState("reset_tracking")
+        resetDescendOffsetState("reset_tracking")
         overlayResetToken++
         clearFirstLockCandidate("reset")
         latestSearchFrame?.release()
@@ -1983,6 +2360,7 @@ class OpenCVTrackerAnalyzer(
         trackingStage = TrackingStage.ACQUIRE
         trackMismatchStreak = 0
         trackAppearanceLowStreak = 0
+        trackAccelGraceFramesRemaining = 0
         activeTrackBackend = TrackBackend.KCF
         nativeLowConfidenceStreak = 0
         nativeFuseWarmupRemaining = 0
@@ -2041,6 +2419,7 @@ class OpenCVTrackerAnalyzer(
         metricsSearchResetIouCount = 0
         metricsSearchResetConfidenceCount = 0
         metricsNativeFuseSoftCount = 0
+        relockSpatialRejectStreak = 0
         metricsNativeFuseHardCount = 0
         metricsNativeLowConfHoldCount = 0
         metricsKalmanPredHoldCount = 0
@@ -2053,6 +2432,10 @@ class OpenCVTrackerAnalyzer(
         metricsNativeSimMin = 1.0
         metricsNativeSimMax = 0.0
         metricsSearchLastReason = "none"
+        centerRoiFailEmittedThisSession = false
+        centerRoiFailLatched = false
+        resetCenterRoiSearchState("session_start")
+        resetDescendOffsetState("session_start")
         Log.w(TAG, "EVAL_EVENT type=SESSION_START reason=$reason session=$diagSessionId")
     }
 
@@ -2226,6 +2609,306 @@ class OpenCVTrackerAnalyzer(
         return true
     }
 
+    private fun isCenterRoiSearchActive(): Boolean {
+        return centerRoiSearchEnabled && centerRoiGpsReady && !centerRoiFailLatched
+    }
+
+    private fun resolveDescendSearchState(): DescendOffsetState {
+        return when (centerRoiLevel) {
+            CenterRoiLevel.L1 -> DescendOffsetState.L1
+            CenterRoiLevel.L2 -> DescendOffsetState.L2
+            CenterRoiLevel.L3 -> DescendOffsetState.L3
+        }
+    }
+
+    private fun resolveDescendTimestampSec(): Double {
+        return currentTimelineMs().toDouble() / 1000.0
+    }
+
+    private fun currentTimelineMs(): Long {
+        if (isReplayInput && currentReplayPtsMs >= 0L) {
+            return currentReplayPtsMs
+        }
+        return SystemClock.elapsedRealtime()
+    }
+
+    private fun resolveDescendOffset(box: Rect): Pair<Double, Double>? {
+        val frameW = currentFrameWidth
+        val frameH = currentFrameHeight
+        if (frameW <= 1 || frameH <= 1) return null
+        val halfW = frameW * 0.5
+        val halfH = frameH * 0.5
+        val centerX = box.x + box.width * 0.5
+        val centerY = box.y + box.height * 0.5
+        val normX = (centerX - halfW) / halfW
+        val normY = (centerY - halfH) / halfH
+        return normX to normY
+    }
+
+    private fun clampDescendValue(
+        value: Double,
+        minValue: Double,
+        maxValue: Double,
+        field: String,
+        state: DescendOffsetState
+    ): Double {
+        if (!value.isFinite()) return Double.NaN
+        val clamped = value.coerceIn(minValue, maxValue)
+        if (clamped != value && frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=DESCEND_CLAMP field=$field state=${state.name} raw=${fmt(value)} clamped=${fmt(clamped)}"
+            )
+        }
+        return clamped
+    }
+
+    private fun shouldEmitDescendOffset(state: DescendOffsetState, nowMs: Long, force: Boolean): Boolean {
+        if (force) return true
+        val changed = descendLastState != state
+        return when (state) {
+            DescendOffsetState.TRACKING -> true
+            DescendOffsetState.L1, DescendOffsetState.L2, DescendOffsetState.L3 ->
+                changed || frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L
+            DescendOffsetState.LOST ->
+                changed || nowMs - descendLastEmitMs >= DESCEND_HEARTBEAT_MS
+            DescendOffsetState.FAIL ->
+                changed
+        }
+    }
+
+    private fun emitDescendOffset(
+        state: DescendOffsetState,
+        box: Rect? = null,
+        confidence: Double? = null,
+        force: Boolean = false
+    ): Boolean {
+        if (!centerRoiGpsReady) return false
+        val nowMs = currentTimelineMs()
+        if (!shouldEmitDescendOffset(state, nowMs, force)) return false
+
+        var x = Double.NaN
+        var y = Double.NaN
+        var conf = Double.NaN
+
+        when (state) {
+            DescendOffsetState.TRACKING -> {
+                val current = box ?: return false
+                val offset = resolveDescendOffset(current) ?: return false
+                x = offset.first
+                y = offset.second
+                conf = (confidence ?: latestPredictionConfidence).coerceIn(0.0, 1.0)
+            }
+            DescendOffsetState.LOST -> {
+                x = descendCacheX
+                y = descendCacheY
+                conf = descendCacheConf
+            }
+            else -> Unit
+        }
+
+        val xOut = clampDescendValue(x, -1.0, 1.0, "x", state)
+        val yOut = clampDescendValue(y, -1.0, 1.0, "y", state)
+        val confOut = clampDescendValue(conf, 0.0, 1.0, "conf", state)
+        if (state == DescendOffsetState.TRACKING) {
+            descendCacheX = xOut
+            descendCacheY = yOut
+            descendCacheConf = confOut
+        }
+
+        Log.w(
+            TAG,
+            "EVAL_EVENT type=DESCEND_OFFSET x=${fmt(xOut)} y=${fmt(yOut)} conf=${fmt(confOut)} " +
+                "state=${state.name} t=${fmt(resolveDescendTimestampSec().coerceAtLeast(0.0))} session=$diagSessionId"
+        )
+        descendLastState = state
+        descendLastEmitMs = nowMs
+        return true
+    }
+
+    private fun emitDescendOffsetPerFrame() {
+        if (!centerRoiGpsReady) return
+        if (centerRoiFailLatched) {
+            emitDescendOffset(DescendOffsetState.FAIL)
+            return
+        }
+        if (isTracking) {
+            descendLostActive = false
+            val trackBox = latestPredictionBox ?: lastTrackedBox ?: lastMeasuredTrackBox
+            emitDescendOffset(
+                state = DescendOffsetState.TRACKING,
+                box = trackBox,
+                confidence = latestPredictionConfidence
+            )
+            return
+        }
+
+        if (descendLostActive) {
+            val lostElapsed = (currentTimelineMs() - descendLostStartMs).coerceAtLeast(0L)
+            if (lostElapsed <= DESCEND_LOST_BUFFER_MS) {
+                emitDescendOffset(DescendOffsetState.LOST)
+                return
+            }
+            descendLostActive = false
+        }
+
+        if (isCenterRoiSearchActive()) {
+            emitDescendOffset(resolveDescendSearchState())
+        }
+    }
+
+    private fun resetDescendOffsetState(reason: String) {
+        descendLastState = null
+        descendLastEmitMs = 0L
+        descendCacheX = Double.NaN
+        descendCacheY = Double.NaN
+        descendCacheConf = Double.NaN
+        descendLostActive = false
+        descendLostStartMs = 0L
+        if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+            Log.w(TAG, "EVAL_EVENT type=DESCEND_STATE state=reset reason=$reason session=$diagSessionId")
+        }
+    }
+
+    private fun resetCenterRoiSearchState(reason: String) {
+        centerRoiLevel = CenterRoiLevel.L1
+        centerRoiLevelStartMs = 0L
+        centerRoiSessionStartMs = 0L
+        centerRoiTimeoutRaised = false
+        centerRoiLastScope = "full"
+        centerRoiL1ElapsedMs = 0L
+        centerRoiL2ElapsedMs = 0L
+        centerRoiL3ElapsedMs = 0L
+        if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=ROI_SEARCH state=reset reason=$reason enabled=$centerRoiSearchEnabled gpsReady=$centerRoiGpsReady"
+            )
+        }
+    }
+
+    private fun maybeTriggerCenterRoiFail(levelElapsedMs: Long, totalElapsedMs: Long) {
+        if (centerRoiFailEmittedThisSession) return
+        if (lockHoldFramesRemaining > 0) return
+        centerRoiL3ElapsedMs = max(centerRoiL3ElapsedMs, levelElapsedMs.coerceAtLeast(0L))
+        centerRoiFailEmittedThisSession = true
+        centerRoiFailLatched = true
+        metricsSearchLastReason = "center_roi_fail_timeout"
+        emitDescendOffset(DescendOffsetState.FAIL, force = true)
+        Log.w(
+            TAG,
+            "EVAL_EVENT type=ROI_SEARCH state=fail reason=l3_timeout " +
+                "l1ms=$centerRoiL1ElapsedMs l2ms=$centerRoiL2ElapsedMs l3ms=$centerRoiL3ElapsedMs totalElapsedMs=$totalElapsedMs"
+        )
+        resetCenterRoiSearchState("fail_timeout")
+    }
+
+    private fun maybeAdvanceCenterRoiLevel(nowMs: Long) {
+        if (!isCenterRoiSearchActive()) return
+        if (centerRoiSessionStartMs <= 0L) {
+            centerRoiSessionStartMs = nowMs
+            centerRoiLevelStartMs = nowMs
+            centerRoiLevel = CenterRoiLevel.L1
+            centerRoiTimeoutRaised = false
+            centerRoiL1ElapsedMs = 0L
+            centerRoiL2ElapsedMs = 0L
+            centerRoiL3ElapsedMs = 0L
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=ROI_SEARCH state=start level=l1 l1Range=${fmt(centerRoiL1Range)} l2Range=${fmt(centerRoiL2Range)} " +
+                    "timeoutMs=${centerRoiL1TimeoutMs}/${centerRoiL2TimeoutMs}/${centerRoiL3TimeoutMs}"
+            )
+            return
+        }
+        val levelElapsed = (nowMs - centerRoiLevelStartMs).coerceAtLeast(0L)
+        when (centerRoiLevel) {
+            CenterRoiLevel.L1 -> {
+                if (levelElapsed >= centerRoiL1TimeoutMs) {
+                    centerRoiL1ElapsedMs = levelElapsed
+                    centerRoiLevel = CenterRoiLevel.L2
+                    centerRoiLevelStartMs = nowMs
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=ROI_SEARCH state=escalate from=l1 to=l2 elapsedMs=$levelElapsed"
+                    )
+                }
+            }
+            CenterRoiLevel.L2 -> {
+                if (levelElapsed >= centerRoiL2TimeoutMs) {
+                    centerRoiL2ElapsedMs = levelElapsed
+                    centerRoiLevel = CenterRoiLevel.L3
+                    centerRoiLevelStartMs = nowMs
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=ROI_SEARCH state=escalate from=l2 to=l3 elapsedMs=$levelElapsed"
+                    )
+                }
+            }
+            CenterRoiLevel.L3 -> {
+                centerRoiL3ElapsedMs = max(centerRoiL3ElapsedMs, levelElapsed)
+                if (!centerRoiTimeoutRaised && levelElapsed >= centerRoiL3TimeoutMs) {
+                    centerRoiTimeoutRaised = true
+                    val totalElapsed = (nowMs - centerRoiSessionStartMs).coerceAtLeast(0L)
+                    metricsSearchLastReason = "center_roi_timeout"
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=ROI_SEARCH state=timeout level=l3 levelElapsedMs=$levelElapsed totalElapsedMs=$totalElapsed"
+                    )
+                    maybeTriggerCenterRoiFail(levelElapsedMs = levelElapsed, totalElapsedMs = totalElapsed)
+                }
+            }
+        }
+    }
+
+    private fun buildCenterRoiRect(frameW: Int, frameH: Int, centerRange: Double): Rect? {
+        val safeRange = centerRange.coerceIn(0.05, 0.49)
+        val left = (frameW * (0.5 - safeRange)).roundToInt()
+        val top = (frameH * (0.5 - safeRange)).roundToInt()
+        val width = (frameW * safeRange * 2.0).roundToInt().coerceAtLeast(MIN_BOX_DIM)
+        val height = (frameH * safeRange * 2.0).roundToInt().coerceAtLeast(MIN_BOX_DIM)
+        return clampRect(Rect(left, top, width, height), frameW, frameH)
+    }
+
+    private fun findOrbMatchForAcquire(frame: Mat): OrbMatchCandidate? {
+        centerRoiLastScope = "full"
+        if (!isCenterRoiSearchActive()) {
+            return findOrbMatch(frame)
+        }
+        val timelineNowMs = currentTimelineMs()
+        maybeAdvanceCenterRoiLevel(timelineNowMs)
+        return when (centerRoiLevel) {
+            CenterRoiLevel.L1 -> {
+                centerRoiLastScope = "l1"
+                val roi = buildCenterRoiRect(frame.cols(), frame.rows(), centerRoiL1Range)
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L && roi != null) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=ROI_SEARCH state=scan level=l1 roi=${roi.x},${roi.y},${roi.width}x${roi.height}"
+                    )
+                }
+                roi?.let { findOrbMatchInRoi(frame, it) }
+            }
+            CenterRoiLevel.L2 -> {
+                centerRoiLastScope = "l2"
+                val roi = buildCenterRoiRect(frame.cols(), frame.rows(), centerRoiL2Range)
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L && roi != null) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=ROI_SEARCH state=scan level=l2 roi=${roi.x},${roi.y},${roi.width}x${roi.height}"
+                    )
+                }
+                roi?.let { findOrbMatchInRoi(frame, it) }
+            }
+            CenterRoiLevel.L3 -> {
+                centerRoiLastScope = "l3"
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                    Log.w(TAG, "EVAL_EVENT type=ROI_SEARCH state=scan level=l3 roi=full")
+                }
+                findOrbMatch(frame)
+            }
+        }
+    }
+
     private fun searchFrameByOrb(frame: Mat, image: ImageProxy? = null) {
         val templateReady = templatePyramidLevels.isNotEmpty()
         if (!templateReady) {
@@ -2249,10 +2932,15 @@ class OpenCVTrackerAnalyzer(
         }
         lastTemplateReadyState = true
 
-        val candidate = findOrbMatch(frame)
+        val candidate = findOrbMatchForAcquire(frame)
         if (candidate == null) {
             metricsSearchMissCount++
-            metricsSearchLastReason = lastSearchDiagReason
+            metricsSearchLastReason =
+                if (isCenterRoiSearchActive()) {
+                    "roi_${centerRoiLastScope}_${lastSearchDiagReason}"
+                } else {
+                    lastSearchDiagReason
+                }
             if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
                 logDiag(
                     "SEARCH",
@@ -2265,7 +2953,20 @@ class OpenCVTrackerAnalyzer(
             return
         }
         metricsSearchCandidateCount++
-        metricsSearchLastReason = "candidate"
+        metricsSearchLastReason =
+            if (isCenterRoiSearchActive()) {
+                "candidate_roi_${centerRoiLastScope}"
+            } else {
+                "candidate"
+            }
+        if (isCenterRoiSearchActive()) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=ROI_SEARCH state=hit level=$centerRoiLastScope " +
+                    "box=${candidate.box.x},${candidate.box.y},${candidate.box.width}x${candidate.box.height} " +
+                    "good=${candidate.goodMatches} inliers=${candidate.inlierCount} conf=${fmt(candidate.confidence)}"
+            )
+        }
         val confirmed = maybeRefineFallbackCandidate(frame, candidate)
         if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
             logDiag(
@@ -2340,17 +3041,43 @@ class OpenCVTrackerAnalyzer(
                 clearFirstLockCandidate("promoted_not_lockable")
                 return
             }
-            if (!passesAutoInitVerification(frame, promoted)) {
+            val s3Enabled = s3PromotedNearGateEnabled || s3PromotedFarGateEnabled
+            val promotedTier =
+                if (s3Enabled) classifyPromotedRelockTier(frame, promoted) else PromotedRelockTier.NONE
+            if (
+                s3PromotedFarGateEnabled &&
+                promotedTier == PromotedRelockTier.FAR &&
+                !passesPromotedFarRelockGate(frame, promoted)
+            ) {
+                metricsSearchPromoteRejectCount++
+                metricsSearchLastReason = "promoted_far_gate_reject"
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=promoted_far_gate_reject " +
+                            "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
+                    )
+                }
+                searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
+                clearFirstLockCandidate("promoted_far_gate_reject")
+                return
+            }
+            var promotedVerified = passesAutoInitVerification(frame, promoted)
+            if (!promotedVerified && s3PromotedNearGateEnabled && promotedTier == PromotedRelockTier.NEAR) {
+                promotedVerified = passesPromotedNearRelockOverride(frame, promoted)
+            }
+            if (!promotedVerified) {
                 logDiag(
                     "LOCK_GATE",
-                    "session=$diagSessionId stage=promoted_verify pass=false good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
+                    "session=$diagSessionId stage=promoted_verify pass=false tier=${promotedTier.name.lowercase(Locale.US)} " +
+                        "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
                 )
                 metricsSearchPromoteRejectCount++
                 metricsSearchLastReason = "promoted_verify_reject"
                 if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
                     Log.w(
                         TAG,
-                        "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=promoted_verify_reject " +
+                        "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=promoted_verify_reject tier=${promotedTier.name.lowercase(Locale.US)} " +
                             "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
                     )
                 }
@@ -2363,14 +3090,16 @@ class OpenCVTrackerAnalyzer(
             metricsSearchLastReason = "lock_init"
             logDiag(
                 "LOCK_GATE",
-                "session=$diagSessionId stage=promote pass=true good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
+                "session=$diagSessionId stage=promote pass=true tier=${promotedTier.name.lowercase(Locale.US)} " +
+                    "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
             )
             initializeTracker(
                 frame,
                 promoted.box,
                 "orb_temporal_confirm good=${promoted.goodMatches} inliers=${promoted.inlierCount} " +
                     "conf=${fmt(promoted.confidence)} h=${promoted.usedHomography} ds=${fmt(promoted.searchScale)} " +
-                    "fallback=${promoted.fallbackReason ?: "none"} matcher=${promoted.matcherType}",
+                    "fallback=${promoted.fallbackReason ?: "none"} matcher=${promoted.matcherType} " +
+                    "tier=${promotedTier.name.lowercase(Locale.US)}",
                 image
             )
         }
@@ -2510,8 +3239,21 @@ class OpenCVTrackerAnalyzer(
             return
         }
 
+        if (!passesNativeSpatialGate(safe, nativeGateConfidence, source = "native_mat")) {
+            metricsSearchLastReason = "native_spatial_gate_fail"
+            consecutiveTrackerFailures++
+            if (consecutiveTrackerFailures < nativeCfg.maxFailStreak) {
+                suppressOverlayOnUncertainTracking("native_spatial_gate_fail", nativeGateConfidence)
+                return
+            }
+            if (holdCurrentBoxOnTransientLoss("native_spatial_gate_fail", nativeGateConfidence)) return
+            onLost("native_spatial_gate_fail")
+            return
+        }
+
         consecutiveTrackerFailures = 0
         if (shouldDropOnTrackGuard(frame, safe, nativeGateConfidence)) {
+            if (holdCurrentBoxOnTransientLoss("track_guard_fail", nativeGateConfidence)) return
             onLost("track_guard_fail")
             return
         }
@@ -2620,7 +3362,20 @@ class OpenCVTrackerAnalyzer(
             return
         }
 
+        if (!passesNativeSpatialGate(safe, nativeGateConfidence, source = "native_img")) {
+            metricsSearchLastReason = "native_spatial_gate_fail"
+            consecutiveTrackerFailures++
+            if (consecutiveTrackerFailures < nativeCfg.maxFailStreak) {
+                suppressOverlayOnUncertainTracking("native_spatial_gate_fail", nativeGateConfidence)
+                return
+            }
+            if (holdCurrentBoxOnTransientLoss("native_spatial_gate_fail", nativeGateConfidence)) return
+            onLost("native_spatial_gate_fail")
+            return
+        }
+
         if (shouldDropOnTrackGuard(null, safe, nativeGateConfidence)) {
+            if (holdCurrentBoxOnTransientLoss("track_guard_fail", nativeGateConfidence)) return
             onLost("track_guard_fail")
             return
         }
@@ -2665,18 +3420,46 @@ class OpenCVTrackerAnalyzer(
     }
 
 
-    private fun evaluateTrackBoxConsistency(current: Rect, previous: Rect?, cfg: TrackGuardConfig): Boolean {
+    private fun evaluateTrackBoxConsistency(
+        current: Rect,
+        previous: Rect?,
+        cfg: TrackGuardConfig,
+        confidence: Double
+    ): Boolean {
         val prev = previous ?: return true
         val currCenter = rectCenter(current)
         val prevCenter = rectCenter(prev)
         val jump = pointDistance(currCenter, prevCenter)
         val ref = max(min(prev.width, prev.height), min(current.width, current.height)).toDouble().coerceAtLeast(1.0)
-        val maxJump = ref * cfg.maxCenterJumpFactor
+        val accelRelaxEligible =
+            activeTrackBackend != TrackBackend.KCF &&
+                confidence >= max(trackVerifyNativeBypassConfidence, TRACK_GUARD_ACCEL_CONF_MIN) &&
+                trackMismatchStreak <= 1 &&
+                trackAppearanceLowStreak == 0
+        val jumpFactor =
+            if (accelRelaxEligible) {
+                cfg.maxCenterJumpFactor * TRACK_GUARD_ACCEL_JUMP_BOOST
+            } else {
+                cfg.maxCenterJumpFactor
+            }
+        val maxJump = ref * jumpFactor
 
         val prevArea = (prev.width.toDouble() * prev.height.toDouble()).coerceAtLeast(1.0)
         val currArea = (current.width.toDouble() * current.height.toDouble()).coerceAtLeast(1.0)
         val areaRatio = currArea / prevArea
-        val areaOk = areaRatio in cfg.minAreaRatio..cfg.maxAreaRatio
+        val minAreaRatio =
+            if (accelRelaxEligible) {
+                (cfg.minAreaRatio * TRACK_GUARD_ACCEL_AREA_MIN_SCALE).coerceAtLeast(0.10)
+            } else {
+                cfg.minAreaRatio
+            }
+        val maxAreaRatio =
+            if (accelRelaxEligible) {
+                (cfg.maxAreaRatio * TRACK_GUARD_ACCEL_AREA_MAX_SCALE).coerceAtMost(12.0)
+            } else {
+                cfg.maxAreaRatio
+            }
+        val areaOk = areaRatio in minAreaRatio..maxAreaRatio
         return jump <= maxJump && areaOk
     }
 
@@ -2688,29 +3471,122 @@ class OpenCVTrackerAnalyzer(
         return (similarity * 0.70 + confidence * 0.30).coerceIn(0.0, 1.0)
     }
 
+    private fun passesNativeSpatialGate(current: Rect, confidence: Double, source: String): Boolean {
+        if (!spatialGateEnabled) return true
+
+        val kalmanPrior = latestKalmanPrediction
+        val priorBox = kalmanPrior ?: lastMeasuredTrackBox ?: return true
+        val prior = SpatialPrior(priorBox, if (kalmanPrior != null) "kalman" else "last_measured")
+        val spatial = evaluateSpatialGate(current, prior) ?: return true
+        val appearanceScore = confidence.coerceIn(0.0, 1.0)
+        val fusionScore = computeDeepSortFusionScore(appearanceScore, spatial.score)
+        val minScore =
+            if (!isReplayInput) {
+                spatialGateRelockMinScoreLive
+            } else {
+                spatialGateRelockMinScoreReplay
+            }
+        val mahalMax =
+            if (!isReplayInput) {
+                NATIVE_SPATIAL_MAHAL_MAX_LIVE
+            } else {
+                NATIVE_SPATIAL_MAHAL_MAX_REPLAY
+            }
+        val fusionMin =
+            if (!isReplayInput) {
+                NATIVE_SPATIAL_FUSION_MIN_LIVE
+            } else {
+                NATIVE_SPATIAL_FUSION_MIN_REPLAY
+            }
+        val bypassFusion =
+            appearanceScore >= spatialGateRelockBypassConf &&
+                appearanceScore >= spatialGateRelockBypassAppearance
+        val passMahal = spatial.distance2 <= mahalMax
+        val passSpatial = spatial.score >= minScore
+        val passFusion = fusionScore >= fusionMin
+        val pass = passMahal && (passSpatial || passFusion || bypassFusion)
+        if (!pass) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=NATIVE_SPATIAL_GATE state=reject src=$source " +
+                    "score=${fmt(spatial.score)} min=${fmt(minScore)} d2=${fmt(spatial.distance2)} " +
+                    "mahalMax=${fmt(mahalMax)} fusion=${fmt(fusionScore)} fusionMin=${fmt(fusionMin)} " +
+                    "conf=${fmt(confidence)} bypass=$bypassFusion prior=${spatial.source} " +
+                    "box=${current.x},${current.y},${current.width}x${current.height}"
+            )
+        }
+        return pass
+    }
+
+    private fun computeDeepSortFusionScore(appearanceScore: Double, spatialScore: Double): Double {
+        val spatialWeight = spatialGateWeight.coerceIn(0.05, 0.90)
+        val alpha = (1.0 - spatialWeight).coerceIn(0.10, 0.95)
+        return (alpha * appearanceScore + (1.0 - alpha) * spatialScore).coerceIn(0.0, 1.0)
+    }
+
     private fun isNativeGapPassthroughActive(): Boolean {
         return nativeGapPassthrough && activeTrackBackend != TrackBackend.KCF
     }
 
     private fun shouldDropOnTrackGuard(frame: Mat?, current: Rect, confidence: Double): Boolean {
         if (isNativeGapPassthroughActive()) return false
+        trackGuardHardMismatch = false
         val guardCfg = heuristicConfig.trackGuard
         val prev = lastMeasuredTrackBox
         val smallTargetForGuard =
             frame != null &&
                 isSmallTargetForExtraVerify(current = current, frameW = frame.cols(), frameH = frame.rows())
-        val geomOk = evaluateTrackBoxConsistency(current, prev, guardCfg)
+        val prevCenter = prev?.let { rectCenter(it) }
+        val currCenter = rectCenter(current)
+        val jumpDistance = if (prevCenter == null) 0.0 else pointDistance(currCenter, prevCenter)
+        val refSide =
+            if (prev == null) {
+                1.0
+            } else {
+                max(min(prev.width, prev.height), min(current.width, current.height)).toDouble().coerceAtLeast(1.0)
+            }
+        val guardMaxJump = refSide * guardCfg.maxCenterJumpFactor
+        val prevArea = prev?.let { (it.width.toDouble() * it.height.toDouble()).coerceAtLeast(1.0) } ?: 1.0
+        val currArea = (current.width.toDouble() * current.height.toDouble()).coerceAtLeast(1.0)
+        val areaRatio = currArea / prevArea
+        val geomOk = evaluateTrackBoxConsistency(current, prev, guardCfg, confidence)
+        val accelSpikeCandidate =
+            !geomOk &&
+                !smallTargetForGuard &&
+                prev != null &&
+                activeTrackBackend != TrackBackend.KCF &&
+                confidence >= max(trackVerifyNativeBypassConfidence, TRACK_GUARD_ACCEL_CONF_MIN) &&
+                trackAppearanceLowStreak == 0 &&
+                !trackGuardHardMismatch &&
+                jumpDistance > guardMaxJump &&
+                jumpDistance <= guardMaxJump * TRACK_GUARD_ACCEL_SPIKE_JUMP_RATIO &&
+                areaRatio in
+                ((guardCfg.minAreaRatio * TRACK_GUARD_ACCEL_SPIKE_AREA_MIN_SCALE).coerceAtLeast(0.08))..
+                ((guardCfg.maxAreaRatio * TRACK_GUARD_ACCEL_SPIKE_AREA_MAX_SCALE).coerceAtMost(16.0))
         if (!geomOk) {
-            trackMismatchStreak = (trackMismatchStreak + 1).coerceAtMost(1000)
+            if (accelSpikeCandidate && trackGuardAccelGraceFrames > 0) {
+                trackAccelGraceFramesRemaining = max(trackAccelGraceFramesRemaining, trackGuardAccelGraceFrames)
+                trackMismatchStreak = (trackMismatchStreak - 1).coerceAtLeast(0)
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                    logDiag(
+                        "TRACK",
+                        "session=$diagSessionId stage=track_guard reason=accel_spike_grace " +
+                            "conf=${fmt(confidence)} jump=${fmt(jumpDistance)} maxJump=${fmt(guardMaxJump)} " +
+                            "area=${fmt(areaRatio)} grace=$trackAccelGraceFramesRemaining"
+                    )
+                }
+            } else {
+                trackMismatchStreak = (trackMismatchStreak + 1).coerceAtMost(1000)
+            }
             if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
-                val jump = if (prev == null) 0.0 else pointDistance(rectCenter(current), rectCenter(prev))
                 logDiag(
                     "TRACK",
-                    "session=$diagSessionId stage=track_guard reason=geom_fail streak=$trackMismatchStreak conf=${fmt(confidence)} jump=${fmt(jump)}"
+                    "session=$diagSessionId stage=track_guard reason=geom_fail streak=$trackMismatchStreak conf=${fmt(confidence)} jump=${fmt(jumpDistance)}"
                 )
             }
         } else {
             trackMismatchStreak = 0
+            trackAccelGraceFramesRemaining = 0
         }
 
         val shouldCheckAppearance =
@@ -2740,11 +3616,19 @@ class OpenCVTrackerAnalyzer(
             val minAllowedScore = max(guardCfg.minAppearanceScore, anchorMinScore)
             if (score < minAllowedScore) {
                 trackAppearanceLowStreak = (trackAppearanceLowStreak + 1).coerceAtMost(1000)
+                val hardMismatch =
+                    anchorScore.isFinite() &&
+                        score <= anchorMinScore - TRACK_GUARD_HARD_APPEAR_MARGIN &&
+                        confidence >= TRACK_GUARD_HARD_APPEAR_CONF_MIN
+                if (hardMismatch) {
+                    trackGuardHardMismatch = true
+                }
                 if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
                     logDiag(
                         "TRACK",
                         "session=$diagSessionId stage=track_guard reason=appearance_fail streak=$trackAppearanceLowStreak conf=${fmt(confidence)} " +
-                            "score=${fmt(score)} min=${fmt(minAllowedScore)} anchor=${fmt(anchorScore)} smallTarget=$smallTargetForGuard"
+                            "score=${fmt(score)} min=${fmt(minAllowedScore)} anchor=${fmt(anchorScore)} smallTarget=$smallTargetForGuard " +
+                            "hardMismatch=$hardMismatch"
                     )
                 }
             } else {
@@ -2756,7 +3640,39 @@ class OpenCVTrackerAnalyzer(
         if (activeTrackBackend != TrackBackend.KCF && confidence >= trackVerifyNativeBypassConfidence) {
             requiredDropStreak = max(requiredDropStreak, 2)
         }
-        return trackMismatchStreak >= requiredDropStreak || trackAppearanceLowStreak >= requiredDropStreak
+        if (
+            activeTrackBackend != TrackBackend.KCF &&
+            confidence >= max(trackVerifyNativeBypassConfidence, TRACK_GUARD_ACCEL_CONF_MIN) &&
+            trackAppearanceLowStreak == 0
+        ) {
+            requiredDropStreak = max(requiredDropStreak, TRACK_GUARD_ACCEL_DROP_STREAK_MIN)
+        }
+        var requiredAppearanceDropStreak = requiredDropStreak
+        // Small-target identity is more fragile: when appearance keeps failing,
+        // drop faster to avoid latching onto adjacent look-alike objects.
+        if (smallTargetForGuard && trackGuardAnchorEnabled) {
+            requiredAppearanceDropStreak = min(requiredDropStreak, 2)
+        }
+        if (trackGuardHardMismatch) {
+            requiredAppearanceDropStreak = 1
+        }
+        if (
+            trackAccelGraceFramesRemaining > 0 &&
+            trackAppearanceLowStreak == 0 &&
+            !trackGuardHardMismatch &&
+            !smallTargetForGuard
+        ) {
+            trackAccelGraceFramesRemaining = (trackAccelGraceFramesRemaining - 1).coerceAtLeast(0)
+            if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=TRACK_GUARD_GRACE remain=$trackAccelGraceFramesRemaining " +
+                        "streak=$trackMismatchStreak conf=${fmt(confidence)}"
+                )
+            }
+            return false
+        }
+        return trackMismatchStreak >= requiredDropStreak || trackAppearanceLowStreak >= requiredAppearanceDropStreak
     }
 
     private fun evaluateNativeConfidence(confidence: Double): NativeConfidenceAction {
@@ -2868,12 +3784,31 @@ class OpenCVTrackerAnalyzer(
     private fun holdCurrentBoxOnTransientLoss(reason: String, confidence: Double): Boolean {
         if (!isTracking) return false
         if (lockHoldFramesRemaining <= 0) return false
+        if (
+            reason == "track_guard_fail" &&
+            (
+                !isReplayInput ||
+                    trackGuardHardMismatch ||
+                    trackAppearanceLowStreak >= 2 ||
+                    trackMismatchStreak >= 3
+                )
+        ) {
+            if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=LOSS_GRACE state=skip reason=track_guard_release " +
+                        "hard=$trackGuardHardMismatch appStreak=$trackAppearanceLowStreak geomStreak=$trackMismatchStreak"
+                )
+            }
+            return false
+        }
         val box = lastMeasuredTrackBox ?: lastTrackedBox ?: return false
         val eligible =
             reason.startsWith("verify_") ||
                 reason.startsWith("native_conf_") ||
                 reason == "native_track_fail" ||
                 reason == "native_invalid_box" ||
+                reason == "track_guard_fail" ||
                 reason.startsWith("kcf_")
         if (!eligible) return false
 
@@ -2899,28 +3834,51 @@ class OpenCVTrackerAnalyzer(
 
     private fun onLost(reason: String) {
         logDiag("TRACK", "session=$diagSessionId action=lost_enter reason=$reason")
+        val priorLost = lastMeasuredTrackBox ?: lastTrackedBox
         releaseTracker("lost_$reason", requestGc = true)
         consecutiveTrackerFailures = 0
         trackVerifyFailStreak = 0
         trackVerifyHardDriftStreak = 0
+        trackGuardHardMismatch = false
         searchBudgetCooldownFrames = 0
         nativeLowConfidenceStreak = 0
         nativeFuseWarmupRemaining = 0
         lockHoldFramesRemaining = 0
+        trackAccelGraceFramesRemaining = 0
+        relockSpatialRejectStreak = 0
+        val fastReacquireBoost =
+            when {
+                reason.contains("track_guard") || reason.contains("native_conf") -> {
+                    max(48, fastFirstLockFrames)
+                }
+                else -> max(32, fastFirstLockFrames / 2)
+            }
+        fastFirstLockRemaining = max(fastFirstLockRemaining, fastReacquireBoost.coerceIn(0, 480))
         lastNativeAcceptMs = 0L
+        lastLostBox = priorLost?.let { Rect(it.x, it.y, it.width, it.height) }
+        lastLostFrameId = frameCounter
         lastTrackedBox = null
         lastMeasuredTrackBox = null
         trackingStage = TrackingStage.ACQUIRE
         trackMismatchStreak = 0
         trackAppearanceLowStreak = 0
-        trackAnchorAppearanceScore = Double.NaN
+        trackGuardHardMismatch = false
         metricsLostCount++
         clearFirstLockCandidate("lost")
+        resetCenterRoiSearchState("lost")
         latestSearchFrame?.release()
         latestSearchFrame = null
         resetKalman("lost_$reason")
         updateLatestPrediction(null, 0.0, tracking = false)
-        Log.w(TAG, "EVAL_EVENT type=LOST reason=$reason lost=$metricsLostCount")
+        descendLostActive = true
+        descendLostStartMs = currentTimelineMs()
+        Log.w(
+            TAG,
+                "EVAL_EVENT type=LOST reason=$reason lost=$metricsLostCount " +
+                "backend=${activeTrackBackend.name.lowercase(Locale.US)} " +
+                "replayPtsSec=${fmt(if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0)} " +
+                "lastBox=${priorLost?.let { "${it.x},${it.y},${it.width}x${it.height}" } ?: "none"}"
+        )
         logDiag("TRACK", "session=$diagSessionId action=lost reason=$reason lost=$metricsLostCount")
         val token = ++overlayResetToken
         if (lostOverlayHoldMs <= 0L) {
@@ -2939,7 +3897,21 @@ class OpenCVTrackerAnalyzer(
 
     private fun initializeTracker(frame: Mat, box: Rect, reason: String, image: ImageProxy? = null) {
         val safe = clampRect(box, frame.cols(), frame.rows()) ?: return
-        trackAnchorAppearanceScore = computePatchTemplateCorrelation(frame, safe).coerceIn(-1.0, 1.0)
+        val currentAnchorScore = computePatchTemplateCorrelation(frame, safe).coerceIn(-1.0, 1.0)
+        val prevAnchorScore = trackAnchorAppearanceScore
+        trackAnchorAppearanceScore =
+            if (!trackGuardAnchorEnabled || !prevAnchorScore.isFinite()) {
+                currentAnchorScore
+            } else {
+                // Keep anchor identity stable across re-locks: only adapt when the
+                // new patch is still close to the existing anchor.
+                val allowUpdateMin = prevAnchorScore - trackGuardAnchorMaxDrop
+                if (currentAnchorScore >= allowUpdateMin) {
+                    (prevAnchorScore * 0.90 + currentAnchorScore * 0.10).coerceIn(-1.0, 1.0)
+                } else {
+                    prevAnchorScore
+                }
+            }
         val wasTracking = isTracking
         latestSearchFrame?.release()
         latestSearchFrame = null
@@ -2953,9 +3925,11 @@ class OpenCVTrackerAnalyzer(
                 isTracking = true
                 trackingStage = TrackingStage.TRACK
                 activeTrackBackend = preferredTrackBackend
+                relockSpatialRejectStreak = 0
                 consecutiveTrackerFailures = 0
                 trackMismatchStreak = 0
                 trackAppearanceLowStreak = 0
+                trackAccelGraceFramesRemaining = 0
                 trackVerifyFailStreak = 0
                 trackVerifyHardDriftStreak = 0
                 searchMissStreak = 0
@@ -2964,6 +3938,8 @@ class OpenCVTrackerAnalyzer(
                 nativeFuseWarmupRemaining = heuristicConfig.nativeGate.fuseWarmupFrames
                 lockHoldFramesRemaining = lockHoldFrames
                 fastFirstLockRemaining = 0
+                resetCenterRoiSearchState("lock")
+                descendLostActive = false
                 overlayResetToken++
                 commitTrackingObservation(safe, confidence = 1.0, markNativeAccept = true)
                 if (!wasTracking) {
@@ -2980,7 +3956,9 @@ class OpenCVTrackerAnalyzer(
                         "EVAL_EVENT type=LOCK reason=$reason backend=${activeTrackBackend.name.lowercase(Locale.US)} " +
                             "locks=$metricsLockCount firstLockSec=${fmt(metricsFirstLockMs.toDouble() / 1000.0)} " +
                             "firstLockReplaySec=${fmt(if (metricsFirstLockReplayMs >= 0L) metricsFirstLockReplayMs.toDouble() / 1000.0 else -1.0)} " +
-                            "firstLockFrame=$metricsFirstLockFrame"
+                            "firstLockFrame=$metricsFirstLockFrame " +
+                            "replayPtsSec=${fmt(if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0)} " +
+                            "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
                     )
                 }
                 Log.i(TAG, "Native tracker initialized ($reason): ${safe.x},${safe.y},${safe.width}x${safe.height}")
@@ -2991,6 +3969,17 @@ class OpenCVTrackerAnalyzer(
                 return
             }
             Log.w(TAG, "EVAL_EVENT type=TRACKER_FALLBACK reason=native_init_failed backend=${preferredTrackBackend.name.lowercase(Locale.US)}")
+            if (shouldSuppressKcfFallback(reason)) {
+                val framesAgo = framesSinceLastLost()
+                metricsSearchLastReason = "native_init_retry_no_kcf"
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=TRACKER_FALLBACK reason=native_init_retry_no_kcf " +
+                        "backend=${preferredTrackBackend.name.lowercase(Locale.US)} " +
+                        "lostFrames=$framesAgo initReason=$reason"
+                )
+                return
+            }
         }
 
         val freshTracker = runCatching {
@@ -3007,9 +3996,11 @@ class OpenCVTrackerAnalyzer(
         isTracking = true
         trackingStage = TrackingStage.TRACK
         activeTrackBackend = TrackBackend.KCF
+        relockSpatialRejectStreak = 0
         consecutiveTrackerFailures = 0
         trackMismatchStreak = 0
         trackAppearanceLowStreak = 0
+        trackAccelGraceFramesRemaining = 0
         trackVerifyFailStreak = 0
         trackVerifyHardDriftStreak = 0
         searchMissStreak = 0
@@ -3019,6 +4010,8 @@ class OpenCVTrackerAnalyzer(
         lockHoldFramesRemaining = lockHoldFrames
         lastNativeAcceptMs = 0L
         fastFirstLockRemaining = 0
+        resetCenterRoiSearchState("lock")
+        descendLostActive = false
         overlayResetToken++
         commitTrackingObservation(safe, confidence = 1.0, markNativeAccept = false)
 
@@ -3036,7 +4029,9 @@ class OpenCVTrackerAnalyzer(
                 "EVAL_EVENT type=LOCK reason=$reason backend=${activeTrackBackend.name.lowercase(Locale.US)} " +
                     "locks=$metricsLockCount firstLockSec=${fmt(metricsFirstLockMs.toDouble() / 1000.0)} " +
                     "firstLockReplaySec=${fmt(if (metricsFirstLockReplayMs >= 0L) metricsFirstLockReplayMs.toDouble() / 1000.0 else -1.0)} " +
-                    "firstLockFrame=$metricsFirstLockFrame"
+                    "firstLockFrame=$metricsFirstLockFrame " +
+                    "replayPtsSec=${fmt(if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0)} " +
+                    "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
             )
         }
 
@@ -3117,12 +4112,80 @@ class OpenCVTrackerAnalyzer(
             return null
         }
 
+        val trackedAppearance = computePatchTemplateCorrelation(frame, trackedBox)
+        val anchorScore = trackAnchorAppearanceScore
+        val bypassBlockedByAppearance =
+            anchorScore.isFinite() &&
+                trackedAppearance < anchorScore - TRACK_VERIFY_BYPASS_ANCHOR_MARGIN
+        val currentConfidence = (currentTrackConfidence ?: 0.0).coerceIn(0.0, 1.0)
+        val prevMeasured = lastMeasuredTrackBox
+        val motionJump =
+            if (prevMeasured == null) {
+                0.0
+            } else {
+                pointDistance(rectCenter(trackedBox), rectCenter(prevMeasured))
+            }
+        val motionRef =
+            if (prevMeasured == null) {
+                1.0
+            } else {
+                max(min(prevMeasured.width, prevMeasured.height), min(trackedBox.width, trackedBox.height))
+                    .toDouble()
+                    .coerceAtLeast(1.0)
+            }
+        val accelVerifyRelaxed =
+            activeTrackBackend != TrackBackend.KCF &&
+                !bypassBlockedByAppearance &&
+                trackAppearanceLowStreak == 0 &&
+                !trackGuardHardMismatch &&
+                currentConfidence >= (verifyCfg.nativeBypassConfidence - TRACK_VERIFY_ACCEL_CONF_RELAX).coerceAtLeast(0.0) &&
+                (
+                    motionJump >= motionRef * TRACK_VERIFY_ACCEL_MOTION_RATIO ||
+                        motionJump >= verifyCfg.recenterPx
+                    )
+        val effectiveRecenterPx =
+            if (accelVerifyRelaxed) {
+                verifyCfg.recenterPx * TRACK_VERIFY_ACCEL_RECENTER_BOOST
+            } else {
+                verifyCfg.recenterPx
+            }
+        val effectiveMinIou =
+            if (accelVerifyRelaxed) {
+                (verifyCfg.minIou - TRACK_VERIFY_ACCEL_MIN_IOU_RELAX).coerceAtLeast(0.05)
+            } else {
+                verifyCfg.minIou
+            }
+        val effectiveFailTolerance =
+            if (accelVerifyRelaxed) {
+                (verifyCfg.failTolerance + TRACK_VERIFY_ACCEL_FAIL_TOL_BONUS).coerceAtMost(12)
+            } else {
+                verifyCfg.failTolerance
+            }
+        val effectiveHardTolerance =
+            if (accelVerifyRelaxed) {
+                (verifyCfg.hardDriftTolerance + TRACK_VERIFY_ACCEL_HARD_TOL_BONUS).coerceAtMost(8)
+            } else {
+                verifyCfg.hardDriftTolerance
+            }
+
         if (activeTrackBackend != TrackBackend.KCF) {
             // NCNN warm-up is sensitive to ORB false negatives; avoid immediate drift drop.
             if (nativeFuseWarmupRemaining > 0) return null
-            if ((currentTrackConfidence ?: 0.0) >= verifyCfg.nativeBypassConfidence) {
+            if (currentConfidence >= verifyCfg.nativeBypassConfidence && !bypassBlockedByAppearance) {
                 trackVerifyFailStreak = 0
                 trackVerifyHardDriftStreak = 0
+                return null
+            }
+            if (accelVerifyRelaxed) {
+                trackVerifyFailStreak = 0
+                trackVerifyHardDriftStreak = 0
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=TRACK_VERIFY state=accel_bypass jump=${fmt(motionJump)} ref=${fmt(motionRef)} " +
+                            "conf=${fmt(currentConfidence)} recenter=${fmt(effectiveRecenterPx)} iou=${fmt(effectiveMinIou)}"
+                    )
+                }
                 return null
             }
         }
@@ -3142,7 +4205,7 @@ class OpenCVTrackerAnalyzer(
         if (localCandidate != null && localHealthy) {
             val shift = pointDistance(rectCenter(trackedBox), rectCenter(localCandidate.box))
             val iou = rectIou(trackedBox, localCandidate.box)
-            val shouldRealign = shift > verifyCfg.recenterPx || iou < verifyCfg.minIou
+            val shouldRealign = shift > effectiveRecenterPx || iou < effectiveMinIou
             trackVerifyHardDriftStreak = 0
             if (shouldRealign) {
                 trackVerifyFailStreak = 0
@@ -3157,6 +4220,37 @@ class OpenCVTrackerAnalyzer(
             return null
         }
 
+        val shouldTryGlobalRealign =
+            !localHealthy &&
+                (
+                    hardDrift ||
+                        bypassBlockedByAppearance ||
+                        trackAppearanceLowStreak >= 2 ||
+                        trackGuardHardMismatch
+                    )
+        if (shouldTryGlobalRealign) {
+            val globalCandidate = findOrbMatch(frame, allowSeedAssist = false)
+            if (globalCandidate != null) {
+                val globalStrong =
+                    globalCandidate.goodMatches >= TRACK_VERIFY_GLOBAL_REALIGN_MIN_GOOD &&
+                        globalCandidate.inlierCount >= TRACK_VERIFY_GLOBAL_REALIGN_MIN_INLIERS
+                if (globalStrong && passesAutoInitVerification(frame, globalCandidate)) {
+                    val shift = pointDistance(rectCenter(trackedBox), rectCenter(globalCandidate.box))
+                    val iou = rectIou(trackedBox, globalCandidate.box)
+                    if (shift > effectiveRecenterPx || iou < effectiveMinIou) {
+                        trackVerifyFailStreak = 0
+                        trackVerifyHardDriftStreak = 0
+                        return TrackVerifyDecision(
+                            action = "realign",
+                            box = globalCandidate.box,
+                            reason = "verify_global_realign shift=${fmt(shift)} iou=${fmt(iou)} " +
+                                "good=${globalCandidate.goodMatches} inliers=${globalCandidate.inlierCount}"
+                        )
+                    }
+                }
+            }
+        }
+
         if (hardDrift) {
             trackVerifyHardDriftStreak++
         } else {
@@ -3169,10 +4263,10 @@ class OpenCVTrackerAnalyzer(
                     TAG,
                         "EVAL_EVENT type=TRACK_VERIFY state=hard_drift " +
                             "good=${trackedQuality.goodMatches} inliers=${trackedQuality.inlierCount} " +
-                            "conf=${fmt(trackedQuality.confidence)} hardStreak=$trackVerifyHardDriftStreak/${verifyCfg.hardDriftTolerance}"
+                            "conf=${fmt(trackedQuality.confidence)} hardStreak=$trackVerifyHardDriftStreak/$effectiveHardTolerance"
                 )
             }
-            if (trackVerifyHardDriftStreak >= verifyCfg.hardDriftTolerance) {
+            if (trackVerifyHardDriftStreak >= effectiveHardTolerance) {
                 trackVerifyFailStreak = 0
                 return TrackVerifyDecision(
                     action = "drop",
@@ -3190,10 +4284,10 @@ class OpenCVTrackerAnalyzer(
                 Log.w(
                     TAG,
                     "EVAL_EVENT type=TRACK_VERIFY state=weak good=${trackedQuality.goodMatches} inliers=${trackedQuality.inlierCount} " +
-                        "conf=${fmt(trackedQuality.confidence)} streak=$trackVerifyFailStreak/${verifyCfg.failTolerance}"
+                        "conf=${fmt(trackedQuality.confidence)} streak=$trackVerifyFailStreak/$effectiveFailTolerance"
                 )
             }
-            if (trackVerifyFailStreak >= verifyCfg.failTolerance) {
+            if (trackVerifyFailStreak >= effectiveFailTolerance) {
                 trackVerifyHardDriftStreak = 0
                 return TrackVerifyDecision(
                     action = "drop",
@@ -3529,8 +4623,12 @@ class OpenCVTrackerAnalyzer(
             )
         }
 
-        val requiredStableFrames = if (!isReplayInput) max(2, firstLockCfg.stableFrames - 1) else firstLockCfg.stableFrames
-        val requiredStableMs = if (!isReplayInput) max(160L, firstLockCfg.stableMs - 80L) else firstLockCfg.stableMs
+        var requiredStableFrames = if (!isReplayInput) max(2, firstLockCfg.stableFrames - 1) else firstLockCfg.stableFrames
+        var requiredStableMs = if (!isReplayInput) max(160L, firstLockCfg.stableMs - 80L) else firstLockCfg.stableMs
+        if (isStartupLockWindow()) {
+            requiredStableFrames = (requiredStableFrames - STARTUP_STABLE_FRAMES_RELAX).coerceAtLeast(2)
+            requiredStableMs = (requiredStableMs - STARTUP_STABLE_MS_RELAX).coerceAtLeast(120L)
+        }
         val ready = firstLockCandidateFrames >= requiredStableFrames && stableMs >= requiredStableMs
         if (!ready) return null
 
@@ -3612,8 +4710,12 @@ class OpenCVTrackerAnalyzer(
     ): Boolean {
         if (frames <= 0) return false
         val strong = bestGood >= 24 && bestInliers >= 8
-        val minAvg = if (strong) -0.10 else -0.06
-        val minSingle = if (strong) -0.42 else -0.32
+        var minAvg = if (strong) -0.10 else -0.06
+        var minSingle = if (strong) -0.42 else -0.32
+        if (isStartupLockWindow()) {
+            minAvg -= STARTUP_APPEAR_AVG_RELAX
+            minSingle -= STARTUP_APPEAR_SINGLE_RELAX
+        }
         return avgScore >= minAvg && minScore >= minSingle
     }
 
@@ -3665,12 +4767,183 @@ class OpenCVTrackerAnalyzer(
         }
     }
 
+    private fun resolveSearchAnchorHint(frameW: Int, frameH: Int): SearchAnchorHint? {
+        val firstLockCfg = heuristicConfig.firstLock
+        if (firstLockCandidateFrames > 0) {
+            val radius = max(firstLockCfg.stablePx, firstLockCfg.smallStablePx) * FIRST_LOCK_ANCHOR_NEAR_FACTOR
+            return SearchAnchorHint(
+                point = Point(firstLockCandidateCenter.x, firstLockCandidateCenter.y),
+                radius = radius,
+                source = "first_lock"
+            )
+        }
+
+        val lost = lastLostBox ?: return null
+        val lostFramesAgo = if (lastLostFrameId >= 0L) frameCounter - lastLostFrameId else Long.MAX_VALUE
+        val maxFrames = if (!isReplayInput) autoVerifyLostPriorMaxFramesLive else autoVerifyLostPriorMaxFramesReplay
+        if (lostFramesAgo !in 1..maxFrames) return null
+        val prior = clampRect(lost, frameW, frameH) ?: return null
+        val side = lostPriorReferenceSide(prior)
+        val baseNearFactor =
+            if (!isReplayInput) autoVerifyLostAnchorNearFactorLive else autoVerifyLostAnchorNearFactorReplay
+        val boostFrames = autoVerifyLostPriorCenterBoostFrames.coerceAtLeast(1L).toDouble()
+        val boost = (lostFramesAgo.toDouble() / boostFrames).coerceIn(0.0, autoVerifyLostPriorCenterBoostCap)
+        return SearchAnchorHint(
+            point = rectCenter(prior),
+            radius = side * (baseNearFactor + boost),
+            source = "lost_prior"
+        )
+    }
+
+    private fun resolveSpatialPriorForCandidateGate(): SpatialPrior? {
+        if (!spatialGateEnabled) return null
+        latestKalmanPrediction?.let { return SpatialPrior(it, "kalman") }
+
+        val lost = lastLostBox
+        val lostFramesAgo = if (lastLostFrameId >= 0L) frameCounter - lastLostFrameId else Long.MAX_VALUE
+        val maxFrames = if (!isReplayInput) autoVerifyLostPriorMaxFramesLive else autoVerifyLostPriorMaxFramesReplay
+        if (lost != null && lostFramesAgo in 1..maxFrames) {
+            return SpatialPrior(lost, "lost_prior")
+        }
+
+        lastMeasuredTrackBox?.let { return SpatialPrior(it, "last_measured") }
+        lastTrackedBox?.let { return SpatialPrior(it, "last_tracked") }
+        return null
+    }
+
+    private fun evaluateSpatialGate(candidate: Rect, prior: SpatialPrior?): SpatialScore? {
+        if (!spatialGateEnabled || prior == null) return null
+        val priorBox = prior.box
+        val center = rectCenter(candidate)
+        val priorCenter = rectCenter(priorBox)
+
+        var refW = priorBox.width.toDouble().coerceAtLeast(MIN_BOX_DIM.toDouble())
+        var refH = priorBox.height.toDouble().coerceAtLeast(MIN_BOX_DIM.toDouble())
+        if (prior.source == "lost_prior") {
+            val sideFloor = lostPriorReferenceSide(priorBox)
+            refW = max(refW, sideFloor)
+            refH = max(refH, sideFloor)
+        }
+        val sigmaX = (refW * spatialGateCenterSigmaFactor).coerceAtLeast(8.0)
+        val sigmaY = (refH * spatialGateCenterSigmaFactor).coerceAtLeast(8.0)
+        val sigmaW = (refW * spatialGateSizeSigmaFactor).coerceAtLeast(6.0)
+        val sigmaH = (refH * spatialGateSizeSigmaFactor).coerceAtLeast(6.0)
+
+        val dx = (center.x - priorCenter.x) / sigmaX
+        val dy = (center.y - priorCenter.y) / sigmaY
+        val dw = (candidate.width.toDouble() - priorBox.width.toDouble()) / sigmaW
+        val dh = (candidate.height.toDouble() - priorBox.height.toDouble()) / sigmaH
+        val distance2 = dx * dx + dy * dy + dw * dw + dh * dh
+        return SpatialScore(
+            score = exp(-0.5 * distance2).coerceIn(0.0, 1.0),
+            distance2 = distance2,
+            source = prior.source
+        )
+    }
+
+    private fun computeOrbAppearanceScore(candidate: OrbMatchCandidate): Double {
+        val orbCfg = heuristicConfig.orb
+        val conf = candidate.confidence.coerceIn(0.0, 1.0)
+        val inlierNorm = (
+            candidate.inlierCount.toDouble() /
+                max(orbCfg.softMinInliers, 1).toDouble()
+            ).coerceIn(0.0, 3.0) / 3.0
+        val goodNorm = (
+            candidate.goodMatches.toDouble() /
+                max(orbCfg.softMinGoodMatches, 1).toDouble()
+            ).coerceIn(0.0, 3.0) / 3.0
+        var score = conf * 0.55 + inlierNorm * 0.30 + goodNorm * 0.15
+        if (candidate.usedHomography) {
+            score += 0.03
+        }
+        return score.coerceIn(0.0, 1.0)
+    }
+
+    private fun computeOrbCandidateFinalScore(candidate: OrbMatchCandidate, prior: SpatialPrior?): Double {
+        val appearanceScore = computeOrbAppearanceScore(candidate)
+        val spatialScore = evaluateSpatialGate(candidate.box, prior)?.score ?: return appearanceScore
+        val spatialWeight = spatialGateWeight.coerceIn(0.0, 0.90)
+        return ((1.0 - spatialWeight) * appearanceScore + spatialWeight * spatialScore).coerceIn(0.0, 1.0)
+    }
+
+    private fun shouldEmitCandidateDump(): Boolean {
+        if (!candDumpEnable) return false
+        if (!isReplayInput) return false
+        val replayMs = currentReplayPtsMs
+        if (replayMs < 0L) return false
+        val replaySec = replayMs.toDouble() / 1000.0
+        val inWindow = replaySec in candDumpStartSec..candDumpEndSec
+        if (!inWindow) return false
+        if (candDumpWindowOnly && replayTargetAppearMs < 0L) return false
+        return true
+    }
+
+    private fun collectCandidateDumpRow(
+        frame: Mat,
+        candidate: OrbMatchCandidate,
+        prior: SpatialPrior?
+    ): OrbCandidateDumpRow {
+        val appearance = computeOrbAppearanceScore(candidate)
+        val spatial = evaluateSpatialGate(candidate.box, prior)
+        val spatialWeight = spatialGateWeight.coerceIn(0.0, 0.90)
+        val fusion =
+            if (spatial != null) {
+                ((1.0 - spatialWeight) * appearance + spatialWeight * spatial.score).coerceIn(0.0, 1.0)
+            } else {
+                appearance
+            }
+        val tier = classifyPromotedRelockTier(frame, candidate)
+        return OrbCandidateDumpRow(
+            candidate = candidate,
+            appearanceScore = appearance,
+            spatialScore = spatial?.score,
+            spatialDistance2 = spatial?.distance2,
+            fusionScore = fusion,
+            tier = tier,
+            source = spatial?.source ?: (prior?.source ?: "none")
+        )
+    }
+
+    private fun emitCandidateDump(rows: List<OrbCandidateDumpRow>, frameW: Int) {
+        if (rows.isEmpty()) return
+        val replaySec = if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0
+        val topRows =
+            rows
+                .sortedWith(
+                    compareByDescending<OrbCandidateDumpRow> { it.fusionScore }
+                        .thenByDescending { it.candidate.inlierCount }
+                        .thenByDescending { it.candidate.goodMatches }
+                )
+                .take(candDumpTopK.coerceAtLeast(1))
+        val expectedX =
+            if (frameW > 0) {
+                "${fmt(frameW * candDumpExpectedXMin)},${fmt(frameW * candDumpExpectedXMax)}"
+            } else {
+                "na"
+            }
+        topRows.forEachIndexed { rank, row ->
+            val box = row.candidate.box
+            val cx = box.x + box.width * 0.5
+            val cy = box.y + box.height * 0.5
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=CAND_DUMP replayPtsSec=${fmt(replaySec)} session=$diagSessionId " +
+                    "src=${row.source} rank=$rank cx=${fmt(cx)} cy=${fmt(cy)} " +
+                    "w=${box.width} h=${box.height} appearance=${fmt(row.appearanceScore)} " +
+                    "spatial=${fmt(row.spatialScore ?: -1.0)} d2=${fmt(row.spatialDistance2 ?: -1.0)} " +
+                    "fusion=${fmt(row.fusionScore)} conf=${fmt(row.candidate.confidence)} " +
+                    "good=${row.candidate.goodMatches} inliers=${row.candidate.inlierCount} " +
+                    "homo=${if (row.candidate.usedHomography) 1 else 0} " +
+                    "tier=${row.tier.name.lowercase(Locale.US)} expectedX=$expectedX"
+            )
+        }
+    }
+
     private fun findOrbMatch(
         frame: Mat,
         loweRatioOverride: Double? = null,
         allowSeedAssist: Boolean = true
     ): OrbMatchCandidate? {
-        val firstLockCfg = heuristicConfig.firstLock
         if (templatePyramidLevels.isEmpty()) return null
 
         val frameGray = Mat()
@@ -3742,17 +5015,9 @@ class OpenCVTrackerAnalyzer(
             frameDescriptors.convertTo(frameDescriptors32F, CvType.CV_32F)
             val framePoints = frameKeypoints.toArray()
             val searchMat = requireNotNull(searchGray)
-            val anchorPoint = if (firstLockCandidateFrames > 0) {
-                Point(firstLockCandidateCenter.x, firstLockCandidateCenter.y)
-            } else {
-                null
-            }
-            val anchorRadius =
-                if (anchorPoint != null) {
-                    max(firstLockCfg.stablePx, firstLockCfg.smallStablePx) * FIRST_LOCK_ANCHOR_NEAR_FACTOR
-                } else {
-                    0.0
-                }
+            val anchorHint = resolveSearchAnchorHint(frame.cols(), frame.rows())
+            val anchorPoint = anchorHint?.point
+            val anchorRadius = anchorHint?.radius ?: 0.0
             if (allowSeedAssist && firstLockCandidateFrames > 0) {
                 val seedBox = firstLockCandidateBox
                 if (seedBox != null) {
@@ -3786,6 +5051,10 @@ class OpenCVTrackerAnalyzer(
             var bestCandidate: OrbMatchCandidate? = null
             var bestNearCandidate: OrbMatchCandidate? = null
             var bestDiag: SearchLevelResult? = null
+            val dumpEnabled = shouldEmitCandidateDump()
+            val candidateDumpRows: MutableList<OrbCandidateDumpRow> =
+                if (dumpEnabled) ArrayList<OrbCandidateDumpRow>(templatePyramidLevels.size) else ArrayList(0)
+            val candidatePrior = if (dumpEnabled) resolveSpatialPriorForCandidateGate() else null
             for (level in templatePyramidLevels) {
                 val levelResult = findOrbMatchForLevel(
                     frame = frame,
@@ -3798,6 +5067,9 @@ class OpenCVTrackerAnalyzer(
                     loweRatio = loweRatioOverride ?: heuristicConfig.orb.loweRatio
                 )
                 val candidate = levelResult.candidate
+                if (dumpEnabled && candidate != null) {
+                    candidateDumpRows += collectCandidateDumpRow(frame, candidate, candidatePrior)
+                }
                 if (candidate != null && isBetterOrbCandidate(candidate, bestCandidate)) {
                     bestCandidate = candidate
                 }
@@ -3820,7 +5092,25 @@ class OpenCVTrackerAnalyzer(
                 }
             }
 
-            if (bestNearCandidate != null) return bestNearCandidate
+            if (dumpEnabled && candidateDumpRows.isNotEmpty()) {
+                emitCandidateDump(candidateDumpRows, frame.cols())
+            }
+
+            if (bestNearCandidate != null) {
+                if (
+                    anchorHint != null &&
+                    anchorHint.source == "lost_prior" &&
+                    frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L
+                ) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=SEARCH_ANCHOR_BIAS source=${anchorHint.source} " +
+                            "radius=${fmt(anchorHint.radius)} box=${bestNearCandidate.box.x},${bestNearCandidate.box.y}," +
+                            "${bestNearCandidate.box.width}x${bestNearCandidate.box.height}"
+                    )
+                }
+                return bestNearCandidate
+            }
             if (bestCandidate != null) return bestCandidate
 
             val diag = bestDiag
@@ -4228,6 +5518,12 @@ class OpenCVTrackerAnalyzer(
 
     private fun isBetterOrbCandidate(candidate: OrbMatchCandidate, current: OrbMatchCandidate?): Boolean {
         if (current == null) return true
+        val prior = resolveSpatialPriorForCandidateGate()
+        if (prior != null) {
+            val candidateScore = computeOrbCandidateFinalScore(candidate, prior)
+            val currentScore = computeOrbCandidateFinalScore(current, prior)
+            if (abs(candidateScore - currentScore) > 1e-4) return candidateScore > currentScore
+        }
         if (candidate.isStrong != current.isStrong) return candidate.isStrong
         if (candidate.inlierCount != current.inlierCount) return candidate.inlierCount > current.inlierCount
         if (candidate.goodMatches != current.goodMatches) return candidate.goodMatches > current.goodMatches
@@ -4277,15 +5573,420 @@ class OpenCVTrackerAnalyzer(
     }
 
     private fun canDirectAutoInit(candidate: OrbMatchCandidate): Boolean {
-        // P0: disable direct auto-init; force temporal-confirm path.
-        return false
+        if (!isStartupLockWindow()) return false
+        if (candidate.usedHomography) return true
+        return candidate.goodMatches >= STARTUP_DIRECT_INIT_MIN_GOOD &&
+            candidate.inlierCount >= STARTUP_DIRECT_INIT_MIN_INLIERS &&
+            candidate.confidence >= STARTUP_DIRECT_INIT_MIN_CONF
+    }
+
+    private fun framesSinceLastLost(): Long {
+        if (lastLostFrameId < 0L) return Long.MAX_VALUE
+        return (frameCounter - lastLostFrameId).coerceAtLeast(0L)
+    }
+
+    private fun lostPriorReferenceSide(prior: Rect): Double {
+        val rawSide = min(prior.width, prior.height).toDouble().coerceAtLeast(1.0)
+        val minSide =
+            if (!isReplayInput) AUTO_VERIFY_LOST_PRIOR_MIN_SIDE_LIVE else AUTO_VERIFY_LOST_PRIOR_MIN_SIDE_REPLAY
+        return rawSide.coerceAtLeast(minSide)
+    }
+
+    private fun resolveLostPriorGeometry(frame: Mat, candidate: OrbMatchCandidate): LostPriorGeometry? {
+        if (metricsLockCount <= 0) return null
+        val lost = lastLostBox ?: return null
+        val maxFrames = if (!isReplayInput) autoVerifyLostPriorMaxFramesLive else autoVerifyLostPriorMaxFramesReplay
+        val lostFramesAgo = framesSinceLastLost()
+        if (lostFramesAgo !in 1..maxFrames) return null
+        val prior = clampRect(lost, frame.cols(), frame.rows()) ?: return null
+        val iou = rectIou(candidate.box, prior)
+        val centerDist = pointDistance(rectCenter(candidate.box), rectCenter(prior))
+        val side = lostPriorReferenceSide(prior)
+        val near =
+            iou >= PROMOTED_RELOCK_NEAR_MIN_IOU ||
+                centerDist <= side * PROMOTED_RELOCK_NEAR_CENTER_FACTOR
+        return LostPriorGeometry(
+            prior = prior,
+            framesAgo = lostFramesAgo,
+            iou = iou,
+            centerDist = centerDist,
+            side = side,
+            near = near
+        )
+    }
+
+    private fun classifyPromotedRelockTier(frame: Mat, candidate: OrbMatchCandidate): PromotedRelockTier {
+        val geom = resolveLostPriorGeometry(frame, candidate) ?: return PromotedRelockTier.NONE
+        return if (geom.near) PromotedRelockTier.NEAR else PromotedRelockTier.FAR
+    }
+
+    private fun passesPromotedFarRelockGate(frame: Mat, candidate: OrbMatchCandidate): Boolean {
+        val geom = resolveLostPriorGeometry(frame, candidate) ?: return true
+        if (geom.near) return true
+        val appearance = computePatchTemplateCorrelation(frame, candidate.box)
+        val anchorScore = trackAnchorAppearanceScore
+        val minConfBase =
+            if (!isReplayInput) autoVerifyLostFarRecoverMinConfLive else autoVerifyLostFarRecoverMinConfReplay
+        val minConf = (minConfBase + PROMOTED_RELOCK_FAR_EXTRA_CONF).coerceAtMost(1.0)
+        val anchorMin =
+            if (trackGuardAnchorEnabled && anchorScore.isFinite()) {
+                anchorScore - PROMOTED_RELOCK_FAR_ANCHOR_MAX_DROP
+            } else {
+                autoVerifyLostFarRecoverMinAppearance
+            }
+        val minAppearance = max(autoVerifyLostFarRecoverMinAppearance, anchorMin)
+        val pass =
+            candidate.goodMatches >= autoVerifyLostFarRecoverMinGood &&
+                candidate.inlierCount >= autoVerifyLostFarRecoverMinInliers &&
+                candidate.confidence >= minConf &&
+                appearance >= minAppearance
+        logDiag(
+            "LOCK_GATE",
+            "session=$diagSessionId stage=promoted_far_gate pass=$pass " +
+                "good=${candidate.goodMatches}/${autoVerifyLostFarRecoverMinGood} " +
+                "inliers=${candidate.inlierCount}/${autoVerifyLostFarRecoverMinInliers} " +
+                "conf=${fmt(candidate.confidence)}/${fmt(minConf)} " +
+                "app=${fmt(appearance)}/${fmt(minAppearance)} " +
+                "iou=${fmt(geom.iou)} center=${fmt(geom.centerDist)}"
+        )
+        return pass
+    }
+
+    private fun passesPromotedNearRelockOverride(frame: Mat, candidate: OrbMatchCandidate): Boolean {
+        val geom = resolveLostPriorGeometry(frame, candidate) ?: return false
+        if (!geom.near) return false
+        val appearance = computePatchTemplateCorrelation(frame, candidate.box)
+        val anchorScore = trackAnchorAppearanceScore
+        val minConfBase =
+            if (!isReplayInput) autoVerifyRelockMinConfLive else autoVerifyRelockMinConfReplay
+        val minConf = (minConfBase - PROMOTED_RELOCK_NEAR_CONF_RELAX).coerceAtLeast(0.0)
+        val minGood = max(heuristicConfig.orb.softMinGoodMatches + 2, 8)
+        val minInliers = max(heuristicConfig.orb.softMinInliers + 1, 4)
+        val enforceAnchorVeto =
+            s3PromotedNearAnchorVetoEnabled &&
+                trackGuardAnchorEnabled &&
+                anchorScore.isFinite()
+        val anchorOk =
+            !enforceAnchorVeto ||
+                appearance >= anchorScore - PROMOTED_RELOCK_NEAR_ANCHOR_MAX_DROP
+        val pass =
+            candidate.goodMatches >= minGood &&
+                candidate.inlierCount >= minInliers &&
+                candidate.confidence >= minConf &&
+                anchorOk
+        logDiag(
+            "LOCK_GATE",
+            "session=$diagSessionId stage=promoted_near_override pass=$pass " +
+                "good=${candidate.goodMatches}/$minGood inliers=${candidate.inlierCount}/$minInliers " +
+                "conf=${fmt(candidate.confidence)}/${fmt(minConf)} " +
+                "app=${fmt(appearance)} anchor=${fmt(anchorScore)} anchorVeto=$enforceAnchorVeto anchorOk=$anchorOk " +
+                "iou=${fmt(geom.iou)} center=${fmt(geom.centerDist)}"
+        )
+        return pass
+    }
+
+    private fun shouldSuppressKcfFallback(reason: String): Boolean {
+        if (!s2SuppressKcfFallbackEnabled) return false
+        if (!isReplayInput) return false
+        if (preferredTrackBackend == TrackBackend.KCF) return false
+        if (metricsLockCount <= 0) return false
+        val framesAgo = framesSinceLastLost()
+        if (framesAgo !in 1..AUTO_VERIFY_RELOCK_RECENT_LOST_WINDOW_FRAMES_REPLAY) return false
+        val normalized = reason.lowercase(Locale.US)
+        return normalized.startsWith("orb_") ||
+            normalized.startsWith("verify_") ||
+            normalized.contains("promoted")
     }
 
     private fun passesAutoInitVerification(frame: Mat, candidate: OrbMatchCandidate): Boolean {
         val fallbackRefineCfg = heuristicConfig.fallbackRefine
         val verifyCfg = heuristicConfig.autoInitVerify
         val gatePrefix = "session=$diagSessionId stage=auto_verify good=${candidate.goodMatches} inliers=${candidate.inlierCount} conf=${fmt(candidate.confidence)}"
+        val fallbackReason = candidate.fallbackReason?.lowercase(Locale.US)
+        if (isReplayInput && autoVerifyRejectFlipReplay && fallbackReason?.contains("flip") == true) {
+            logDiag(
+                "LOCK_GATE",
+                "$gatePrefix pass=false reason=flip_reject fallback=${candidate.fallbackReason}"
+            )
+            return false
+        }
+        val isRelock = metricsLockCount > 0
+        val isFirstLock = metricsLockCount == 0
+        if (
+            isFirstLock &&
+            isReplayInput &&
+            replayTargetAppearMs > 0L &&
+            currentReplayPtsMs >= 0L &&
+            currentReplayPtsMs + REPLAY_TARGET_APPEAR_GRACE_MS < replayTargetAppearMs
+        ) {
+            logDiag(
+                "LOCK_GATE",
+                "$gatePrefix pass=false reason=before_target_appear replayPtsSec=${fmt(currentReplayPtsMs.toDouble() / 1000.0)} targetSec=${fmt(replayTargetAppearMs.toDouble() / 1000.0)}"
+            )
+            return false
+        }
         val appearanceScore = computePatchTemplateCorrelation(frame, candidate.box)
+        val anchorScore = trackAnchorAppearanceScore
+        val lostPrior = lastLostBox
+        val lostFramesAgo = if (lastLostFrameId >= 0L) frameCounter - lastLostFrameId else Long.MAX_VALUE
+        val fastRelockWindow =
+            if (!isReplayInput) AUTO_VERIFY_FAST_RELOCK_WINDOW_FRAMES_LIVE else AUTO_VERIFY_FAST_RELOCK_WINDOW_FRAMES_REPLAY
+        val fastRelockNearLostPrior =
+            run {
+                if (lostPrior == null || lostFramesAgo !in 1..fastRelockWindow) return@run false
+                val prior = clampRect(lostPrior, frame.cols(), frame.rows()) ?: return@run false
+                val priorIou = rectIou(candidate.box, prior)
+                val priorCenterDist = pointDistance(rectCenter(candidate.box), rectCenter(prior))
+                val side = lostPriorReferenceSide(prior)
+                val nearPrior =
+                    priorCenterDist <= side * AUTO_VERIFY_FAST_RELOCK_CENTER_FACTOR ||
+                        priorIou >= AUTO_VERIFY_FAST_RELOCK_MIN_IOU
+                val anchorOk =
+                    !trackGuardAnchorEnabled ||
+                        !anchorScore.isFinite() ||
+                        appearanceScore >= anchorScore - AUTO_VERIFY_FAST_RELOCK_ANCHOR_MAX_DROP
+                nearPrior && anchorOk
+            }
+        if (isFirstLock) {
+            if (isReplayInput && candidate.inlierCount < autoVerifyFirstLockMinInliersReplay) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=first_lock_inliers inliers=${candidate.inlierCount} min=$autoVerifyFirstLockMinInliersReplay"
+                )
+                return false
+            }
+            val firstLockMinAppear =
+                if (!isReplayInput) autoVerifyFirstLockAppearanceMinLive else autoVerifyFirstLockAppearanceMinReplay
+            if (appearanceScore < firstLockMinAppear) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=first_lock_appearance score=${fmt(appearanceScore)} min=${fmt(firstLockMinAppear)}"
+                )
+                return false
+            }
+            if (isReplayInput && autoVerifyFirstLockCenterGuardReplay) {
+                val center = rectCenter(candidate.box)
+                val frameW = frame.cols().toDouble().coerceAtLeast(1.0)
+                val frameH = frame.rows().toDouble().coerceAtLeast(1.0)
+                val dxNorm = abs(center.x / frameW - 0.5)
+                val dyNorm = abs(center.y / frameH - 0.5)
+                if (dxNorm > autoVerifyFirstLockCenterFactorReplay || dyNorm > autoVerifyFirstLockCenterFactorReplay) {
+                    logDiag(
+                        "LOCK_GATE",
+                        "$gatePrefix pass=false reason=first_lock_center dx=${fmt(dxNorm)} dy=${fmt(dyNorm)} " +
+                            "th=${fmt(autoVerifyFirstLockCenterFactorReplay)}"
+                    )
+                    return false
+                }
+            }
+        }
+        if (isRelock) {
+            val relockMinConfBase =
+                if (!isReplayInput) autoVerifyRelockMinConfLive else autoVerifyRelockMinConfReplay
+            val relockMinConf =
+                if (fastRelockNearLostPrior) {
+                    (relockMinConfBase - AUTO_VERIFY_FAST_RELOCK_CONF_RELAX).coerceAtLeast(0.0)
+                } else {
+                    relockMinConfBase
+                }
+            if (candidate.confidence < relockMinConf) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=relock_conf conf=${fmt(candidate.confidence)} min=${fmt(relockMinConf)} fastRelock=$fastRelockNearLostPrior"
+                )
+                return false
+            }
+            if (trackGuardAnchorEnabled && anchorScore.isFinite()) {
+                val relockAnchorMaxDrop =
+                    if (!isReplayInput) AUTO_VERIFY_RELOCK_ANCHOR_MAX_DROP_LIVE else AUTO_VERIFY_RELOCK_ANCHOR_MAX_DROP_REPLAY
+                val relockAnchorMin = anchorScore - relockAnchorMaxDrop
+                if (appearanceScore < relockAnchorMin) {
+                    logDiag(
+                        "LOCK_GATE",
+                        "$gatePrefix pass=false reason=relock_anchor score=${fmt(appearanceScore)} min=${fmt(relockAnchorMin)} anchor=${fmt(anchorScore)}"
+                    )
+                    return false
+                }
+            }
+            val prior = resolveSpatialPriorForCandidateGate()
+            val spatial = evaluateSpatialGate(candidate.box, prior)
+            if (spatial != null) {
+                val relockLostFramesAgo =
+                    if (lastLostFrameId >= 0L) frameCounter - lastLostFrameId else Long.MAX_VALUE
+                val recentLostWindow =
+                    if (!isReplayInput) AUTO_VERIFY_RELOCK_RECENT_LOST_WINDOW_FRAMES_LIVE else AUTO_VERIFY_RELOCK_RECENT_LOST_WINDOW_FRAMES_REPLAY
+                val recentLostRelock = relockLostFramesAgo in 1..recentLostWindow
+                val minSpatialBase =
+                    if (!isReplayInput) spatialGateRelockMinScoreLive else spatialGateRelockMinScoreReplay
+                val recentLostSpatialFloorBase =
+                    if (!isReplayInput) AUTO_VERIFY_RELOCK_RECENT_LOST_MIN_SPATIAL_LIVE else AUTO_VERIFY_RELOCK_RECENT_LOST_MIN_SPATIAL_REPLAY
+                val recentLostSpatialFloor =
+                    if (fastRelockNearLostPrior) {
+                        minSpatialBase
+                    } else {
+                        recentLostSpatialFloorBase
+                    }
+                val minSpatial = if (recentLostRelock) max(minSpatialBase, recentLostSpatialFloor) else minSpatialBase
+                val spatialRelaxStreakThreshold =
+                    if (!isReplayInput) autoVerifyRelockSpatialRelaxStreakLive else autoVerifyRelockSpatialRelaxStreakReplay
+                val relaxLostPriorSpatialGate =
+                    recentLostRelock &&
+                        spatial.source == "lost_prior" &&
+                        (relockSpatialRejectStreak + 1) >= spatialRelaxStreakThreshold
+                val effectiveMinSpatial =
+                    if (relaxLostPriorSpatialGate) {
+                        min(minSpatial, autoVerifyRelockSpatialRelaxMinScore)
+                    } else {
+                        minSpatial
+                    }
+                if (relaxLostPriorSpatialGate) {
+                    logDiag(
+                        "LOCK_GATE",
+                        "$gatePrefix pass=trace reason=spatial_relax_apply score=${fmt(spatial.score)} " +
+                            "min=${fmt(minSpatial)} effectiveMin=${fmt(effectiveMinSpatial)} " +
+                            "d2=${fmt(spatial.distance2)} src=${spatial.source} " +
+                            "spatialStreak=$relockSpatialRejectStreak"
+                    )
+                }
+                val bypassConf =
+                    if (recentLostRelock) {
+                        (spatialGateRelockBypassConf + AUTO_VERIFY_RELOCK_RECENT_LOST_BYPASS_CONF_BONUS).coerceAtMost(1.0)
+                    } else {
+                        spatialGateRelockBypassConf
+                    }
+                val bypassAppearance =
+                    if (recentLostRelock) {
+                        (spatialGateRelockBypassAppearance + AUTO_VERIFY_RELOCK_RECENT_LOST_BYPASS_APPEARANCE_BONUS).coerceAtMost(1.0)
+                    } else {
+                        spatialGateRelockBypassAppearance
+                    }
+                val bypassSpatial =
+                    candidate.confidence >= bypassConf &&
+                        appearanceScore >= bypassAppearance
+                if (relaxLostPriorSpatialGate &&
+                    appearanceScore < autoVerifyRelockSpatialRelaxMinAppearance
+                ) {
+                    relockSpatialRejectStreak = (relockSpatialRejectStreak + 1).coerceAtMost(256)
+                    logDiag(
+                        "LOCK_GATE",
+                        "$gatePrefix pass=false reason=spatial_relax_appearance app=${fmt(appearanceScore)} " +
+                            "minApp=${fmt(autoVerifyRelockSpatialRelaxMinAppearance)} score=${fmt(spatial.score)} " +
+                            "min=${fmt(effectiveMinSpatial)} d2=${fmt(spatial.distance2)} src=${spatial.source} " +
+                            "spatialStreak=$relockSpatialRejectStreak"
+                    )
+                    return false
+                }
+                if (spatial.score < effectiveMinSpatial && !bypassSpatial) {
+                    relockSpatialRejectStreak = (relockSpatialRejectStreak + 1).coerceAtMost(256)
+                    logDiag(
+                        "LOCK_GATE",
+                        "$gatePrefix pass=false reason=spatial score=${fmt(spatial.score)} min=${fmt(effectiveMinSpatial)} " +
+                            "d2=${fmt(spatial.distance2)} src=${spatial.source} conf=${fmt(candidate.confidence)} " +
+                            "app=${fmt(appearanceScore)} bypass=${fmt(bypassConf)}/${fmt(bypassAppearance)} " +
+                            "recentLost=$recentLostRelock fastRelock=$fastRelockNearLostPrior " +
+                            "spatialStreak=$relockSpatialRejectStreak relax=$relaxLostPriorSpatialGate"
+                    )
+                    return false
+                }
+                relockSpatialRejectStreak =
+                    if (recentLostRelock && spatial.source == "lost_prior") {
+                        (relockSpatialRejectStreak - 1).coerceAtLeast(0)
+                    } else {
+                        0
+                    }
+            }
+        }
+        if (trackGuardAnchorEnabled && anchorScore.isFinite()) {
+            val smallCandidate =
+                isSmallTargetForExtraVerify(
+                    current = candidate.box,
+                    frameW = frame.cols(),
+                    frameH = frame.rows()
+                )
+            val anchorDrop =
+                if (smallCandidate) {
+                    (trackGuardAnchorMaxDrop * smallTargetAnchorDropScale).coerceAtLeast(0.05)
+                } else {
+                    trackGuardAnchorMaxDrop
+                }
+            val dynamicAnchorMin = anchorScore - anchorDrop
+            val anchorMinScore =
+                if (trackGuardAnchorMinScore > -0.999) {
+                    max(dynamicAnchorMin, trackGuardAnchorMinScore)
+                } else {
+                    dynamicAnchorMin
+                }
+            if (appearanceScore < anchorMinScore) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=anchor score=${fmt(appearanceScore)} min=${fmt(anchorMinScore)} anchor=${fmt(anchorScore)} small=$smallCandidate"
+                )
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=VERIFY_GATE state=reject reason=anchor " +
+                            "score=${fmt(appearanceScore)}/${fmt(anchorMinScore)} anchor=${fmt(anchorScore)} small=$smallCandidate " +
+                            "candGood=${candidate.goodMatches} candInliers=${candidate.inlierCount}"
+                    )
+                }
+                return false
+            }
+        }
+        val maxLostPriorFrames =
+            if (!isReplayInput) autoVerifyLostPriorMaxFramesLive else autoVerifyLostPriorMaxFramesReplay
+        if (lostPrior != null && lostFramesAgo in 1..maxLostPriorFrames) {
+            val prior = clampRect(lostPrior, frame.cols(), frame.rows())
+            if (prior != null) {
+                val priorIou = rectIou(candidate.box, prior)
+                val priorCenterDist = pointDistance(rectCenter(candidate.box), rectCenter(prior))
+                val side = lostPriorReferenceSide(prior)
+                val baseCenterFactor =
+                    if (!isReplayInput) autoVerifyLostPriorCenterFactorLive else autoVerifyLostPriorCenterFactorReplay
+                val boostFrames = autoVerifyLostPriorCenterBoostFrames.coerceAtLeast(1L).toDouble()
+                val boost = (lostFramesAgo.toDouble() / boostFrames)
+                    .coerceIn(0.0, autoVerifyLostPriorCenterBoostCap)
+                val centerLimit = side * (baseCenterFactor + boost)
+                val minPriorIou =
+                    if (!isReplayInput) autoVerifyLostPriorMinIouLive else autoVerifyLostPriorMinIouReplay
+                val geomNear = priorCenterDist <= centerLimit || priorIou >= minPriorIou
+                if (!geomNear) {
+                    val farRecoverMinConfBase =
+                        if (!isReplayInput) autoVerifyLostFarRecoverMinConfLive else autoVerifyLostFarRecoverMinConfReplay
+                    val farRecoverMinConf =
+                        (
+                            farRecoverMinConfBase +
+                                if (!isReplayInput) AUTO_VERIFY_LOST_FAR_RECOVER_EXTRA_CONF_LIVE else AUTO_VERIFY_LOST_FAR_RECOVER_EXTRA_CONF_REPLAY
+                            ).coerceAtMost(1.0)
+                    val farRecoverAnchorMinAppearance =
+                        if (trackGuardAnchorEnabled && anchorScore.isFinite()) {
+                            anchorScore - AUTO_VERIFY_LOST_FAR_RECOVER_ANCHOR_MAX_DROP
+                        } else {
+                            autoVerifyLostFarRecoverMinAppearance
+                        }
+                    val farRecoverMinAppearance = max(autoVerifyLostFarRecoverMinAppearance, farRecoverAnchorMinAppearance)
+                    val farRecoverPass =
+                        candidate.goodMatches >= autoVerifyLostFarRecoverMinGood &&
+                            candidate.inlierCount >= autoVerifyLostFarRecoverMinInliers &&
+                            candidate.confidence >= farRecoverMinConf &&
+                            appearanceScore >= farRecoverMinAppearance
+                    if (!farRecoverPass) {
+                        logDiag(
+                            "LOCK_GATE",
+                            "$gatePrefix pass=false reason=lost_prior iou=${fmt(priorIou)} minIou=${fmt(minPriorIou)} center=${fmt(priorCenterDist)} centerTh=${fmt(centerLimit)} " +
+                                "lostFrames=$lostFramesAgo farConf=${fmt(candidate.confidence)}/${fmt(farRecoverMinConf)} " +
+                                "farApp=${fmt(appearanceScore)}/${fmt(farRecoverMinAppearance)}"
+                        )
+                        return false
+                    }
+                    logDiag(
+                        "LOCK_GATE",
+                        "$gatePrefix pass=true reason=lost_prior_far_recover iou=${fmt(priorIou)} center=${fmt(priorCenterDist)} " +
+                            "good=${candidate.goodMatches} inliers=${candidate.inlierCount} conf=${fmt(candidate.confidence)} " +
+                            "app=${fmt(appearanceScore)} farConfMin=${fmt(farRecoverMinConf)} farAppMin=${fmt(farRecoverMinAppearance)}"
+                    )
+                }
+            }
+        }
         val strongCandidate =
             candidate.goodMatches >= verifyCfg.strongCandidateMinGood &&
                 candidate.inlierCount >= verifyCfg.strongCandidateMinInliers &&
@@ -4299,10 +6000,33 @@ class OpenCVTrackerAnalyzer(
         val roi = expandRectWithFactor(candidate.box, verifyCfg.localRoiExpandFactor, frame.cols(), frame.rows())
         val local = roi?.let { findOrbMatchInRoi(frame, it, loweRatioOverride = fallbackRefineCfg.loweRatio) }
         if (local == null) {
-            val fallbackPass = strongCandidate && strongAppearance
+            val requireLocalForFirstLock =
+                if (!isReplayInput) autoVerifyFirstLockRequireLocalLive else autoVerifyFirstLockRequireLocalReplay
+            if (isFirstLock && requireLocalForFirstLock) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=local_missing_first_lock score=${fmt(appearanceScore)}"
+                )
+                return false
+            }
+            val relockRequireLocal =
+                isRelock &&
+                    isReplayInput &&
+                    lostPrior != null &&
+                    lostFramesAgo in 1..autoVerifyLostPriorMaxFramesReplay
+            if (relockRequireLocal) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=local_missing_relock score=${fmt(appearanceScore)} conf=${fmt(candidate.confidence)} lostFrames=$lostFramesAgo"
+                )
+                return false
+            }
+            val localMissingMinConf =
+                if (!isReplayInput) verifyCfg.localMissingMinConfLive else verifyCfg.localMissingMinConfReplay
+            val fallbackPass = strongCandidate && strongAppearance && candidate.confidence >= localMissingMinConf
             logDiag(
                 "LOCK_GATE",
-                "$gatePrefix pass=$fallbackPass reason=local_missing score=${fmt(appearanceScore)}"
+                "$gatePrefix pass=$fallbackPass reason=local_missing score=${fmt(appearanceScore)} conf=${fmt(candidate.confidence)} minConf=${fmt(localMissingMinConf)}"
             )
             if (!fallbackPass) return false
         } else {
@@ -4334,6 +6058,15 @@ class OpenCVTrackerAnalyzer(
                     "$gatePrefix pass=true reason=geom_override iou=${fmt(iou)} center=${fmt(centerDist)} localConf=${fmt(local.confidence)} score=${fmt(appearanceScore)}"
                 )
             }
+        }
+        val finalMinConf =
+            if (!isReplayInput) AUTO_VERIFY_FINAL_MIN_CONF_LIVE else AUTO_VERIFY_FINAL_MIN_CONF_REPLAY
+        if (candidate.confidence < finalMinConf) {
+            logDiag(
+                "LOCK_GATE",
+                "$gatePrefix pass=false reason=conf_floor conf=${fmt(candidate.confidence)} min=${fmt(finalMinConf)}"
+            )
+            return false
         }
 
         var minAppearanceScore = when {
@@ -4373,12 +6106,20 @@ class OpenCVTrackerAnalyzer(
         return candidate.confidence >= minConf
     }
 
+    private fun isStartupLockWindow(): Boolean {
+        return !isTracking && metricsLockCount == 0 && fastFirstLockRemaining > 0
+    }
+
     private fun isCandidateEligibleForTemporal(candidate: OrbMatchCandidate): Boolean {
         val cfg = heuristicConfig
         val temporalCfg = cfg.temporalGate
+        val startupWindow = isStartupLockWindow()
         var temporalMinGoodMatches = computeTemporalMinGoodMatches(candidate)
         if (!isReplayInput) {
             temporalMinGoodMatches = (temporalMinGoodMatches - 1).coerceAtLeast(max(cfg.orb.softMinGoodMatches, 3))
+        }
+        if (startupWindow) {
+            temporalMinGoodMatches = (temporalMinGoodMatches - STARTUP_TEMPORAL_MIN_GOOD_RELAX).coerceAtLeast(3)
         }
         if (candidate.goodMatches < temporalMinGoodMatches) return false
 
@@ -4387,10 +6128,13 @@ class OpenCVTrackerAnalyzer(
         } else {
             max(cfg.orb.softMinInliers, cfg.fallbackRefine.minInliers - 1)
         }
-        val minInliers = if (!isReplayInput && !candidate.usedHomography) {
+        var minInliers = if (!isReplayInput && !candidate.usedHomography) {
             (minInliersBase - 1).coerceAtLeast(cfg.orb.softMinInliers)
         } else {
             minInliersBase
+        }
+        if (startupWindow) {
+            minInliers = (minInliers - STARTUP_TEMPORAL_MIN_INLIERS_RELAX).coerceAtLeast(cfg.orb.softMinInliers)
         }
         if (candidate.inlierCount < minInliers) return false
 
@@ -4410,6 +6154,10 @@ class OpenCVTrackerAnalyzer(
             if (!isReplayInput) {
                 minTemporalConfidence = (minTemporalConfidence - temporalCfg.liveConfidenceRelax)
                     .coerceAtLeast(temporalCfg.liveConfidenceFloor)
+            }
+            if (startupWindow) {
+                minTemporalConfidence = (minTemporalConfidence - STARTUP_TEMPORAL_CONFIDENCE_RELAX)
+                    .coerceAtLeast(STARTUP_TEMPORAL_CONFIDENCE_FLOOR)
             }
             if (candidate.confidence < minTemporalConfidence) return false
         }
@@ -5043,18 +6791,67 @@ class OpenCVTrackerAnalyzer(
         )
     }
 
+    private fun currentTemplateAspectForFallback(): Double {
+        val template = templateGray ?: return 1.0
+        if (template.empty()) return 1.0
+        val h = template.rows().coerceAtLeast(1).toDouble()
+        val w = template.cols().coerceAtLeast(1).toDouble()
+        return (w / h).coerceIn(FALLBACK_TEMPLATE_ASPECT_MIN, FALLBACK_TEMPLATE_ASPECT_MAX)
+    }
+
     private fun normalizeTemplateSize(template: Mat): Mat {
+        if (template.empty()) return Mat()
         val out = Mat()
         val w = template.cols().toDouble()
         val h = template.rows().toDouble()
         val maxDim = max(w, h)
-        if (maxDim <= MAX_TEMPLATE_DIM) {
-            template.copyTo(out)
-            return out
+        val scale = when {
+            maxDim > MAX_TEMPLATE_DIM -> MAX_TEMPLATE_DIM / maxDim
+            maxDim < MIN_TEMPLATE_DIM -> MIN_TEMPLATE_DIM / maxDim
+            else -> 1.0
         }
-        val scale = MAX_TEMPLATE_DIM / maxDim
-        Imgproc.resize(template, out, Size(w * scale, h * scale), 0.0, 0.0, Imgproc.INTER_AREA)
+        if (abs(scale - 1.0) < 1e-6) {
+            template.copyTo(out)
+        } else {
+            val interpolation = if (scale < 1.0) Imgproc.INTER_AREA else Imgproc.INTER_LINEAR
+            Imgproc.resize(template, out, Size(w * scale, h * scale), 0.0, 0.0, interpolation)
+        }
         return out
+    }
+
+    private fun buildPoseAugmentedTemplates(templateGray: Mat, enablePoseAugment: Boolean): List<Mat> {
+        val outputs = ArrayList<Mat>(TEMPLATE_POSE_AUGMENT_DEGREES.size)
+        outputs += templateGray.clone()
+        if (!enablePoseAugment) return outputs
+        for (angleDeg in TEMPLATE_POSE_AUGMENT_DEGREES) {
+            if (abs(angleDeg) < 0.1) continue
+            val rotated = rotateTemplateByDegrees(templateGray, angleDeg) ?: continue
+            outputs += rotated
+        }
+        return outputs
+    }
+
+    private fun rotateTemplateByDegrees(templateGray: Mat, angleDeg: Double): Mat? {
+        if (templateGray.empty()) return null
+        val center = Point(templateGray.cols() * 0.5, templateGray.rows() * 0.5)
+        val rotation = Imgproc.getRotationMatrix2D(center, angleDeg, 1.0)
+        val rotated = Mat()
+        return try {
+            Imgproc.warpAffine(
+                templateGray,
+                rotated,
+                rotation,
+                Size(templateGray.cols().toDouble(), templateGray.rows().toDouble()),
+                Imgproc.INTER_LINEAR,
+                Core.BORDER_REPLICATE
+            )
+            normalizeTemplateSize(rotated).also { rotated.release() }
+        } catch (_: Throwable) {
+            rotated.release()
+            null
+        } finally {
+            rotation.release()
+        }
     }
 
     private fun dispatchTrackedRect(box: Rect) {
@@ -5119,6 +6916,8 @@ class OpenCVTrackerAnalyzer(
     }
 
     private fun updateScaleFactors(frameWidth: Int, frameHeight: Int) {
+        currentFrameWidth = frameWidth
+        currentFrameHeight = frameHeight
         if (overlayView.width == 0 || overlayView.height == 0) return
         val sx = overlayView.width.toFloat() / frameWidth.toFloat()
         val sy = overlayView.height.toFloat() / frameHeight.toFloat()
@@ -5144,12 +6943,17 @@ class OpenCVTrackerAnalyzer(
             metricsCurrentTrackingStreak = 0
         }
 
+        emitDescendOffsetPerFrame()
+
         if (metricsFrames % PERF_LOG_INTERVAL_FRAMES == 0L) {
             val avgMs = metricsTotalProcessMs.toDouble() / metricsFrames
             val trackRatio = metricsTrackingFrames.toDouble() / metricsFrames
             val firstLockSec = if (metricsFirstLockMs >= 0L) metricsFirstLockMs.toDouble() / 1000.0 else -1.0
             val firstLockReplaySec = if (metricsFirstLockReplayMs >= 0L) metricsFirstLockReplayMs.toDouble() / 1000.0 else -1.0
             val replayPtsSec = if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0
+            val perfBox = lastMeasuredTrackBox ?: lastTrackedBox
+            val perfBoxToken =
+                perfBox?.let { "${it.x},${it.y},${it.width}x${it.height}" } ?: "none"
             val nativeConfAvg = if (metricsNativeConfSamples > 0L) metricsNativeConfSum / metricsNativeConfSamples else -1.0
             val nativeConfMin = if (metricsNativeConfSamples > 0L) metricsNativeConfMin else -1.0
             val nativeConfMax = if (metricsNativeConfSamples > 0L) metricsNativeConfMax else -1.0
@@ -5163,6 +6967,7 @@ class OpenCVTrackerAnalyzer(
                     "backendActive=${activeTrackBackend.name.lowercase(Locale.US)} " +
                     "avgFrameMs=${fmt(avgMs)} trackRatio=${fmt(trackRatio)} locks=$metricsLockCount " +
                     "lost=$metricsLostCount replayPtsSec=${fmt(replayPtsSec)} firstLockSec=${fmt(firstLockSec)} firstLockReplaySec=${fmt(firstLockReplaySec)} firstLockFrame=$metricsFirstLockFrame " +
+                    "stage=${trackingStage.name.lowercase(Locale.US)} tracking=$isTracking box=$perfBoxToken " +
                     "nativeFuseSoft=$metricsNativeFuseSoftCount nativeFuseHard=$metricsNativeFuseHardCount " +
                     "nativeHold=$metricsNativeLowConfHoldCount kalmanPredHold=$metricsKalmanPredHoldCount nativeLowStreak=$nativeLowConfidenceStreak " +
                     "nativeWarmup=$nativeFuseWarmupRemaining " +
@@ -5302,8 +7107,10 @@ class OpenCVTrackerAnalyzer(
         private const val MIN_TEMPLATE_LEVEL_KEYPOINTS = 10
         private const val MIN_TEMPLATE_USABLE_KEYPOINTS = 50
         private const val MAX_ACTIVE_TEMPLATE_LEVELS = 30
+        private const val MIN_TEMPLATE_DIM = 128.0
         private const val MAX_TEMPLATE_DIM = 480.0
         private val TEMPLATE_PYRAMID_SCALES = doubleArrayOf(1.0, 0.75, 0.5, 0.35, 0.25, 0.18, 0.125, 0.09, 0.075)
+        private val TEMPLATE_POSE_AUGMENT_DEGREES = doubleArrayOf(-30.0, -15.0, 0.0, 15.0, 30.0)
 
         private const val MIN_HOMOGRAPHY_EDGE_PX = 6.0
         private const val MIN_HOMOGRAPHY_POLYGON_AREA = 48.0
@@ -5370,14 +7177,26 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_SEARCH_ULTRA_HIGH_RES_SHORT_EDGE = 1080
         private const val DEFAULT_SEARCH_MAX_LONG_EDGE = 640
         private const val DEFAULT_SEARCH_MULTI_TEMPLATE_MAX_LONG_EDGE = 520
+        private const val DEFAULT_CENTER_ROI_SEARCH_ENABLED = false
+        private const val DEFAULT_CENTER_ROI_GPS_READY = false
+        private const val DEFAULT_CENTER_ROI_L1_RANGE = 0.20
+        private const val DEFAULT_CENTER_ROI_L2_RANGE = 0.40
+        private const val DEFAULT_CENTER_ROI_L1_TIMEOUT_MS = 500L
+        private const val DEFAULT_CENTER_ROI_L2_TIMEOUT_MS = 1_000L
+        private const val DEFAULT_CENTER_ROI_L3_TIMEOUT_MS = 2_000L
+        private const val DESCEND_HEARTBEAT_MS = 1_000L
+        private const val DESCEND_LOST_BUFFER_MS = 1_000L
         private const val DEFAULT_INIT_BOX_SIZE = 100
         private const val DEFAULT_FALLBACK_MIN_BOX_SIZE = 48
         private const val DEFAULT_FALLBACK_MAX_BOX_SIZE = 180
+        private const val FALLBACK_TEMPLATE_ASPECT_MIN = 0.50
+        private const val FALLBACK_TEMPLATE_ASPECT_MAX = 2.20
         private const val DEFAULT_HOMOGRAPHY_MAX_DISTORTION = 0.20
         private const val DEFAULT_HOMOGRAPHY_SCALE_MIN = 0.60
         private const val DEFAULT_HOMOGRAPHY_SCALE_MAX = 1.80
         private const val DEFAULT_HOMOGRAPHY_MIN_JACOBIAN_DET = 1e-5
         private const val DEFAULT_TEMPLATE_MIN_TEXTURE_SCORE = 15.0
+        private const val DEFAULT_TEMPLATE_POSE_AUGMENT_ENABLED = false
 
         private const val DEFAULT_ORB_FAR_BOOST_MULTI_TEMPLATE_CAP = 1200
 
@@ -5429,7 +7248,7 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_FALLBACK_REFINE_MIN_INLIERS = 4
         private const val DEFAULT_FALLBACK_REFINE_MIN_CONFIDENCE = 0.40
         private const val DEFAULT_FALLBACK_REFINE_LOWE_RATIO = 0.84
-        private const val DEFAULT_SMALL_TARGET_AREA_RATIO = 0.05
+        private const val DEFAULT_SMALL_TARGET_AREA_RATIO = 0.08
         private const val DEFAULT_SMALL_TARGET_MIN_GOOD_MATCHES = 4
         private const val DEFAULT_SMALL_TARGET_MIN_INLIERS = 3
         private const val DEFAULT_SMALL_TARGET_SCALE_THRESHOLD = 0.55
@@ -5469,6 +7288,8 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_AUTO_VERIFY_STRONG_MIN_CONFIDENCE = 0.36
         private const val DEFAULT_AUTO_VERIFY_STRONG_APPEARANCE_MIN_LIVE = 0.16
         private const val DEFAULT_AUTO_VERIFY_STRONG_APPEARANCE_MIN_REPLAY = 0.10
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MISSING_MIN_CONF_LIVE = 0.38
+        private const val DEFAULT_AUTO_VERIFY_LOCAL_MISSING_MIN_CONF_REPLAY = 0.42
         private const val DEFAULT_AUTO_VERIFY_LOCAL_ROI_EXPAND_FACTOR = 1.6
         private const val DEFAULT_AUTO_VERIFY_LOCAL_CENTER_FACTOR_LIVE = 0.75
         private const val DEFAULT_AUTO_VERIFY_LOCAL_CENTER_FACTOR_REPLAY = 1.80
@@ -5480,12 +7301,15 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_AUTO_VERIFY_LOCAL_MIN_CONF_FLOOR_REPLAY = 0.24
         private const val DEFAULT_AUTO_VERIFY_APPEAR_STRONG_GOOD = 24
         private const val DEFAULT_AUTO_VERIFY_APPEAR_STRONG_INLIERS = 10
-        private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_STRONG = -0.06
+        private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_STRONG = 0.0
         private const val DEFAULT_AUTO_VERIFY_APPEAR_MEDIUM_GOOD = 20
         private const val DEFAULT_AUTO_VERIFY_APPEAR_MEDIUM_INLIERS = 8
         private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_MEDIUM = -0.25
         private const val DEFAULT_AUTO_VERIFY_APPEAR_MIN_BASE = -0.25
         private const val DEFAULT_AUTO_VERIFY_APPEAR_LIVE_BIAS = 0.06
+        private const val DEFAULT_AUTO_VERIFY_REJECT_FLIP_REPLAY = true
+        private const val DEFAULT_AUTO_VERIFY_RELOCK_MIN_CONF_LIVE = 0.26
+        private const val DEFAULT_AUTO_VERIFY_RELOCK_MIN_CONF_REPLAY = 0.34
         private const val DEFAULT_KALMAN_ENABLED = false
         private const val DEFAULT_KALMAN_PROCESS_NOISE = 0.10
         private const val DEFAULT_KALMAN_MEASUREMENT_NOISE = 0.24
@@ -5502,44 +7326,146 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_KALMAN_PRIOR_ONLY_ON_UNCERTAIN = true
         private const val DEFAULT_KALMAN_PRIOR_MIN_IOU = 0.25
         private const val DEFAULT_KALMAN_PRIOR_STALE_MS = 100L
-        private const val DEFAULT_LOCK_HOLD_FRAMES = 2
+        private const val DEFAULT_LOCK_HOLD_FRAMES = 3
         private const val DEFAULT_LOST_OVERLAY_HOLD_MS = 120L
         private const val DEFAULT_FAST_FIRST_LOCK_FRAMES = 240
         private const val FAST_FIRST_LOCK_MIN_GOOD_MATCHES = 12
         private const val FAST_FIRST_LOCK_MIN_INLIERS = 4
         private const val FAST_FIRST_LOCK_MIN_CONFIDENCE = 0.24
+        private const val STARTUP_DIRECT_INIT_MIN_GOOD = 20
+        private const val STARTUP_DIRECT_INIT_MIN_INLIERS = 8
+        private const val STARTUP_DIRECT_INIT_MIN_CONF = 0.40
+        private const val STARTUP_TEMPORAL_MIN_GOOD_RELAX = 1
+        private const val STARTUP_TEMPORAL_MIN_INLIERS_RELAX = 1
+        private const val STARTUP_TEMPORAL_CONFIDENCE_RELAX = 0.05
+        private const val STARTUP_TEMPORAL_CONFIDENCE_FLOOR = 0.08
+        private const val STARTUP_STABLE_FRAMES_RELAX = 1
+        private const val STARTUP_STABLE_MS_RELAX = 60L
+        private const val STARTUP_APPEAR_AVG_RELAX = 0.04
+        private const val STARTUP_APPEAR_SINGLE_RELAX = 0.05
         private const val DEFAULT_FORCE_TRACKER_GC_ON_DROP = true
         private const val TRACKER_GC_MIN_INTERVAL_MS = 1_200L
         private const val DEFAULT_NATIVE_MODEL_PARAM_PATH = "/data/local/tmp/nanotrack.param"
         private const val DEFAULT_NATIVE_MODEL_BIN_PATH = "/data/local/tmp/nanotrack.bin"
 
-        private const val DEFAULT_TRACK_VERIFY_INTERVAL_FRAMES = 30
+        private const val DEFAULT_TRACK_VERIFY_INTERVAL_FRAMES = 15
         private const val DEFAULT_TRACK_VERIFY_LOCAL_EXPAND_FACTOR = 2.2
         private const val DEFAULT_TRACK_VERIFY_MIN_GOOD_MATCHES = 5
         private const val DEFAULT_TRACK_VERIFY_MIN_INLIERS = 3
         private const val DEFAULT_TRACK_VERIFY_FAIL_TOLERANCE = 3
         private const val DEFAULT_TRACK_VERIFY_RECENTER_PX = 48.0
         private const val DEFAULT_TRACK_VERIFY_MIN_IOU = 0.35
-        private const val DEFAULT_TRACK_VERIFY_SWITCH_CONFIDENCE_MARGIN = 0.15
+        private const val DEFAULT_TRACK_VERIFY_SWITCH_CONFIDENCE_MARGIN = 0.25
         private const val TRACK_VERIFY_HARD_MIN_GOOD_MATCHES = 5
         private const val DEFAULT_TRACK_VERIFY_HARD_DRIFT_TOLERANCE = 3
-        private const val DEFAULT_TRACK_VERIFY_NATIVE_BYPASS_CONFIDENCE = 0.55
-        private const val DEFAULT_TRACK_GUARD_MAX_CENTER_JUMP_FACTOR = 1.30
-        private const val DEFAULT_TRACK_GUARD_MIN_AREA_RATIO = 0.35
+        private const val DEFAULT_TRACK_VERIFY_NATIVE_BYPASS_CONFIDENCE = 0.72
+        private const val DEFAULT_TRACK_GUARD_MAX_CENTER_JUMP_FACTOR = 1.45
+        private const val DEFAULT_TRACK_GUARD_MIN_AREA_RATIO = 0.30
         private const val DEFAULT_TRACK_GUARD_MAX_AREA_RATIO = 2.00
-        private const val DEFAULT_TRACK_GUARD_DROP_STREAK = 3
+        private const val DEFAULT_TRACK_GUARD_DROP_STREAK = 6
         private const val DEFAULT_TRACK_GUARD_APPEARANCE_CHECK_INTERVAL = 2L
         private const val DEFAULT_TRACK_GUARD_MIN_APPEARANCE_SCORE = -0.12
         private const val DEFAULT_TRACK_GUARD_ANCHOR_ENABLED = true
-        private const val DEFAULT_TRACK_GUARD_ANCHOR_MAX_DROP = 0.24
+        private const val DEFAULT_TRACK_GUARD_ANCHOR_MAX_DROP = 0.20
         private const val DEFAULT_TRACK_GUARD_ANCHOR_MIN_SCORE = -1.0
-        private const val DEFAULT_SMALL_TARGET_NATIVE_VERIFY_INTERVAL_FRAMES = 2
+        private const val DEFAULT_TRACK_GUARD_ACCEL_GRACE_FRAMES = 5
+        private const val TRACK_GUARD_ACCEL_CONF_MIN = 0.72
+        private const val TRACK_GUARD_ACCEL_JUMP_BOOST = 1.8
+        private const val TRACK_GUARD_ACCEL_AREA_MIN_SCALE = 0.75
+        private const val TRACK_GUARD_ACCEL_AREA_MAX_SCALE = 1.25
+        private const val TRACK_GUARD_ACCEL_DROP_STREAK_MIN = 8
+        private const val TRACK_GUARD_ACCEL_SPIKE_JUMP_RATIO = 1.45
+        private const val TRACK_GUARD_ACCEL_SPIKE_AREA_MIN_SCALE = 0.60
+        private const val TRACK_GUARD_ACCEL_SPIKE_AREA_MAX_SCALE = 1.40
+        private const val TRACK_GUARD_HARD_APPEAR_MARGIN = 0.05
+        private const val TRACK_GUARD_HARD_APPEAR_CONF_MIN = 0.45
+        private const val TRACK_VERIFY_BYPASS_ANCHOR_MARGIN = 0.08
+        private const val TRACK_VERIFY_GLOBAL_REALIGN_MIN_GOOD = 12
+        private const val TRACK_VERIFY_GLOBAL_REALIGN_MIN_INLIERS = 5
+        private const val TRACK_VERIFY_ACCEL_CONF_RELAX = 0.10
+        private const val TRACK_VERIFY_ACCEL_MOTION_RATIO = 1.10
+        private const val TRACK_VERIFY_ACCEL_RECENTER_BOOST = 1.60
+        private const val TRACK_VERIFY_ACCEL_MIN_IOU_RELAX = 0.10
+        private const val TRACK_VERIFY_ACCEL_FAIL_TOL_BONUS = 2
+        private const val TRACK_VERIFY_ACCEL_HARD_TOL_BONUS = 1
+        private const val DEFAULT_SMALL_TARGET_NATIVE_VERIFY_INTERVAL_FRAMES = 1
         private const val DEFAULT_SMALL_TARGET_NATIVE_VERIFY_AREA_SCALE = 1.0
-        private const val DEFAULT_SMALL_TARGET_ANCHOR_DROP_SCALE = 0.65
+        private const val DEFAULT_SMALL_TARGET_ANCHOR_DROP_SCALE = 0.40
+        private const val DEFAULT_AUTO_VERIFY_LOST_PRIOR_MAX_FRAMES_LIVE = 36L
+        private const val DEFAULT_AUTO_VERIFY_LOST_PRIOR_MAX_FRAMES_REPLAY = 240L
+        private const val AUTO_VERIFY_LOST_PRIOR_MIN_SIDE_LIVE = 20.0
+        private const val AUTO_VERIFY_LOST_PRIOR_MIN_SIDE_REPLAY = 40.0
+        private const val DEFAULT_AUTO_VERIFY_LOST_PRIOR_CENTER_FACTOR_LIVE = 2.4
+        private const val DEFAULT_AUTO_VERIFY_LOST_PRIOR_CENTER_FACTOR_REPLAY = 2.6
+        private const val DEFAULT_AUTO_VERIFY_LOST_PRIOR_MIN_IOU_LIVE = 0.05
+        private const val DEFAULT_AUTO_VERIFY_LOST_PRIOR_MIN_IOU_REPLAY = 0.02
+        private const val DEFAULT_AUTO_VERIFY_LOST_PRIOR_CENTER_BOOST_FRAMES = 120L
+        private const val DEFAULT_AUTO_VERIFY_LOST_PRIOR_CENTER_BOOST_CAP = 0.6
+        private const val DEFAULT_AUTO_VERIFY_LOST_ANCHOR_NEAR_FACTOR_LIVE = 2.8
+        private const val DEFAULT_AUTO_VERIFY_LOST_ANCHOR_NEAR_FACTOR_REPLAY = 3.2
+        private const val DEFAULT_AUTO_VERIFY_LOST_FAR_RECOVER_MIN_GOOD = 16
+        private const val DEFAULT_AUTO_VERIFY_LOST_FAR_RECOVER_MIN_INLIERS = 6
+        private const val DEFAULT_AUTO_VERIFY_LOST_FAR_RECOVER_MIN_CONF_LIVE = 0.46
+        private const val DEFAULT_AUTO_VERIFY_LOST_FAR_RECOVER_MIN_CONF_REPLAY = 0.52
+        private const val DEFAULT_AUTO_VERIFY_LOST_FAR_RECOVER_MIN_APPEARANCE = -0.14
+        private const val DEFAULT_AUTO_VERIFY_FIRST_LOCK_APPEAR_MIN_LIVE = 0.05
+        private const val DEFAULT_AUTO_VERIFY_FIRST_LOCK_APPEAR_MIN_REPLAY = 0.02
+        private const val DEFAULT_AUTO_VERIFY_FIRST_LOCK_MIN_INLIERS_REPLAY = 4
+        private const val DEFAULT_AUTO_VERIFY_FIRST_LOCK_REQUIRE_LOCAL_LIVE = false
+        private const val DEFAULT_AUTO_VERIFY_FIRST_LOCK_REQUIRE_LOCAL_REPLAY = false
+        private const val DEFAULT_AUTO_VERIFY_FIRST_LOCK_CENTER_GUARD_REPLAY = false
+        private const val DEFAULT_AUTO_VERIFY_FIRST_LOCK_CENTER_FACTOR_REPLAY = 0.22
+        private const val DEFAULT_SPATIAL_GATE_ENABLED = true
+        private const val DEFAULT_SPATIAL_GATE_WEIGHT = 0.35
+        private const val DEFAULT_SPATIAL_GATE_CENTER_SIGMA_FACTOR = 1.25
+        private const val DEFAULT_SPATIAL_GATE_SIZE_SIGMA_FACTOR = 0.80
+        private const val DEFAULT_SPATIAL_GATE_RELOCK_MIN_SCORE_LIVE = 0.08
+        private const val DEFAULT_SPATIAL_GATE_RELOCK_MIN_SCORE_REPLAY = 0.05
+        private const val DEFAULT_SPATIAL_GATE_RELOCK_BYPASS_CONF = 0.72
+        private const val DEFAULT_SPATIAL_GATE_RELOCK_BYPASS_APPEARANCE = 0.16
+        private const val NATIVE_SPATIAL_MAHAL_MAX_LIVE = 9.49
+        private const val NATIVE_SPATIAL_MAHAL_MAX_REPLAY = 11.50
+        private const val NATIVE_SPATIAL_FUSION_MIN_LIVE = 0.28
+        private const val NATIVE_SPATIAL_FUSION_MIN_REPLAY = 0.24
+        private const val AUTO_VERIFY_RELOCK_ANCHOR_MAX_DROP_LIVE = 0.14
+        private const val AUTO_VERIFY_RELOCK_ANCHOR_MAX_DROP_REPLAY = 0.18
+        private const val AUTO_VERIFY_RELOCK_RECENT_LOST_WINDOW_FRAMES_LIVE = 48L
+        private const val AUTO_VERIFY_RELOCK_RECENT_LOST_WINDOW_FRAMES_REPLAY = 180L
+        private const val AUTO_VERIFY_RELOCK_RECENT_LOST_MIN_SPATIAL_LIVE = 0.14
+        private const val AUTO_VERIFY_RELOCK_RECENT_LOST_MIN_SPATIAL_REPLAY = 0.08
+        private const val AUTO_VERIFY_RELOCK_SPATIAL_RELAX_STREAK_LIVE = 4
+        private const val AUTO_VERIFY_RELOCK_SPATIAL_RELAX_STREAK_REPLAY = 5
+        private const val AUTO_VERIFY_RELOCK_SPATIAL_RELAX_MIN_SCORE = 0.0
+        private const val AUTO_VERIFY_RELOCK_SPATIAL_RELAX_MIN_APPEARANCE = -1.0
+        private const val AUTO_VERIFY_RELOCK_RECENT_LOST_BYPASS_CONF_BONUS = 0.12
+        private const val AUTO_VERIFY_RELOCK_RECENT_LOST_BYPASS_APPEARANCE_BONUS = 0.10
+        private const val AUTO_VERIFY_LOST_FAR_RECOVER_EXTRA_CONF_LIVE = 0.04
+        private const val AUTO_VERIFY_LOST_FAR_RECOVER_EXTRA_CONF_REPLAY = 0.04
+        private const val AUTO_VERIFY_LOST_FAR_RECOVER_ANCHOR_MAX_DROP = 0.12
+        private const val AUTO_VERIFY_FAST_RELOCK_WINDOW_FRAMES_LIVE = 45L
+        private const val AUTO_VERIFY_FAST_RELOCK_WINDOW_FRAMES_REPLAY = 180L
+        private const val AUTO_VERIFY_FAST_RELOCK_CENTER_FACTOR = 2.4
+        private const val AUTO_VERIFY_FAST_RELOCK_MIN_IOU = 0.01
+        private const val AUTO_VERIFY_FAST_RELOCK_ANCHOR_MAX_DROP = 0.20
+        private const val AUTO_VERIFY_FAST_RELOCK_CONF_RELAX = 0.12
+        private const val AUTO_VERIFY_FAST_RELOCK_SPATIAL_RELAX = 0.08
+        private const val PROMOTED_RELOCK_NEAR_CENTER_FACTOR = 2.2
+        private const val PROMOTED_RELOCK_NEAR_MIN_IOU = 0.02
+        private const val PROMOTED_RELOCK_NEAR_CONF_RELAX = 0.08
+        private const val PROMOTED_RELOCK_NEAR_ANCHOR_MAX_DROP = 0.22
+        private const val PROMOTED_RELOCK_FAR_EXTRA_CONF = 0.03
+        private const val PROMOTED_RELOCK_FAR_ANCHOR_MAX_DROP = 0.14
+        private const val DEFAULT_S2_SUPPRESS_KCF_FALLBACK_ENABLED = false
+        private const val DEFAULT_S3_PROMOTED_NEAR_GATE_ENABLED = false
+        private const val DEFAULT_S3_PROMOTED_FAR_GATE_ENABLED = false
+        private const val DEFAULT_S3_PROMOTED_NEAR_ANCHOR_VETO_ENABLED = false
+        private const val AUTO_VERIFY_FINAL_MIN_CONF_LIVE = 0.26
+        private const val AUTO_VERIFY_FINAL_MIN_CONF_REPLAY = 0.32
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED = 0.24
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE = 0.32
         private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_RELAX = 0.03
         private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_FLOOR = 0.10
+        private const val REPLAY_TARGET_APPEAR_GRACE_MS = 120L
         private const val REPLAY_NATIVE_VERIFY_INTERVAL_FRAMES = 10
 
         private const val SEARCH_DIAG_INTERVAL_FRAMES = 20
