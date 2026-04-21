@@ -1047,3 +1047,8 @@ GT_EXPECTED (from p0_windows.json label): cx=?, cy=?, w=?, h=?
   - L1 remains stable around `firstLockReplaySec=12.474s`, indicating intrinsic LOCK pipeline latency rather than cross-session contamination.
   - Working policy for MVP-5 acceptance: extend `center_roi_l3_timeout_ms` to `10000` as pragmatic guardrail.
   - Root-cause optimization of LOCK latency is deferred as post-MVP follow-up (target: reduce first-lock from ~12.474s to <=5s).
+- Update 2026-04-21 (L2 hold issue root cause):
+  - Root cause confirmed by new guard-subtype telemetry: `TRACK_GUARD_REJECT reason=appearance/appearance_hard` with `smallTarget=true`, while `geomStreak=0`.
+  - This indicates off-center small-target loss is dominated by appearance/anchor guard strictness, not geometric jump/area thresholds.
+  - MVP-5 pragmatic fix: `track_guard_anchor_enabled=false` for L2/L3 replay variants.
+  - Long-term direction: make `trackGuard*` thresholds center-distance adaptive (strict near center, relaxed near edges) instead of one global threshold.

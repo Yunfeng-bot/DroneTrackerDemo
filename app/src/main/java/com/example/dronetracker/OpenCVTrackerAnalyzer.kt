@@ -3672,7 +3672,27 @@ class OpenCVTrackerAnalyzer(
             }
             return false
         }
-        return trackMismatchStreak >= requiredDropStreak || trackAppearanceLowStreak >= requiredAppearanceDropStreak
+        val geomDrop = trackMismatchStreak >= requiredDropStreak
+        val appearanceDrop = trackAppearanceLowStreak >= requiredAppearanceDropStreak
+        if (geomDrop || appearanceDrop) {
+            val subtype =
+                when {
+                    trackGuardHardMismatch -> "appearance_hard"
+                    geomDrop && appearanceDrop -> "geom_appearance"
+                    appearanceDrop -> "appearance"
+                    else -> "geom"
+                }
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=TRACK_GUARD_REJECT reason=$subtype " +
+                    "conf=${fmt(confidence)} jump=${fmt(jumpDistance)} maxJump=${fmt(guardMaxJump)} " +
+                    "area=${fmt(areaRatio)} areaMin=${fmt(guardCfg.minAreaRatio)} areaMax=${fmt(guardCfg.maxAreaRatio)} " +
+                    "geomStreak=$trackMismatchStreak/$requiredDropStreak " +
+                    "appStreak=$trackAppearanceLowStreak/$requiredAppearanceDropStreak " +
+                    "hard=$trackGuardHardMismatch smallTarget=$smallTargetForGuard"
+            )
+        }
+        return geomDrop || appearanceDrop
     }
 
     private fun evaluateNativeConfidence(confidence: Double): NativeConfidenceAction {

@@ -54,6 +54,11 @@ if ($Variant -eq "l1" -or $Variant -eq "l2" -or $Variant -eq "l3") {
     # - Slightly loosen Lowe ratio to recover sparse rooftop features
     # - Extend first-lock candidate gap to survive sparse replay hits
     $baseParams += ",orb_ratio=0.82,orb_soft_min_matches=3,soft_relax_miss=4,soft_relax_max_ratio=0.82,first_lock_gap_ms=2500"
+    if ($Variant -eq "l2" -or $Variant -eq "l3") {
+        # Evidence-driven: l2 losses are appearance_hard in small-target guard path.
+        # Disable anchor hard veto for off-center variants first, keep geometry guard unchanged.
+        $baseParams += ",track_guard_anchor_enabled=false"
+    }
     # Optional strict center guard (can reduce wrong-lock, but may increase miss-lock).
     if ($StrictFirstLockCenter) {
         $baseParams += ",auto_verify_first_lock_center_guard_replay=true,auto_verify_first_lock_center_factor_replay=0.22"
