@@ -2174,7 +2174,7 @@ class OpenCVTrackerAnalyzer(
         pendingInitBox = target
     }
 
-    fun setTemplateImage(bitmap: Bitmap): Boolean = setTemplateImages(listOf(bitmap))
+    fun setTemplateImage(bitmap: Bitmap): Boolean = setTemplateImages(listOf(bitmap), source = "disk")
 
     private fun refreshManualTemplateFromLiveFrame(
         requestedBox: Rect,
@@ -2246,7 +2246,7 @@ class OpenCVTrackerAnalyzer(
 
             val templateReady =
                 try {
-                    setTemplateImages(listOf(patchBitmap))
+                    setTemplateImages(listOf(patchBitmap), source = "manual_live")
                 } finally {
                     if (!patchBitmap.isRecycled) patchBitmap.recycle()
                 }
@@ -2318,7 +2318,7 @@ class OpenCVTrackerAnalyzer(
         return NativeTrackerBridge.initTargetGray(bytes, frameRgb.cols(), frameRgb.rows(), nativeBox)
     }
 
-    fun setTemplateImages(bitmaps: List<Bitmap>): Boolean {
+    fun setTemplateImages(bitmaps: List<Bitmap>, source: String = "unknown"): Boolean {
         if (bitmaps.isEmpty()) {
             clearTemplateSources()
             clearTemplateFeatures()
@@ -2373,7 +2373,7 @@ class OpenCVTrackerAnalyzer(
                 Log.w(TAG, "template loaded but ORB template quality is weak")
                 Log.w(
                     TAG,
-                    "EVAL_EVENT type=TEMPLATE_WEAK kp=$templateKeypointCount texture=${fmt(templateTextureScore)} " +
+                    "EVAL_EVENT type=TEMPLATE_WEAK source=$source kp=$templateKeypointCount texture=${fmt(templateTextureScore)} " +
                         "textureMin=${fmt(templateMinTextureScore)} templates=$templateLibrarySize"
                 )
             }
@@ -2389,7 +2389,7 @@ class OpenCVTrackerAnalyzer(
             Log.i(TAG, "template loaded: ${templateLibrarySize} templates first=${firstW}x${firstH}")
             Log.w(
                 TAG,
-                "EVAL_EVENT type=TEMPLATE_READY templates=$templateLibrarySize width=$firstW height=$firstH " +
+                "EVAL_EVENT type=TEMPLATE_READY source=$source templates=$templateLibrarySize width=$firstW height=$firstH " +
                     "kp=$templateKeypointCount texture=${fmt(templateTextureScore)} ready=$ok"
             )
             logDiag(

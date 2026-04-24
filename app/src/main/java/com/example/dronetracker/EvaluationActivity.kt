@@ -198,7 +198,7 @@ class EvaluationActivity : AppCompatActivity() {
             }
             if (bitmaps.isEmpty()) return false
 
-            val ready = trackerAnalyzer.setTemplateImages(bitmaps)
+            val ready = trackerAnalyzer.setTemplateImages(bitmaps, source = "disk")
             if (!ready) {
                 Toast.makeText(this, "Template texture is too weak", Toast.LENGTH_LONG).show()
             }
@@ -362,8 +362,8 @@ class EvaluationActivity : AppCompatActivity() {
         private const val EXTRA_EVAL_CSV_PATH = "eval_csv_path"
         private const val EXTRA_EVAL_LOOP = "eval_loop"
 
-        private const val DEFAULT_EVAL_VIDEO_PATH = "/sdcard/test.mp4"
-        private const val DEFAULT_EVAL_TARGET_PATH = "/sdcard/Download/Video_Search/target.jpg"
+        private const val DEFAULT_EVAL_VIDEO_PATH = "/sdcard/Download/Video_Search/scene_20260417.mp4"
+        private const val DEFAULT_EVAL_TARGET_PATH = "/sdcard/Download/Video_Search/target0417_s640.jpg"
         private const val ASSET_NCNN_BACKBONE_PARAM = "nanotrack_backbone_sim-opt.param"
         private const val ASSET_NCNN_BACKBONE_BIN = "nanotrack_backbone_sim-opt.bin"
         private const val ASSET_NCNN_HEAD_PARAM = "nanotrack_head_sim-opt.param"
