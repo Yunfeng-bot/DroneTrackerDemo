@@ -559,6 +559,10 @@ class OpenCVTrackerAnalyzer(
     private var manualRoiAnchorBox: Rect? = null
     @Volatile
     private var manualRoiLostFrameId: Long = -1L
+    @Volatile
+    private var manualRoiRelockBlocked = false
+    @Volatile
+    private var manualRoiPatchGray: Mat? = null
     private var isTracking = false
     private var trackingStage = TrackingStage.ACQUIRE
     private var lastTrackedBox: Rect? = null
@@ -2318,8 +2322,18 @@ class OpenCVTrackerAnalyzer(
             manualRoiFrameTsMs = frameTs
             manualRoiBboxClamped = effectiveClamped
             manualRoiInitPath = "live"
+            val patchFingerprintRoi = frameGray.submat(safe)
+            val patchFingerprint = try {
+                patchFingerprintRoi.clone()
+            } finally {
+                patchFingerprintRoi.release()
+            }
+            val oldPatchFingerprint = manualRoiPatchGray
+            manualRoiPatchGray = patchFingerprint
+            oldPatchFingerprint?.release()
             manualRoiAnchorBox = Rect(safe.x, safe.y, safe.width, safe.height)
             manualRoiLostFrameId = -1L
+            manualRoiRelockBlocked = false
             Log.w(
                 TAG,
                 "EVAL_EVENT type=MANUAL_ROI_INIT_OK tsMs=$frameTs init_path=$manualRoiInitPath " +
@@ -2992,6 +3006,9 @@ class OpenCVTrackerAnalyzer(
         if (clearSession || !manualRoiSessionActive) {
             manualRoiAnchorBox = null
             manualRoiLostFrameId = -1L
+            manualRoiPatchGray?.release()
+            manualRoiPatchGray = null
+            manualRoiRelockBlocked = false
         }
     }
 
@@ -3427,7 +3444,7 @@ class OpenCVTrackerAnalyzer(
         if (
             isManualRoiSessionActive() &&
             isCandidateLockableForInit(confirmed, frame.cols(), frame.rows()) &&
-            passesManualRoiRelockGate(confirmed, frame.cols(), frame.rows())
+            passesManualRoiRelockGate(confirmed, frame)
         ) {
             searchMissStreak = 0
             clearFirstLockCandidate("manual_roi_direct")
@@ -3715,6 +3732,7 @@ class OpenCVTrackerAnalyzer(
                 TAG,
                 "EVAL_EVENT type=MANUAL_ROI_TRACK_VETO src=native_mat reason=$reason conf=${fmt(nativeGateConfidence)}"
             )
+            enterManualRoiRelockBlocked("track_veto:$reason")
             logDiag("MANUAL_ROI_LIFECYCLE", "session=$diagSessionId trigger=track_veto:$reason")
             onLost("manual_track_veto")
             return
@@ -3852,6 +3870,7 @@ class OpenCVTrackerAnalyzer(
                 TAG,
                 "EVAL_EVENT type=MANUAL_ROI_TRACK_VETO src=native_img reason=$reason conf=${fmt(nativeGateConfidence)}"
             )
+            enterManualRoiRelockBlocked("track_veto:$reason")
             logDiag("MANUAL_ROI_LIFECYCLE", "session=$diagSessionId trigger=track_veto:$reason")
             onLost("manual_track_veto")
             return
@@ -4030,6 +4049,17 @@ class OpenCVTrackerAnalyzer(
         }
 
         return null
+    }
+
+    private fun enterManualRoiRelockBlocked(trigger: String) {
+        if (manualRoiRelockBlocked) return
+        manualRoiRelockBlocked = true
+        Log.w(
+            TAG,
+            "EVAL_EVENT type=MANUAL_ROI state=relock_blocked trigger=$trigger " +
+                "anchor=${manualRoiAnchorBox?.let { "${it.x},${it.y},${it.width}x${it.height}" } ?: "none"}"
+        )
+        logDiag("MANUAL_ROI_LIFECYCLE", "session=$diagSessionId trigger=enter_relock_blocked:$trigger")
     }
 
     private fun resolveNativeMeasurementConfidence(result: NativeTrackerBridge.NativeTrackResult): Double {
@@ -6180,17 +6210,63 @@ class OpenCVTrackerAnalyzer(
             candidate.confidence >= minConfidence
     }
 
-    private fun passesManualRoiRelockGate(
-        candidate: OrbMatchCandidate,
-        frameW: Int,
-        frameH: Int
-    ): Boolean {
+    private fun verifyCandidateViaTemplateFingerprint(candidate: OrbMatchCandidate, frame: Mat): Double? {
+        if (!MANUAL_ROI_FINGERPRINT_ENABLED) return null
+        val patch = manualRoiPatchGray
+        if (patch == null || patch.empty()) return null
+        if (patch.width() < MANUAL_ROI_FINGERPRINT_MIN_SIDE || patch.height() < MANUAL_ROI_FINGERPRINT_MIN_SIDE) {
+            return null
+        }
+
+        val safeBox = clampRect(candidate.box, frame.cols(), frame.rows()) ?: return null
+        if (safeBox.width < MANUAL_ROI_FINGERPRINT_MIN_SIDE || safeBox.height < MANUAL_ROI_FINGERPRINT_MIN_SIDE) {
+            return null
+        }
+
+        val region = frame.submat(safeBox)
+        var grayRegion = region
+        var needReleaseGray = false
+        val resized = Mat()
+        val result = Mat()
+        return try {
+            if (region.channels() != 1) {
+                grayRegion = Mat()
+                val cvtCode =
+                    when (region.channels()) {
+                        3 -> Imgproc.COLOR_RGB2GRAY
+                        4 -> Imgproc.COLOR_RGBA2GRAY
+                        else -> return null
+                    }
+                Imgproc.cvtColor(region, grayRegion, cvtCode)
+                needReleaseGray = true
+            }
+
+            Imgproc.resize(
+                grayRegion,
+                resized,
+                Size(patch.width().toDouble(), patch.height().toDouble())
+            )
+            Imgproc.matchTemplate(resized, patch, result, Imgproc.TM_CCOEFF_NORMED)
+            Core.minMaxLoc(result).maxVal.coerceIn(-1.0, 1.0)
+        } catch (t: Throwable) {
+            Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_FINGERPRINT_ERROR err=${t.message}")
+            null
+        } finally {
+            result.release()
+            resized.release()
+            if (needReleaseGray) grayRegion.release()
+            region.release()
+        }
+    }
+
+    private fun passesManualRoiRelockGate(candidate: OrbMatchCandidate, frame: Mat): Boolean {
         if (!MANUAL_ROI_STRICT_RELOCK_V2_ENABLED) return true
 
         val gatePrefix =
             "session=$diagSessionId stage=manual_relock_v2 " +
                 "good=${candidate.goodMatches} inliers=${candidate.inlierCount} " +
-                "conf=${fmt(candidate.confidence)} fallback=${candidate.fallbackReason ?: "none"}"
+                "conf=${fmt(candidate.confidence)} fallback=${candidate.fallbackReason ?: "none"} " +
+                "blocked=$manualRoiRelockBlocked"
 
         if (candidate.fallbackReason == "refined_area_small") {
             logDiag("LOCK_GATE", "$gatePrefix pass=false reason=ban_refined_area_small")
@@ -6245,7 +6321,39 @@ class OpenCVTrackerAnalyzer(
             }
         }
 
-        logDiag("LOCK_GATE", "$gatePrefix pass=true")
+        val ncc = verifyCandidateViaTemplateFingerprint(candidate, frame)
+        if (ncc == null) {
+            if (manualRoiRelockBlocked) {
+                logDiag("LOCK_GATE", "$gatePrefix pass=false reason=blocked_no_fingerprint")
+                return false
+            }
+            logDiag("LOCK_GATE", "$gatePrefix pass=true reason=fingerprint_unavailable")
+            return true
+        }
+
+        if (ncc < MANUAL_ROI_RELOCK_MIN_FINGERPRINT_NCC) {
+            logDiag(
+                "LOCK_GATE",
+                "$gatePrefix pass=false reason=fingerprint_mismatch ncc=${fmt(ncc)} min=${fmt(MANUAL_ROI_RELOCK_MIN_FINGERPRINT_NCC)}"
+            )
+            return false
+        }
+
+        if (manualRoiRelockBlocked) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI state=relock_unblocked trigger=fingerprint_pass " +
+                    "ncc=${fmt(ncc)} min=${fmt(MANUAL_ROI_RELOCK_MIN_FINGERPRINT_NCC)} " +
+                    "box=${candidate.box.x},${candidate.box.y},${candidate.box.width}x${candidate.box.height}"
+            )
+            logDiag(
+                "MANUAL_ROI_LIFECYCLE",
+                "session=$diagSessionId trigger=exit_relock_blocked:fingerprint_pass ncc=${fmt(ncc)}"
+            )
+            manualRoiRelockBlocked = false
+        }
+
+        logDiag("LOCK_GATE", "$gatePrefix pass=true ncc=${fmt(ncc)}")
         return true
     }
 
@@ -8223,6 +8331,12 @@ class OpenCVTrackerAnalyzer(
         private const val MANUAL_ROI_TRACK_AREA_MIN_SHRINK = 0.25
         private const val MANUAL_ROI_TRACK_MAX_CENTER_JUMP_FACTOR = 3.0
         private const val MANUAL_ROI_TRACK_EDGE_HUG_PX = 4
+        // Phase 1 T4.2 Batch 7 v2: template fingerprint verification.
+        // ORB proposes a candidate; NCC confirms that its pixels still look like the
+        // original manual patch. Thresholds will be re-tuned after T4.3 probe data.
+        private const val MANUAL_ROI_FINGERPRINT_ENABLED = true
+        private const val MANUAL_ROI_RELOCK_MIN_FINGERPRINT_NCC = 0.70
+        private const val MANUAL_ROI_FINGERPRINT_MIN_SIDE = 16
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED = 0.24
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE = 0.32
         private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_RELAX = 0.03
