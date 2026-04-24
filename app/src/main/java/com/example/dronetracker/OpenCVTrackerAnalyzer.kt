@@ -555,6 +555,10 @@ class OpenCVTrackerAnalyzer(
     private var manualRoiBboxClamped = false
     @Volatile
     private var manualRoiInitPath = "none"
+    @Volatile
+    private var manualRoiAnchorBox: Rect? = null
+    @Volatile
+    private var manualRoiLostFrameId: Long = -1L
     private var isTracking = false
     private var trackingStage = TrackingStage.ACQUIRE
     private var lastTrackedBox: Rect? = null
@@ -2223,7 +2227,7 @@ class OpenCVTrackerAnalyzer(
             }
 
             // Frame freshness check: if cache is older than 500ms, warn but don't fail.
-            val frameAgeMs = if (frameTs > 0) (System.currentTimeMillis() - frameTs) else -1L
+            val frameAgeMs = if (frameTs > 0) (SystemClock.elapsedRealtime() - frameTs) else -1L
 
             val patchForStats = frameGray.submat(safe)
             val meanStd = MatOfDouble()
@@ -2314,6 +2318,8 @@ class OpenCVTrackerAnalyzer(
             manualRoiFrameTsMs = frameTs
             manualRoiBboxClamped = effectiveClamped
             manualRoiInitPath = "live"
+            manualRoiAnchorBox = Rect(safe.x, safe.y, safe.width, safe.height)
+            manualRoiLostFrameId = -1L
             Log.w(
                 TAG,
                 "EVAL_EVENT type=MANUAL_ROI_INIT_OK tsMs=$frameTs init_path=$manualRoiInitPath " +
@@ -2983,6 +2989,10 @@ class OpenCVTrackerAnalyzer(
         manualRoiPatchTexture = Double.NaN
         manualRoiBboxClamped = false
         manualRoiInitPath = "none"
+        if (clearSession || !manualRoiSessionActive) {
+            manualRoiAnchorBox = null
+            manualRoiLostFrameId = -1L
+        }
     }
 
     private fun isManualRoiSessionActive(): Boolean = manualRoiActive || manualRoiSessionActive
@@ -3414,7 +3424,11 @@ class OpenCVTrackerAnalyzer(
         }
         updateLatestPrediction(confirmed.box, confirmed.confidence, tracking = false)
 
-        if (isManualRoiSessionActive() && isCandidateLockableForInit(confirmed, frame.cols(), frame.rows())) {
+        if (
+            isManualRoiSessionActive() &&
+            isCandidateLockableForInit(confirmed, frame.cols(), frame.rows()) &&
+            passesManualRoiRelockGate(confirmed, frame.cols(), frame.rows())
+        ) {
             searchMissStreak = 0
             clearFirstLockCandidate("manual_roi_direct")
             metricsSearchLastReason = "manual_roi_direct_lock"
@@ -4332,6 +4346,9 @@ class OpenCVTrackerAnalyzer(
     private fun onLost(reason: String) {
         logDiag("TRACK", "session=$diagSessionId action=lost_enter reason=$reason")
         val priorLost = lastMeasuredTrackBox ?: lastTrackedBox
+        if (isManualRoiSessionActive()) {
+            manualRoiLostFrameId = frameCounter
+        }
         releaseTracker("lost_$reason", requestGc = true, callerTrigger = "onLost:$reason")
         consecutiveTrackerFailures = 0
         trackVerifyFailStreak = 0
@@ -6071,6 +6088,75 @@ class OpenCVTrackerAnalyzer(
         return candidate.goodMatches >= minGoodFallback &&
             candidate.inlierCount >= minInliersFallback &&
             candidate.confidence >= minConfidence
+    }
+
+    private fun passesManualRoiRelockGate(
+        candidate: OrbMatchCandidate,
+        frameW: Int,
+        frameH: Int
+    ): Boolean {
+        if (!MANUAL_ROI_STRICT_RELOCK_V2_ENABLED) return true
+
+        val gatePrefix =
+            "session=$diagSessionId stage=manual_relock_v2 " +
+                "good=${candidate.goodMatches} inliers=${candidate.inlierCount} " +
+                "conf=${fmt(candidate.confidence)} fallback=${candidate.fallbackReason ?: "none"}"
+
+        if (candidate.fallbackReason == "refined_area_small") {
+            logDiag("LOCK_GATE", "$gatePrefix pass=false reason=ban_refined_area_small")
+            return false
+        }
+
+        if (candidate.goodMatches < MANUAL_ROI_RELOCK_MIN_GOOD) {
+            logDiag("LOCK_GATE", "$gatePrefix pass=false reason=low_good min=$MANUAL_ROI_RELOCK_MIN_GOOD")
+            return false
+        }
+        if (candidate.inlierCount < MANUAL_ROI_RELOCK_MIN_INLIERS) {
+            logDiag("LOCK_GATE", "$gatePrefix pass=false reason=low_inliers min=$MANUAL_ROI_RELOCK_MIN_INLIERS")
+            return false
+        }
+        if (candidate.confidence < MANUAL_ROI_RELOCK_MIN_CONF_V2) {
+            logDiag(
+                "LOCK_GATE",
+                "$gatePrefix pass=false reason=low_conf min=${fmt(MANUAL_ROI_RELOCK_MIN_CONF_V2)}"
+            )
+            return false
+        }
+
+        val anchor = manualRoiAnchorBox
+        if (anchor != null) {
+            val anchorCx = anchor.x + anchor.width / 2.0
+            val anchorCy = anchor.y + anchor.height / 2.0
+            val candCx = candidate.box.x + candidate.box.width / 2.0
+            val candCy = candidate.box.y + candidate.box.height / 2.0
+            val dist = kotlin.math.hypot(candCx - anchorCx, candCy - anchorCy)
+            val anchorDiag = kotlin.math.hypot(anchor.width.toDouble(), anchor.height.toDouble())
+            val maxDist = anchorDiag * MANUAL_ROI_RELOCK_MAX_CENTER_DIST_FACTOR
+            if (dist > maxDist) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=far_from_anchor dist=${fmt(dist)} maxDist=${fmt(maxDist)} " +
+                        "anchor=${anchor.x},${anchor.y},${anchor.width}x${anchor.height} " +
+                        "cand=${candidate.box.x},${candidate.box.y},${candidate.box.width}x${candidate.box.height}"
+                )
+                return false
+            }
+        }
+
+        if (manualRoiLostFrameId >= 0L) {
+            val framesSinceLost = frameCounter - manualRoiLostFrameId
+            if (framesSinceLost in 0 until MANUAL_ROI_RELOCK_SILENCE_FRAMES_AFTER_LOST) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=lost_silence framesSinceLost=$framesSinceLost " +
+                        "required=$MANUAL_ROI_RELOCK_SILENCE_FRAMES_AFTER_LOST"
+                )
+                return false
+            }
+        }
+
+        logDiag("LOCK_GATE", "$gatePrefix pass=true")
+        return true
     }
 
     private fun canDirectAutoInit(candidate: OrbMatchCandidate): Boolean {
@@ -8027,6 +8113,17 @@ class OpenCVTrackerAnalyzer(
         private const val MANUAL_ROI_STRICT_RELOCK_ENABLED = false
         private const val MANUAL_ROI_RELOCK_MIN_CONFIDENCE = 0.35
         private const val MANUAL_ROI_RELOCK_MIN_APPEARANCE = 0.05
+        // Phase 1 T4.2 WIP v2: manual-session hard relock gate.
+        // Data point from 2026-04-25 live-device logs:
+        // first lock patch_kp=112, false relock good=8 (<10% hit rate),
+        // false box center drifted far beyond the original box diagonal,
+        // and the relock path came through fallback=refined_area_small.
+        private const val MANUAL_ROI_STRICT_RELOCK_V2_ENABLED = true
+        private const val MANUAL_ROI_RELOCK_MIN_GOOD = 25
+        private const val MANUAL_ROI_RELOCK_MIN_INLIERS = 12
+        private const val MANUAL_ROI_RELOCK_MIN_CONF_V2 = 0.40
+        private const val MANUAL_ROI_RELOCK_MAX_CENTER_DIST_FACTOR = 2.5
+        private const val MANUAL_ROI_RELOCK_SILENCE_FRAMES_AFTER_LOST = 10
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED = 0.24
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE = 0.32
         private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_RELAX = 0.03
