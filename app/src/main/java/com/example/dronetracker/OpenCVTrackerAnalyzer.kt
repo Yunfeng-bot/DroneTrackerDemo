@@ -2228,6 +2228,10 @@ class OpenCVTrackerAnalyzer(
                 "EVAL_EVENT type=MANUAL_ROI_INIT_OK tsMs=$frameTs box=${safe.x},${safe.y},${safe.width}x${safe.height} " +
                     "view=${viewWidth}x${viewHeight}"
             )
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI state=active tsMs=$frameTs box=${safe.x},${safe.y},${safe.width}x${safe.height}"
+            )
             return true
         } finally {
             frameGray.release()
@@ -2504,8 +2508,7 @@ class OpenCVTrackerAnalyzer(
         resetCenterRoiSearchState("reset_tracking")
         resetDescendOffsetState("reset_tracking")
         resetDescendExplosionState("reset_tracking")
-        manualRoiActive = false
-        manualRoiFrameTsMs = 0L
+        clearManualRoiState("reset_tracking")
         clearLiveFrameCache()
         overlayResetToken++
         clearFirstLockCandidate("reset")
@@ -2513,7 +2516,10 @@ class OpenCVTrackerAnalyzer(
         latestSearchFrame = null
         resetKalman("reset_tracking")
         updateLatestPrediction(null, 0.0, tracking = false)
-        overlayView.post { overlayView.reset() }
+        overlayView.post {
+            clearManualRoiState("overlay_reset_reset_tracking")
+            overlayView.reset()
+        }
     }
 
     private fun releaseTracker(reason: String, requestGc: Boolean) {
@@ -2523,6 +2529,12 @@ class OpenCVTrackerAnalyzer(
         tracker = null
         if (hadNativeTracking) {
             NativeTrackerBridge.reset()
+            val keepManualRoi =
+                reason.startsWith("reinit_manual") ||
+                    reason.startsWith("reinit_manual_roi")
+            if (!keepManualRoi) {
+                clearManualRoiState("native_reset_$reason")
+            }
         }
         isTracking = false
         trackingStage = TrackingStage.ACQUIRE
@@ -2603,8 +2615,7 @@ class OpenCVTrackerAnalyzer(
         metricsSearchLastReason = "none"
         centerRoiFailEmittedThisSession = false
         centerRoiFailLatched = false
-        manualRoiActive = false
-        manualRoiFrameTsMs = 0L
+        clearManualRoiState("session_start")
         clearLiveFrameCache()
         resetCenterRoiSearchState("session_start")
         resetDescendOffsetState("session_start")
@@ -2784,7 +2795,7 @@ class OpenCVTrackerAnalyzer(
     }
 
     private fun isCenterRoiSearchActive(): Boolean {
-        return centerRoiSearchEnabled && centerRoiGpsReady && !centerRoiFailLatched
+        return centerRoiSearchEnabled && centerRoiGpsReady && !centerRoiFailLatched && !manualRoiActive
     }
 
     private fun resolveDescendSearchState(): DescendOffsetState {
@@ -2833,6 +2844,18 @@ class OpenCVTrackerAnalyzer(
         }
         oldGray?.release()
         oldRgb?.release()
+    }
+
+    private fun clearManualRoiState(reason: String) {
+        val hadActive = manualRoiActive || manualRoiFrameTsMs > 0L
+        if (hadActive) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI state=clear reason=$reason tsMs=$manualRoiFrameTsMs"
+            )
+        }
+        manualRoiActive = false
+        manualRoiFrameTsMs = 0L
     }
 
     private fun resolveDescendTimestampSec(): Double {
@@ -3261,6 +3284,21 @@ class OpenCVTrackerAnalyzer(
             )
         }
         updateLatestPrediction(confirmed.box, confirmed.confidence, tracking = false)
+
+        if (manualRoiActive && isCandidateLockableForInit(confirmed, frame.cols(), frame.rows())) {
+            searchMissStreak = 0
+            clearFirstLockCandidate("manual_roi_direct")
+            metricsSearchLastReason = "manual_roi_direct_lock"
+            initializeTracker(
+                frame,
+                confirmed.box,
+                "manual_roi_direct good=${confirmed.goodMatches} inliers=${confirmed.inlierCount} " +
+                    "conf=${fmt(confirmed.confidence)} h=${confirmed.usedHomography} ds=${fmt(confirmed.searchScale)} " +
+                    "fallback=${confirmed.fallbackReason ?: "none"} matcher=${confirmed.matcherType}",
+                image
+            )
+            return
+        }
 
         if (shouldAutoInitWithoutManual(confirmed, frame.cols(), frame.rows())) {
             if (canDirectAutoInit(confirmed) && passesAutoInitVerification(frame, confirmed)) {
@@ -4200,11 +4238,15 @@ class OpenCVTrackerAnalyzer(
         logDiag("TRACK", "session=$diagSessionId action=lost reason=$reason lost=$metricsLostCount")
         val token = ++overlayResetToken
         if (lostOverlayHoldMs <= 0L) {
-            overlayView.post { overlayView.reset() }
+            overlayView.post {
+                clearManualRoiState("overlay_reset_lost")
+                overlayView.reset()
+            }
         } else {
             overlayView.postDelayed(
                 {
                     if (!isTracking && token == overlayResetToken) {
+                        clearManualRoiState("overlay_reset_lost_delay")
                         overlayView.reset()
                     }
                 },
@@ -7226,7 +7268,10 @@ class OpenCVTrackerAnalyzer(
                 return
             }
         }
-        overlayView.post { overlayView.reset() }
+        overlayView.post {
+            clearManualRoiState("overlay_reset_uncertain")
+            overlayView.reset()
+        }
         updateLatestPrediction(null, confidence.coerceIn(0.0, 1.0), tracking = false)
         if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
             logDiag("OVERLAY", "session=$diagSessionId action=suppress reason=$reason conf=${fmt(confidence)}")
