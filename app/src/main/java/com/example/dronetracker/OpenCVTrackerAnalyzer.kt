@@ -543,6 +543,8 @@ class OpenCVTrackerAnalyzer(
     @Volatile
     private var manualRoiActive = false
     @Volatile
+    private var manualRoiSessionActive = false
+    @Volatile
     private var manualRoiFrameTsMs: Long = 0L
     @Volatile
     private var manualRoiPatchKp = -1
@@ -2270,6 +2272,7 @@ class OpenCVTrackerAnalyzer(
             }
 
             manualRoiActive = true
+            manualRoiSessionActive = true
             manualRoiFrameTsMs = frameTs
             manualRoiBboxClamped = effectiveClamped
             manualRoiInitPath = "live"
@@ -2864,7 +2867,7 @@ class OpenCVTrackerAnalyzer(
     }
 
     private fun isCenterRoiSearchActive(): Boolean {
-        return centerRoiSearchEnabled && centerRoiGpsReady && !centerRoiFailLatched && !manualRoiActive
+        return centerRoiSearchEnabled && centerRoiGpsReady && !centerRoiFailLatched && !isManualRoiSessionActive()
     }
 
     private fun resolveDescendSearchState(): DescendOffsetState {
@@ -2927,11 +2930,24 @@ class OpenCVTrackerAnalyzer(
         }
         manualRoiActive = false
         manualRoiFrameTsMs = 0L
+        val clearSession =
+            reason == "manual_init_failed" ||
+                reason == "session_start" ||
+                reason == "reset_tracking"
+        if (clearSession && manualRoiSessionActive) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI state=session_clear reason=$reason"
+            )
+            manualRoiSessionActive = false
+        }
         manualRoiPatchKp = -1
         manualRoiPatchTexture = Double.NaN
         manualRoiBboxClamped = false
         manualRoiInitPath = "none"
     }
+
+    private fun isManualRoiSessionActive(): Boolean = manualRoiActive || manualRoiSessionActive
 
     private fun resolveDescendTimestampSec(): Double {
         return currentTimelineMs().toDouble() / 1000.0
@@ -3360,7 +3376,7 @@ class OpenCVTrackerAnalyzer(
         }
         updateLatestPrediction(confirmed.box, confirmed.confidence, tracking = false)
 
-        if (manualRoiActive && isCandidateLockableForInit(confirmed, frame.cols(), frame.rows())) {
+        if (isManualRoiSessionActive() && isCandidateLockableForInit(confirmed, frame.cols(), frame.rows())) {
             searchMissStreak = 0
             clearFirstLockCandidate("manual_roi_direct")
             metricsSearchLastReason = "manual_roi_direct_lock"
@@ -4215,6 +4231,18 @@ class OpenCVTrackerAnalyzer(
     private fun holdCurrentBoxOnTransientLoss(reason: String, confidence: Double): Boolean {
         if (!isTracking) return false
         if (lockHoldFramesRemaining <= 0) return false
+        if (
+            isManualRoiSessionActive() &&
+            (reason == "track_guard_fail" || reason.startsWith("native_conf_"))
+        ) {
+            if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=LOSS_GRACE state=skip reason=manual_roi_release gate=$reason"
+                )
+            }
+            return false
+        }
         if (
             reason == "track_guard_fail" &&
             (
@@ -6216,6 +6244,7 @@ class OpenCVTrackerAnalyzer(
             }
         }
         if (isRelock) {
+            val manualStrictRelock = isManualRoiSessionActive()
             val relockMinConfBase =
                 if (!isReplayInput) autoVerifyRelockMinConfLive else autoVerifyRelockMinConfReplay
             val relockMinConf =
@@ -6230,6 +6259,23 @@ class OpenCVTrackerAnalyzer(
                     "$gatePrefix pass=false reason=relock_conf conf=${fmt(candidate.confidence)} min=${fmt(relockMinConf)} fastRelock=$fastRelockNearLostPrior"
                 )
                 return false
+            }
+            if (manualStrictRelock && MANUAL_ROI_STRICT_RELOCK_ENABLED) {
+                val manualRelockMinConf = max(relockMinConf, MANUAL_ROI_RELOCK_MIN_CONFIDENCE)
+                if (candidate.confidence < manualRelockMinConf) {
+                    logDiag(
+                        "LOCK_GATE",
+                        "$gatePrefix pass=false reason=manual_relock_conf conf=${fmt(candidate.confidence)} min=${fmt(manualRelockMinConf)}"
+                    )
+                    return false
+                }
+                if (appearanceScore < MANUAL_ROI_RELOCK_MIN_APPEARANCE) {
+                    logDiag(
+                        "LOCK_GATE",
+                        "$gatePrefix pass=false reason=manual_relock_appearance score=${fmt(appearanceScore)} min=${fmt(MANUAL_ROI_RELOCK_MIN_APPEARANCE)}"
+                    )
+                    return false
+                }
             }
             if (trackGuardAnchorEnabled && anchorScore.isFinite()) {
                 val relockAnchorMaxDrop =
@@ -6449,10 +6495,11 @@ class OpenCVTrackerAnalyzer(
                     isReplayInput &&
                     lostPrior != null &&
                     lostFramesAgo in 1..autoVerifyLostPriorMaxFramesReplay
-            if (relockRequireLocal) {
+            if (relockRequireLocal || (isRelock && isManualRoiSessionActive() && MANUAL_ROI_STRICT_RELOCK_ENABLED)) {
                 logDiag(
                     "LOCK_GATE",
-                    "$gatePrefix pass=false reason=local_missing_relock score=${fmt(appearanceScore)} conf=${fmt(candidate.confidence)} lostFrames=$lostFramesAgo"
+                    "$gatePrefix pass=false reason=local_missing_relock score=${fmt(appearanceScore)} conf=${fmt(candidate.confidence)} " +
+                        "lostFrames=$lostFramesAgo manualSession=${isManualRoiSessionActive()}"
                 )
                 return false
             }
@@ -6480,6 +6527,14 @@ class OpenCVTrackerAnalyzer(
             val confOk = local.confidence >= minLocalConf
             val geomPass = centerOk && iouOk && confOk
             val geomOverride = strongCandidate && strongAppearance
+            if (!geomPass && isRelock && isManualRoiSessionActive() && MANUAL_ROI_STRICT_RELOCK_ENABLED) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=geom_manual_relock iou=${fmt(iou)} center=${fmt(centerDist)} " +
+                        "centerTh=${fmt(side * centerFactor)} localConf=${fmt(local.confidence)}"
+                )
+                return false
+            }
             if (!geomPass && !geomOverride) {
                 logDiag(
                     "LOCK_GATE",
@@ -7903,6 +7958,11 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_S3_PROMOTED_NEAR_ANCHOR_VETO_ENABLED = false
         private const val AUTO_VERIFY_FINAL_MIN_CONF_LIVE = 0.26
         private const val AUTO_VERIFY_FINAL_MIN_CONF_REPLAY = 0.32
+        // Phase 1 WIP: strict relock gates (conf/appearance/geom) default OFF -
+        // awaiting distribution data from T4.3 probe before activating.
+        private const val MANUAL_ROI_STRICT_RELOCK_ENABLED = false
+        private const val MANUAL_ROI_RELOCK_MIN_CONFIDENCE = 0.35
+        private const val MANUAL_ROI_RELOCK_MIN_APPEARANCE = 0.05
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED = 0.24
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE = 0.32
         private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_RELAX = 0.03
