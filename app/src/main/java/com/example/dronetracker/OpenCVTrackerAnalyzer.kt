@@ -110,6 +110,12 @@ class OpenCVTrackerAnalyzer(
         val source: String
     )
 
+    private data class DescendExplosionGuardDecision(
+        val box: Rect,
+        val active: Boolean,
+        val areaRatio: Double
+    )
+
     private data class LostPriorGeometry(
         val prior: Rect,
         val framesAgo: Long,
@@ -527,6 +533,17 @@ class OpenCVTrackerAnalyzer(
     private var trackerMode = TrackerMode.ENHANCED
     private var tracker: TrackerKCF? = null
     private var pendingInitBox: Rect? = null
+    private val liveFrameCacheLock = Any()
+    @Volatile
+    private var lastLiveFrameGray: Mat? = null
+    @Volatile
+    private var lastLiveFrameRgb: Mat? = null
+    @Volatile
+    private var lastLiveFrameTsMs: Long = 0L
+    @Volatile
+    private var manualRoiActive = false
+    @Volatile
+    private var manualRoiFrameTsMs: Long = 0L
     private var isTracking = false
     private var trackingStage = TrackingStage.ACQUIRE
     private var lastTrackedBox: Rect? = null
@@ -633,6 +650,10 @@ class OpenCVTrackerAnalyzer(
     private var centerRoiL1TimeoutMs = DEFAULT_CENTER_ROI_L1_TIMEOUT_MS
     private var centerRoiL2TimeoutMs = DEFAULT_CENTER_ROI_L2_TIMEOUT_MS
     private var centerRoiL3TimeoutMs = DEFAULT_CENTER_ROI_L3_TIMEOUT_MS
+    private var descendExplosionGuardEnabled = DEFAULT_DESCEND_EXPLOSION_GUARD_ENABLED
+    private var descendExplosionAreaRatio = DEFAULT_DESCEND_EXPLOSION_AREA_RATIO
+    private var descendExplosionReleaseRatio = DEFAULT_DESCEND_EXPLOSION_RELEASE_RATIO
+    private var descendExplosionCoreSizePx = DEFAULT_DESCEND_EXPLOSION_CORE_SIZE_PX
     private var centerRoiLevel = CenterRoiLevel.L1
     private var centerRoiLevelStartMs = 0L
     private var centerRoiSessionStartMs = 0L
@@ -650,6 +671,8 @@ class OpenCVTrackerAnalyzer(
     private var descendCacheConf = Double.NaN
     private var descendLostActive = false
     private var descendLostStartMs = 0L
+    private var descendExplosionGuardActive = false
+    private var descendExplosionLastAreaRatio = 0.0
 
     private var orbMaxFeatures = DEFAULT_ORB_FEATURES
     private var orbFeatureHardCap = DEFAULT_ORB_FEATURE_HARD_CAP
@@ -1023,9 +1046,17 @@ class OpenCVTrackerAnalyzer(
                     value.toLongOrNull()?.let { centerRoiL2TimeoutMs = it.coerceIn(100L, 5_000L) }
                 "center_roi_l3_timeout_ms", "mvp_roi_l3_timeout_ms" ->
                     value.toLongOrNull()?.let { centerRoiL3TimeoutMs = it.coerceIn(200L, 10_000L) }
-                "init_box" -> value.toIntOrNull()?.let { initBoxSize = it.coerceIn(48, 360) }
+                "descend_explosion_guard", "mvp_descend_explosion_guard" ->
+                    parseBoolean(value)?.let { descendExplosionGuardEnabled = it }
+                "descend_explosion_area_ratio", "mvp_descend_explosion_area_ratio" ->
+                    value.toDoubleOrNull()?.let { descendExplosionAreaRatio = it.coerceIn(0.001, 0.95) }
+                "descend_explosion_release_ratio", "mvp_descend_explosion_release_ratio" ->
+                    value.toDoubleOrNull()?.let { descendExplosionReleaseRatio = it.coerceIn(0.001, 0.90) }
+                "descend_explosion_core_size", "mvp_descend_explosion_core_size" ->
+                    value.toIntOrNull()?.let { descendExplosionCoreSizePx = it.coerceIn(MIN_BOX_DIM, 1600) }
+                "init_box" -> value.toIntOrNull()?.let { initBoxSize = it.coerceIn(48, 1600) }
                 "fallback_box_min" -> value.toIntOrNull()?.let { fallbackMinBoxSize = it.coerceIn(32, 240) }
-                "fallback_box_max" -> value.toIntOrNull()?.let { fallbackMaxBoxSize = it.coerceIn(64, 420) }
+                "fallback_box_max" -> value.toIntOrNull()?.let { fallbackMaxBoxSize = it.coerceIn(64, 1600) }
                 "homography_distortion" -> value.toDoubleOrNull()?.let { homographyMaxDistortion = it.coerceIn(0.05, 0.60) }
                 "homography_scale_min" -> value.toDoubleOrNull()?.let { homographyScaleMin = it.coerceIn(0.40, 2.0) }
                 "homography_scale_max" -> value.toDoubleOrNull()?.let { homographyScaleMax = it.coerceIn(0.60, 3.0) }
@@ -1537,6 +1568,12 @@ class OpenCVTrackerAnalyzer(
         centerRoiL1TimeoutMs = centerRoiL1TimeoutMs.coerceIn(100L, 5_000L)
         centerRoiL2TimeoutMs = centerRoiL2TimeoutMs.coerceIn(100L, 5_000L)
         centerRoiL3TimeoutMs = centerRoiL3TimeoutMs.coerceIn(200L, 10_000L)
+        descendExplosionAreaRatio = descendExplosionAreaRatio.coerceIn(0.001, 0.95)
+        descendExplosionReleaseRatio = descendExplosionReleaseRatio.coerceIn(0.001, 0.90)
+        if (descendExplosionReleaseRatio >= descendExplosionAreaRatio) {
+            descendExplosionReleaseRatio = (descendExplosionAreaRatio - 0.05).coerceAtLeast(0.05)
+        }
+        descendExplosionCoreSizePx = descendExplosionCoreSizePx.coerceIn(MIN_BOX_DIM, 1600)
         temporalHighGoodMatches = temporalHighGoodMatches.coerceIn(4, 120)
         temporalHighInliers = temporalHighInliers.coerceIn(3, 80)
         temporalMediumGoodMatches = temporalMediumGoodMatches.coerceIn(4, temporalHighGoodMatches)
@@ -1633,6 +1670,7 @@ class OpenCVTrackerAnalyzer(
         centerRoiFailEmittedThisSession = false
         resetCenterRoiSearchState(if (ready) "gps_ready" else "gps_not_ready")
         resetDescendOffsetState(if (ready) "gps_ready" else "gps_not_ready")
+        resetDescendExplosionState(if (ready) "gps_ready" else "gps_not_ready")
         Log.w(
             TAG,
             "EVAL_EVENT type=ROI_SEARCH state=gps_ready ready=$ready reason=$reason enabled=$centerRoiSearchEnabled"
@@ -2018,6 +2056,7 @@ class OpenCVTrackerAnalyzer(
                 "centerRoi=$centerRoiSearchEnabled/$centerRoiGpsReady level=${centerRoiLevel.name.lowercase(Locale.US)} " +
                 "centerRoiRange=${fmt(centerRoiL1Range)}/${fmt(centerRoiL2Range)} " +
                 "centerRoiTimeoutMs=${centerRoiL1TimeoutMs}/${centerRoiL2TimeoutMs}/${centerRoiL3TimeoutMs} " +
+                "descendExplosion=$descendExplosionGuardEnabled/${fmt(descendExplosionAreaRatio)}/${fmt(descendExplosionReleaseRatio)}/$descendExplosionCoreSizePx " +
                 "candDump=$candDumpEnable/$candDumpWindowOnly ${fmt(candDumpStartSec)}-${fmt(candDumpEndSec)} topK=$candDumpTopK " +
                 "candDumpExpectedX=${fmt(candDumpExpectedXMin)}:${fmt(candDumpExpectedXMax)} " +
                 "s2NoKcfFallback=$s2SuppressKcfFallbackEnabled " +
@@ -2080,19 +2119,136 @@ class OpenCVTrackerAnalyzer(
     fun setInitialTarget(viewRect: RectF, viewWidth: Int, viewHeight: Int) {
         val sx = if (scaleX > 0f) scaleX else 1f
         val sy = if (scaleY > 0f) scaleY else 1f
-        pendingInitBox = Rect(
+        val mapped = Rect(
             ((viewRect.left - offsetX) / sx).toInt(),
             ((viewRect.top - offsetY) / sy).toInt(),
             (viewRect.width() / sx).toInt(),
             (viewRect.height() / sy).toInt()
         )
+        pendingInitBox = mapped
         Log.d(
             TAG,
             "manual target selected: overlay=${viewRect.width().toInt()}x${viewRect.height().toInt()} view=${viewWidth}x${viewHeight}"
         )
+        val refreshOk = refreshManualTemplateFromLiveFrame(mapped, viewWidth, viewHeight)
+        pendingInitBox = mapped
+        if (!refreshOk) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=fallback_disk_template " +
+                    "box=${mapped.x},${mapped.y},${mapped.width}x${mapped.height}"
+            )
+        }
     }
 
     fun setTemplateImage(bitmap: Bitmap): Boolean = setTemplateImages(listOf(bitmap))
+
+    private fun refreshManualTemplateFromLiveFrame(
+        requestedBox: Rect,
+        viewWidth: Int,
+        viewHeight: Int
+    ): Boolean {
+        val frameGray: Mat
+        val frameRgb: Mat
+        val frameTs: Long
+        synchronized(liveFrameCacheLock) {
+            val cachedGray = lastLiveFrameGray
+            val cachedRgb = lastLiveFrameRgb
+            if (cachedGray == null || cachedGray.empty()) {
+                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=no_live_gray")
+                return false
+            }
+            if (cachedRgb == null || cachedRgb.empty()) {
+                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=no_live_rgb")
+                return false
+            }
+            frameGray = cachedGray.clone()
+            frameRgb = cachedRgb.clone()
+            frameTs = lastLiveFrameTsMs
+        }
+        try {
+            val safe = clampRect(requestedBox, frameGray.cols(), frameGray.rows())
+            if (safe == null) {
+                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=box_oob")
+                return false
+            }
+            if (safe.width < 32 || safe.height < 32) {
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=box_small " +
+                        "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
+                )
+                return false
+            }
+
+            val patch = frameGray.submat(safe)
+            val patchRgba = Mat()
+            val patchBitmap: Bitmap
+            try {
+                Imgproc.cvtColor(patch, patchRgba, Imgproc.COLOR_GRAY2RGBA)
+                patchBitmap = Bitmap.createBitmap(patchRgba.cols(), patchRgba.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(patchRgba, patchBitmap)
+            } catch (t: Throwable) {
+                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=patch_bitmap_error", t)
+                return false
+            } finally {
+                patch.release()
+                patchRgba.release()
+            }
+
+            val templateReady =
+                try {
+                    setTemplateImages(listOf(patchBitmap))
+                } finally {
+                    if (!patchBitmap.isRecycled) patchBitmap.recycle()
+                }
+            if (!templateReady) {
+                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=template_rebuild_failed")
+                return false
+            }
+
+            val nativeReady = warmupNativeManualInit(frameRgb, safe)
+            if (!nativeReady) {
+                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=native_init_failed")
+                return false
+            }
+
+            manualRoiActive = true
+            manualRoiFrameTsMs = frameTs
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI_INIT_OK tsMs=$frameTs box=${safe.x},${safe.y},${safe.width}x${safe.height} " +
+                    "view=${viewWidth}x${viewHeight}"
+            )
+            return true
+        } finally {
+            frameGray.release()
+            frameRgb.release()
+        }
+    }
+
+    private fun warmupNativeManualInit(frameRgb: Mat, box: Rect): Boolean {
+        val nativeBackend = when (preferredTrackBackend) {
+            TrackBackend.NATIVE_RKNN -> NativeTrackerBridge.Backend.RKNN
+            else -> NativeTrackerBridge.Backend.NCNN
+        }
+        val requestedParam = nativeModelParamPathOverride
+        val requestedBin = nativeModelBinPathOverride
+        val initEngineOk = NativeTrackerBridge.initializeEngine(nativeBackend, requestedParam, requestedBin)
+        if (!initEngineOk || !NativeTrackerBridge.isAvailable()) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=native_engine_unavailable " +
+                    "backend=${nativeBackend.name.lowercase(Locale.US)} " +
+                    "param=${summarizePath(requestedParam)} bin=${summarizePath(requestedBin)}"
+            )
+            return false
+        }
+        val nativeBox = android.graphics.Rect(box.x, box.y, box.x + box.width, box.y + box.height)
+        val bytes = ByteArray(frameRgb.cols() * frameRgb.rows() * 3)
+        frameRgb.get(0, 0, bytes)
+        return NativeTrackerBridge.initTargetGray(bytes, frameRgb.cols(), frameRgb.rows(), nativeBox)
+    }
 
     fun setTemplateImages(bitmaps: List<Bitmap>): Boolean {
         if (bitmaps.isEmpty()) {
@@ -2339,6 +2495,10 @@ class OpenCVTrackerAnalyzer(
         centerRoiFailLatched = false
         resetCenterRoiSearchState("reset_tracking")
         resetDescendOffsetState("reset_tracking")
+        resetDescendExplosionState("reset_tracking")
+        manualRoiActive = false
+        manualRoiFrameTsMs = 0L
+        clearLiveFrameCache()
         overlayResetToken++
         clearFirstLockCandidate("reset")
         latestSearchFrame?.release()
@@ -2365,6 +2525,7 @@ class OpenCVTrackerAnalyzer(
         nativeLowConfidenceStreak = 0
         nativeFuseWarmupRemaining = 0
         lastNativeAcceptMs = 0L
+        resetDescendExplosionState("tracker_release")
         if (!hadTracker && !hadNativeTracking) return
 
         Log.d(TAG, "EVAL_EVENT type=TRACKER_RELEASE reason=$reason")
@@ -2434,8 +2595,12 @@ class OpenCVTrackerAnalyzer(
         metricsSearchLastReason = "none"
         centerRoiFailEmittedThisSession = false
         centerRoiFailLatched = false
+        manualRoiActive = false
+        manualRoiFrameTsMs = 0L
+        clearLiveFrameCache()
         resetCenterRoiSearchState("session_start")
         resetDescendOffsetState("session_start")
+        resetDescendExplosionState("session_start")
         Log.w(TAG, "EVAL_EVENT type=SESSION_START reason=$reason session=$diagSessionId")
     }
 
@@ -2547,6 +2712,7 @@ class OpenCVTrackerAnalyzer(
 
     private fun processFrame(frame: Mat, image: ImageProxy? = null) {
         frameCounter++
+        cacheLiveFrame(frame)
         updateKalmanPrediction(SystemClock.elapsedRealtime())
         if (!isTracking && fastFirstLockRemaining > 0) {
             fastFirstLockRemaining--
@@ -2621,6 +2787,41 @@ class OpenCVTrackerAnalyzer(
         }
     }
 
+    private fun cacheLiveFrame(frame: Mat) {
+        val grayClone = frame.clone()
+        val rgbClone = Mat()
+        if (frame.channels() == 3) {
+            frame.copyTo(rgbClone)
+        } else {
+            Imgproc.cvtColor(frame, rgbClone, Imgproc.COLOR_GRAY2RGB)
+        }
+        var oldGray: Mat? = null
+        var oldRgb: Mat? = null
+        synchronized(liveFrameCacheLock) {
+            oldGray = lastLiveFrameGray
+            oldRgb = lastLiveFrameRgb
+            lastLiveFrameGray = grayClone
+            lastLiveFrameRgb = rgbClone
+            lastLiveFrameTsMs = currentTimelineMs()
+        }
+        oldGray?.release()
+        oldRgb?.release()
+    }
+
+    private fun clearLiveFrameCache() {
+        var oldGray: Mat? = null
+        var oldRgb: Mat? = null
+        synchronized(liveFrameCacheLock) {
+            oldGray = lastLiveFrameGray
+            oldRgb = lastLiveFrameRgb
+            lastLiveFrameGray = null
+            lastLiveFrameRgb = null
+            lastLiveFrameTsMs = 0L
+        }
+        oldGray?.release()
+        oldRgb?.release()
+    }
+
     private fun resolveDescendTimestampSec(): Double {
         return currentTimelineMs().toDouble() / 1000.0
     }
@@ -2643,6 +2844,78 @@ class OpenCVTrackerAnalyzer(
         val normX = (centerX - halfW) / halfW
         val normY = (centerY - halfH) / halfH
         return normX to normY
+    }
+
+    private fun resetDescendExplosionState(reason: String) {
+        if (descendExplosionGuardActive && frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+            Log.w(TAG, "EVAL_EVENT type=DESCEND_GUARD state=reset reason=$reason session=$diagSessionId")
+        }
+        descendExplosionGuardActive = false
+        descendExplosionLastAreaRatio = 0.0
+    }
+
+    private fun applyDescendExplosionGuard(
+        box: Rect,
+        frameW: Int,
+        frameH: Int,
+        source: String
+    ): DescendExplosionGuardDecision {
+        val frameArea = (frameW.toDouble() * frameH.toDouble()).coerceAtLeast(1.0)
+        val areaRatio =
+            ((box.width.toDouble().coerceAtLeast(1.0) * box.height.toDouble().coerceAtLeast(1.0)) / frameArea)
+                .coerceIn(0.0, 1.0)
+
+        if (!descendExplosionGuardEnabled || !centerRoiGpsReady) {
+            if (descendExplosionGuardActive && frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=DESCEND_GUARD state=release reason=disabled src=$source " +
+                        "areaRatio=${fmt(areaRatio)} threshold=${fmt(descendExplosionAreaRatio)}"
+                )
+            }
+            descendExplosionGuardActive = false
+            descendExplosionLastAreaRatio = areaRatio
+            return DescendExplosionGuardDecision(box, false, areaRatio)
+        }
+
+        val engageThreshold = descendExplosionAreaRatio.coerceIn(0.001, 0.95)
+        val releaseThreshold = descendExplosionReleaseRatio.coerceIn(0.001, engageThreshold - 1e-3)
+        val shouldEngage =
+            areaRatio >= engageThreshold ||
+                (descendExplosionGuardActive && areaRatio >= releaseThreshold)
+        if (!shouldEngage) {
+            if (descendExplosionGuardActive && frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=DESCEND_GUARD state=release reason=ratio_low src=$source " +
+                        "areaRatio=${fmt(areaRatio)} release=${fmt(releaseThreshold)}"
+                )
+            }
+            descendExplosionGuardActive = false
+            descendExplosionLastAreaRatio = areaRatio
+            return DescendExplosionGuardDecision(box, false, areaRatio)
+        }
+
+        val coreSide = min(descendExplosionCoreSizePx, min(frameW, frameH)).coerceAtLeast(MIN_BOX_DIM)
+        val coreCenter = Point(frameW * 0.5, frameH * 0.5)
+        val coreRect = clampRect(buildCenteredSquare(coreCenter, coreSide), frameW, frameH) ?: box
+        val transition = if (descendExplosionGuardActive) "hold" else "engage"
+        if (
+            !descendExplosionGuardActive ||
+            frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L ||
+            abs(areaRatio - descendExplosionLastAreaRatio) >= 0.05
+        ) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=DESCEND_GUARD state=$transition src=$source " +
+                    "areaRatio=${fmt(areaRatio)} threshold=${fmt(engageThreshold)} release=${fmt(releaseThreshold)} " +
+                    "raw=${box.x},${box.y},${box.width}x${box.height} " +
+                    "core=${coreRect.x},${coreRect.y},${coreRect.width}x${coreRect.height}"
+            )
+        }
+        descendExplosionGuardActive = true
+        descendExplosionLastAreaRatio = areaRatio
+        return DescendExplosionGuardDecision(coreRect, true, areaRatio)
     }
 
     private fun clampDescendValue(
@@ -3146,26 +3419,30 @@ class OpenCVTrackerAnalyzer(
         }
 
         consecutiveTrackerFailures = 0
-        val verifyDecision = maybeVerifyTracking(frame, safe)
-        if (verifyDecision != null) {
-            when (verifyDecision.action) {
-                "realign" -> {
-                    verifyDecision.box?.let {
-                        initializeTracker(frame, it, verifyDecision.reason)
+        val guardDecision = applyDescendExplosionGuard(safe, frame.cols(), frame.rows(), "kcf")
+        val guardedBox = guardDecision.box
+        if (!guardDecision.active) {
+            val verifyDecision = maybeVerifyTracking(frame, guardedBox)
+            if (verifyDecision != null) {
+                when (verifyDecision.action) {
+                    "realign" -> {
+                        verifyDecision.box?.let {
+                            initializeTracker(frame, it, verifyDecision.reason)
+                            return
+                        }
+                    }
+                    "drop" -> {
+                        if (holdCurrentBoxOnTransientLoss(verifyDecision.reason, 0.55)) {
+                            return
+                        }
+                        onLost(verifyDecision.reason)
                         return
                     }
-                }
-                "drop" -> {
-                    if (holdCurrentBoxOnTransientLoss(verifyDecision.reason, 0.55)) {
-                        return
-                    }
-                    onLost(verifyDecision.reason)
-                    return
                 }
             }
         }
 
-        commitTrackingObservation(safe, confidence = 1.0, markNativeAccept = false)
+        commitTrackingObservation(guardedBox, confidence = 1.0, markNativeAccept = false)
     }
 
     private fun trackFrameNative(frame: Mat) {
@@ -3239,7 +3516,10 @@ class OpenCVTrackerAnalyzer(
             return
         }
 
-        if (!passesNativeSpatialGate(safe, nativeGateConfidence, source = "native_mat")) {
+        val guardDecision = applyDescendExplosionGuard(safe, frame.cols(), frame.rows(), "native_mat")
+        val guardedBox = guardDecision.box
+
+        if (!guardDecision.active && !passesNativeSpatialGate(guardedBox, nativeGateConfidence, source = "native_mat")) {
             metricsSearchLastReason = "native_spatial_gate_fail"
             consecutiveTrackerFailures++
             if (consecutiveTrackerFailures < nativeCfg.maxFailStreak) {
@@ -3252,22 +3532,23 @@ class OpenCVTrackerAnalyzer(
         }
 
         consecutiveTrackerFailures = 0
-        if (shouldDropOnTrackGuard(frame, safe, nativeGateConfidence)) {
+        if (!guardDecision.active && shouldDropOnTrackGuard(frame, guardedBox, nativeGateConfidence)) {
             if (holdCurrentBoxOnTransientLoss("track_guard_fail", nativeGateConfidence)) return
             onLost("track_guard_fail")
             return
         }
         val nativeVerifyInterval = resolveNativeVerifyIntervalFrames(
-            current = safe,
+            current = guardedBox,
             frameW = frame.cols(),
             frameH = frame.rows()
         )
         if (
+            !guardDecision.active &&
             shouldRunNativeOrbVerify() &&
             nativeVerifyInterval > 0 &&
             frameCounter % nativeVerifyInterval.toLong() == 0L
         ) {
-            val verifyDecision = maybeVerifyTracking(frame, safe, nativeGateConfidence)
+            val verifyDecision = maybeVerifyTracking(frame, guardedBox, nativeGateConfidence)
             if (verifyDecision != null) {
                 when (verifyDecision.action) {
                     "realign" -> {
@@ -3287,7 +3568,7 @@ class OpenCVTrackerAnalyzer(
             }
         }
 
-        commitTrackingObservation(safe, confidence = nativeMeasurementConfidence, markNativeAccept = true)
+        commitTrackingObservation(guardedBox, confidence = nativeMeasurementConfidence, markNativeAccept = true)
     }
 
     private fun trackFrameNativeImage(image: ImageProxy, frameW: Int, frameH: Int) {
@@ -3362,7 +3643,10 @@ class OpenCVTrackerAnalyzer(
             return
         }
 
-        if (!passesNativeSpatialGate(safe, nativeGateConfidence, source = "native_img")) {
+        val guardDecision = applyDescendExplosionGuard(safe, frameW, frameH, "native_img")
+        val guardedBox = guardDecision.box
+
+        if (!guardDecision.active && !passesNativeSpatialGate(guardedBox, nativeGateConfidence, source = "native_img")) {
             metricsSearchLastReason = "native_spatial_gate_fail"
             consecutiveTrackerFailures++
             if (consecutiveTrackerFailures < nativeCfg.maxFailStreak) {
@@ -3374,25 +3658,26 @@ class OpenCVTrackerAnalyzer(
             return
         }
 
-        if (shouldDropOnTrackGuard(null, safe, nativeGateConfidence)) {
+        if (!guardDecision.active && shouldDropOnTrackGuard(null, guardedBox, nativeGateConfidence)) {
             if (holdCurrentBoxOnTransientLoss("track_guard_fail", nativeGateConfidence)) return
             onLost("track_guard_fail")
             return
         }
 
         val nativeVerifyInterval = resolveNativeVerifyIntervalFrames(
-            current = safe,
+            current = guardedBox,
             frameW = frameW,
             frameH = frameH
         )
         if (
+            !guardDecision.active &&
             shouldRunNativeOrbVerify() &&
             nativeVerifyInterval > 0 &&
             frameCounter % nativeVerifyInterval.toLong() == 0L
         ) {
             val verifyFrame = imageToMat(image)
             try {
-                val verifyDecision = maybeVerifyTracking(verifyFrame, safe, nativeGateConfidence)
+                val verifyDecision = maybeVerifyTracking(verifyFrame, guardedBox, nativeGateConfidence)
                 if (verifyDecision != null) {
                     when (verifyDecision.action) {
                         "realign" -> {
@@ -3416,7 +3701,7 @@ class OpenCVTrackerAnalyzer(
         }
 
         consecutiveTrackerFailures = 0
-        commitTrackingObservation(safe, confidence = nativeMeasurementConfidence, markNativeAccept = true)
+        commitTrackingObservation(guardedBox, confidence = nativeMeasurementConfidence, markNativeAccept = true)
     }
 
 
@@ -7204,6 +7489,10 @@ class OpenCVTrackerAnalyzer(
         private const val DEFAULT_CENTER_ROI_L1_TIMEOUT_MS = 500L
         private const val DEFAULT_CENTER_ROI_L2_TIMEOUT_MS = 1_000L
         private const val DEFAULT_CENTER_ROI_L3_TIMEOUT_MS = 2_000L
+        private const val DEFAULT_DESCEND_EXPLOSION_GUARD_ENABLED = true
+        private const val DEFAULT_DESCEND_EXPLOSION_AREA_RATIO = 0.40
+        private const val DEFAULT_DESCEND_EXPLOSION_RELEASE_RATIO = 0.30
+        private const val DEFAULT_DESCEND_EXPLOSION_CORE_SIZE_PX = 400
         private const val DESCEND_HEARTBEAT_MS = 1_000L
         private const val DESCEND_LOST_BUFFER_MS = 1_000L
         private const val DEFAULT_INIT_BOX_SIZE = 100
