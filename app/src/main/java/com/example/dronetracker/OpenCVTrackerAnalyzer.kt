@@ -2185,7 +2185,15 @@ class OpenCVTrackerAnalyzer(
             val patchRgba = Mat()
             val patchBitmap: Bitmap
             try {
-                Imgproc.cvtColor(patch, patchRgba, Imgproc.COLOR_GRAY2RGBA)
+                when (patch.channels()) {
+                    1 -> Imgproc.cvtColor(patch, patchRgba, Imgproc.COLOR_GRAY2RGBA)
+                    3 -> Imgproc.cvtColor(patch, patchRgba, Imgproc.COLOR_RGB2RGBA)
+                    4 -> patch.copyTo(patchRgba)
+                    else -> {
+                        Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=patch_channel_unsupported ch=${patch.channels()}")
+                        return false
+                    }
+                }
                 patchBitmap = Bitmap.createBitmap(patchRgba.cols(), patchRgba.rows(), Bitmap.Config.ARGB_8888)
                 Utils.matToBitmap(patchRgba, patchBitmap)
             } catch (t: Throwable) {
@@ -2788,7 +2796,12 @@ class OpenCVTrackerAnalyzer(
     }
 
     private fun cacheLiveFrame(frame: Mat) {
-        val grayClone = frame.clone()
+        val grayClone = Mat()
+        if (frame.channels() == 1) {
+            frame.copyTo(grayClone)
+        } else {
+            Imgproc.cvtColor(frame, grayClone, Imgproc.COLOR_RGB2GRAY)
+        }
         val rgbClone = Mat()
         if (frame.channels() == 3) {
             frame.copyTo(rgbClone)
