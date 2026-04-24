@@ -3710,6 +3710,16 @@ class OpenCVTrackerAnalyzer(
             return
         }
 
+        manualRoiTrackAcceptVeto(safe, frame.cols(), frame.rows(), nativeGateConfidence)?.let { reason ->
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI_TRACK_VETO src=native_mat reason=$reason conf=${fmt(nativeGateConfidence)}"
+            )
+            logDiag("MANUAL_ROI_LIFECYCLE", "session=$diagSessionId trigger=track_veto:$reason")
+            onLost("manual_track_veto")
+            return
+        }
+
         val guardDecision = applyDescendExplosionGuard(safe, frame.cols(), frame.rows(), "native_mat")
         val guardedBox = guardDecision.box
 
@@ -3837,6 +3847,16 @@ class OpenCVTrackerAnalyzer(
             return
         }
 
+        manualRoiTrackAcceptVeto(safe, frameW, frameH, nativeGateConfidence)?.let { reason ->
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI_TRACK_VETO src=native_img reason=$reason conf=${fmt(nativeGateConfidence)}"
+            )
+            logDiag("MANUAL_ROI_LIFECYCLE", "session=$diagSessionId trigger=track_veto:$reason")
+            onLost("manual_track_veto")
+            return
+        }
+
         val guardDecision = applyDescendExplosionGuard(safe, frameW, frameH, "native_img")
         val guardedBox = guardDecision.box
 
@@ -3940,6 +3960,76 @@ class OpenCVTrackerAnalyzer(
             }
         val areaOk = areaRatio in minAreaRatio..maxAreaRatio
         return jump <= maxJump && areaOk
+    }
+
+    /**
+     * Manual-session tracking veto. A non-null return means the accepted native
+     * track should be treated as a hard loss immediately.
+     */
+    private fun manualRoiTrackAcceptVeto(
+        tracked: Rect,
+        frameW: Int,
+        frameH: Int,
+        confidence: Double
+    ): String? {
+        if (!MANUAL_ROI_TRACK_ANCHOR_VETO_ENABLED) return null
+        if (!isManualRoiSessionActive()) return null
+        val anchor = manualRoiAnchorBox ?: return null
+        val confText = fmt(confidence)
+
+        val tx = tracked.x + tracked.width / 2.0
+        val ty = tracked.y + tracked.height / 2.0
+        val ax = anchor.x + anchor.width / 2.0
+        val ay = anchor.y + anchor.height / 2.0
+        val anchorDiag =
+            kotlin.math.hypot(anchor.width.toDouble(), anchor.height.toDouble()).coerceAtLeast(1.0)
+
+        val distToAnchor = kotlin.math.hypot(tx - ax, ty - ay)
+        val maxAnchorDist = anchorDiag * MANUAL_ROI_TRACK_ANCHOR_MAX_DRIFT_FACTOR
+        if (distToAnchor > maxAnchorDist) {
+            return "anchor_drift dist=${fmt(distToAnchor)} max=${fmt(maxAnchorDist)} " +
+                "box=${tracked.x},${tracked.y},${tracked.width}x${tracked.height} " +
+                "anchor=${anchor.x},${anchor.y},${anchor.width}x${anchor.height} conf=$confText"
+        }
+
+        val anchorArea = (anchor.width.toDouble() * anchor.height.toDouble()).coerceAtLeast(1.0)
+        val trackedArea = tracked.width.toDouble() * tracked.height.toDouble()
+        val areaRatio = trackedArea / anchorArea
+        if (areaRatio > MANUAL_ROI_TRACK_AREA_MAX_GROWTH) {
+            return "area_grow ratio=${fmt(areaRatio)} max=${fmt(MANUAL_ROI_TRACK_AREA_MAX_GROWTH)} " +
+                "box=${tracked.width}x${tracked.height} anchor=${anchor.width}x${anchor.height} conf=$confText"
+        }
+        if (areaRatio < MANUAL_ROI_TRACK_AREA_MIN_SHRINK) {
+            return "area_shrink ratio=${fmt(areaRatio)} min=${fmt(MANUAL_ROI_TRACK_AREA_MIN_SHRINK)} " +
+                "box=${tracked.width}x${tracked.height} anchor=${anchor.width}x${anchor.height} conf=$confText"
+        }
+
+        lastTrackedBox?.let { prev ->
+            val px = prev.x + prev.width / 2.0
+            val py = prev.y + prev.height / 2.0
+            val jump = kotlin.math.hypot(tx - px, ty - py)
+            val prevMinSide = kotlin.math.min(prev.width, prev.height).toDouble().coerceAtLeast(1.0)
+            val maxJump = prevMinSide * MANUAL_ROI_TRACK_MAX_CENTER_JUMP_FACTOR
+            if (jump > maxJump) {
+                return "frame_jump jump=${fmt(jump)} max=${fmt(maxJump)} " +
+                    "prev=${prev.x},${prev.y},${prev.width}x${prev.height} " +
+                    "curr=${tracked.x},${tracked.y},${tracked.width}x${tracked.height} conf=$confText"
+            }
+        }
+
+        val px = MANUAL_ROI_TRACK_EDGE_HUG_PX
+        val hugL = tracked.x <= px
+        val hugT = tracked.y <= px
+        val hugR = (tracked.x + tracked.width) >= (frameW - px)
+        val hugB = (tracked.y + tracked.height) >= (frameH - px)
+        val hugCount = listOf(hugL, hugT, hugR, hugB).count { it }
+        if (hugCount >= 2) {
+            return "edge_hug L=$hugL T=$hugT R=$hugR B=$hugB " +
+                "box=${tracked.x},${tracked.y},${tracked.width}x${tracked.height} " +
+                "frame=${frameW}x${frameH} conf=$confText"
+        }
+
+        return null
     }
 
     private fun resolveNativeMeasurementConfidence(result: NativeTrackerBridge.NativeTrackResult): Double {
@@ -8124,6 +8214,15 @@ class OpenCVTrackerAnalyzer(
         private const val MANUAL_ROI_RELOCK_MIN_CONF_V2 = 0.40
         private const val MANUAL_ROI_RELOCK_MAX_CENTER_DIST_FACTOR = 2.5
         private const val MANUAL_ROI_RELOCK_SILENCE_FRAMES_AFTER_LOST = 10
+        // Phase 1 T4.2 Batch 6: manual-session tracking veto.
+        // Live-device diagnosis on 2026-04-25 showed a successful 70x57 manual lock
+        // drifting across large parts of the frame while native tracking kept accepting it.
+        private const val MANUAL_ROI_TRACK_ANCHOR_VETO_ENABLED = true
+        private const val MANUAL_ROI_TRACK_ANCHOR_MAX_DRIFT_FACTOR = 5.0
+        private const val MANUAL_ROI_TRACK_AREA_MAX_GROWTH = 4.0
+        private const val MANUAL_ROI_TRACK_AREA_MIN_SHRINK = 0.25
+        private const val MANUAL_ROI_TRACK_MAX_CENTER_JUMP_FACTOR = 3.0
+        private const val MANUAL_ROI_TRACK_EDGE_HUG_PX = 4
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED = 0.24
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE = 0.32
         private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_RELAX = 0.03
