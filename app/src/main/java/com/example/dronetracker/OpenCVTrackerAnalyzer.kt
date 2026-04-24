@@ -24,6 +24,7 @@ import org.opencv.core.Rect
 import org.opencv.core.Size
 import org.opencv.features2d.DescriptorMatcher
 import org.opencv.features2d.ORB
+import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.CLAHE
 import org.opencv.imgproc.Imgproc
 import org.opencv.tracking.TrackerKCF
@@ -2221,6 +2222,41 @@ class OpenCVTrackerAnalyzer(
                 return false
             }
 
+            // Frame freshness check: if cache is older than 500ms, warn but don't fail.
+            val frameAgeMs = if (frameTs > 0) (System.currentTimeMillis() - frameTs) else -1L
+
+            val patchForStats = frameGray.submat(safe)
+            val meanStd = MatOfDouble()
+            val stdStd = MatOfDouble()
+            Core.meanStdDev(patchForStats, meanStd, stdStd)
+            val patchMean = if (!meanStd.empty()) meanStd.toArray().firstOrNull() ?: 0.0 else 0.0
+            val patchStd = if (!stdStd.empty()) stdStd.toArray().firstOrNull() ?: 0.0 else 0.0
+            val minMaxLoc = Core.minMaxLoc(patchForStats)
+            val patchMin = minMaxLoc.minVal
+            val patchMax = minMaxLoc.maxVal
+            meanStd.release()
+            stdStd.release()
+            patchForStats.release()
+
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI_PATCH_STATS " +
+                    "box=${safe.x},${safe.y},${safe.width}x${safe.height} " +
+                    "frameAgeMs=$frameAgeMs " +
+                    "mean=${fmt(patchMean)} std=${fmt(patchStd)} min=${fmt(patchMin)} max=${fmt(patchMax)}"
+            )
+
+            if (patchStd < 3.0 || (patchMax - patchMin) < 10.0) {
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=patch_low_contrast " +
+                        "mean=${fmt(patchMean)} std=${fmt(patchStd)} range=${fmt(patchMax - patchMin)} " +
+                        "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
+                )
+                dumpPatchToDisk(frameGray, safe, "low_contrast")
+                return false
+            }
+
             val patch = frameGray.submat(safe)
             val patchRgba = Mat()
             val patchBitmap: Bitmap
@@ -2258,6 +2294,7 @@ class OpenCVTrackerAnalyzer(
                     "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=template_rebuild_failed init_path=live " +
                         "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)}"
                 )
+                dumpPatchToDisk(frameGray, safe, "template_rebuild_failed")
                 return false
             }
 
@@ -2268,6 +2305,7 @@ class OpenCVTrackerAnalyzer(
                     "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=native_init_failed init_path=live " +
                         "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)}"
                 )
+                dumpPatchToDisk(frameGray, safe, "native_init_failed")
                 return false
             }
 
@@ -7587,6 +7625,32 @@ class OpenCVTrackerAnalyzer(
     }
 
     private fun fmt(value: Double): String = String.format(Locale.US, "%.3f", value)
+
+    private fun dumpPatchToDisk(frameGray: Mat, box: Rect, tag: String) {
+        try {
+            val appContext = overlayView.context.applicationContext
+            val baseDir = appContext.getExternalFilesDir(null) ?: appContext.filesDir
+            val dir = java.io.File(baseDir, "manual_patch")
+            if (!dir.exists()) dir.mkdirs()
+            val ts = System.currentTimeMillis()
+            val patch = frameGray.submat(box)
+            try {
+                val fullFrame = java.io.File(dir, "frame_${ts}_${tag}.png")
+                val patchFile = java.io.File(dir, "patch_${ts}_${tag}_${box.x}_${box.y}_${box.width}x${box.height}.png")
+                Imgcodecs.imwrite(fullFrame.absolutePath, frameGray)
+                Imgcodecs.imwrite(patchFile.absolutePath, patch)
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=MANUAL_ROI_DUMP tag=$tag " +
+                        "full=${fullFrame.absolutePath} patch=${patchFile.absolutePath}"
+                )
+            } finally {
+                patch.release()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_DUMP_FAIL tag=$tag err=${t.message}")
+        }
+    }
 
     private fun logDiag(type: String, payload: String) {
         Log.i(TAG, "DIAG_${type.uppercase(Locale.US)} $payload")
