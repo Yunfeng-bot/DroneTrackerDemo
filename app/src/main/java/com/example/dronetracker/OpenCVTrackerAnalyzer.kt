@@ -544,6 +544,14 @@ class OpenCVTrackerAnalyzer(
     private var manualRoiActive = false
     @Volatile
     private var manualRoiFrameTsMs: Long = 0L
+    @Volatile
+    private var manualRoiPatchKp = -1
+    @Volatile
+    private var manualRoiPatchTexture = Double.NaN
+    @Volatile
+    private var manualRoiBboxClamped = false
+    @Volatile
+    private var manualRoiInitPath = "none"
     private var isTracking = false
     private var trackingStage = TrackingStage.ACQUIRE
     private var lastTrackedBox: Rect? = null
@@ -2117,6 +2125,7 @@ class OpenCVTrackerAnalyzer(
     }
 
     fun setInitialTarget(viewRect: RectF, viewWidth: Int, viewHeight: Int) {
+        logDiag("MANUAL_ROI_LIFECYCLE", "session=$diagSessionId trigger=setInitialTarget_enter manualActive=$manualRoiActive")
         val sx = if (scaleX > 0f) scaleX else 1f
         val sy = if (scaleY > 0f) scaleY else 1f
         val mapped = Rect(
@@ -2125,20 +2134,42 @@ class OpenCVTrackerAnalyzer(
             (viewRect.width() / sx).toInt(),
             (viewRect.height() / sy).toInt()
         )
-        pendingInitBox = mapped
+        val frameW = currentFrameWidth
+        val frameH = currentFrameHeight
+        val mappedSafe = clampRect(mapped, frameW, frameH)
+        val clamped = mappedSafe != null && (
+            mappedSafe.x != mapped.x ||
+                mappedSafe.y != mapped.y ||
+                mappedSafe.width != mapped.width ||
+                mappedSafe.height != mapped.height
+            )
+        val target = mappedSafe ?: mapped
+        manualRoiBboxClamped = clamped
         Log.d(
             TAG,
-            "manual target selected: overlay=${viewRect.width().toInt()}x${viewRect.height().toInt()} view=${viewWidth}x${viewHeight}"
+            "manual target selected: overlay=${viewRect.width().toInt()}x${viewRect.height().toInt()} view=${viewWidth}x${viewHeight} " +
+                "mapped=${mapped.x},${mapped.y},${mapped.width}x${mapped.height} " +
+                "safe=${target.x},${target.y},${target.width}x${target.height} frame=${frameW}x${frameH} clamped=$clamped"
         )
-        val refreshOk = refreshManualTemplateFromLiveFrame(mapped, viewWidth, viewHeight)
-        pendingInitBox = mapped
+        val refreshOk = refreshManualTemplateFromLiveFrame(target, viewWidth, viewHeight, clamped)
         if (!refreshOk) {
+            pendingInitBox = null
+            manualRoiInitPath = "fallback_disk"
             Log.w(
                 TAG,
-                "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=fallback_disk_template " +
-                    "box=${mapped.x},${mapped.y},${mapped.width}x${mapped.height}"
+                "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=fallback_forbidden init_path=$manualRoiInitPath " +
+                    "bbox_clamped=$clamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)} " +
+                    "box=${target.x},${target.y},${target.width}x${target.height}"
             )
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=MANUAL_ROI state=clear reason=fallback_forbidden init_path=$manualRoiInitPath " +
+                    "bbox_clamped=$clamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)}"
+            )
+            clearManualRoiState("manual_init_failed")
+            return
         }
+        pendingInitBox = target
     }
 
     fun setTemplateImage(bitmap: Bitmap): Boolean = setTemplateImages(listOf(bitmap))
@@ -2146,7 +2177,8 @@ class OpenCVTrackerAnalyzer(
     private fun refreshManualTemplateFromLiveFrame(
         requestedBox: Rect,
         viewWidth: Int,
-        viewHeight: Int
+        viewHeight: Int,
+        bboxClamped: Boolean
     ): Boolean {
         val frameGray: Mat
         val frameRgb: Mat
@@ -2155,11 +2187,11 @@ class OpenCVTrackerAnalyzer(
             val cachedGray = lastLiveFrameGray
             val cachedRgb = lastLiveFrameRgb
             if (cachedGray == null || cachedGray.empty()) {
-                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=no_live_gray")
+                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=no_live_frame detail=gray")
                 return false
             }
             if (cachedRgb == null || cachedRgb.empty()) {
-                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=no_live_rgb")
+                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=no_live_frame detail=rgb")
                 return false
             }
             frameGray = cachedGray.clone()
@@ -2172,6 +2204,12 @@ class OpenCVTrackerAnalyzer(
                 Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=box_oob")
                 return false
             }
+            val effectiveClamped =
+                bboxClamped ||
+                    safe.x != requestedBox.x ||
+                    safe.y != requestedBox.y ||
+                    safe.width != requestedBox.width ||
+                    safe.height != requestedBox.height
             if (safe.width < 32 || safe.height < 32) {
                 Log.w(
                     TAG,
@@ -2210,27 +2248,42 @@ class OpenCVTrackerAnalyzer(
                 } finally {
                     if (!patchBitmap.isRecycled) patchBitmap.recycle()
                 }
+            manualRoiPatchKp = templateKeypointCount
+            manualRoiPatchTexture = templateTextureScore
             if (!templateReady) {
-                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=template_rebuild_failed")
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=template_rebuild_failed init_path=live " +
+                        "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)}"
+                )
                 return false
             }
 
             val nativeReady = warmupNativeManualInit(frameRgb, safe)
             if (!nativeReady) {
-                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=native_init_failed")
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=native_init_failed init_path=live " +
+                        "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)}"
+                )
                 return false
             }
 
             manualRoiActive = true
             manualRoiFrameTsMs = frameTs
+            manualRoiBboxClamped = effectiveClamped
+            manualRoiInitPath = "live"
             Log.w(
                 TAG,
-                "EVAL_EVENT type=MANUAL_ROI_INIT_OK tsMs=$frameTs box=${safe.x},${safe.y},${safe.width}x${safe.height} " +
-                    "view=${viewWidth}x${viewHeight}"
+                "EVAL_EVENT type=MANUAL_ROI_INIT_OK tsMs=$frameTs init_path=$manualRoiInitPath " +
+                    "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)} " +
+                    "box=${safe.x},${safe.y},${safe.width}x${safe.height} view=${viewWidth}x${viewHeight}"
             )
             Log.w(
                 TAG,
-                "EVAL_EVENT type=MANUAL_ROI state=active tsMs=$frameTs box=${safe.x},${safe.y},${safe.width}x${safe.height}"
+                "EVAL_EVENT type=MANUAL_ROI state=active tsMs=$frameTs init_path=$manualRoiInitPath " +
+                    "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)} " +
+                    "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
             )
             return true
         } finally {
@@ -2325,7 +2378,7 @@ class OpenCVTrackerAnalyzer(
             clearFirstLockCandidate("template_changed")
             searchMissStreak = 0
 
-            resetTracking(logSummary = false)
+            resetTracking(logSummary = false, trigger = "template_changed")
             pendingInitBox = null
             val first = templateSourceGrays.firstOrNull()
             val firstW = first?.cols() ?: 0
@@ -2475,12 +2528,20 @@ class OpenCVTrackerAnalyzer(
         templateTextureScore = 0.0
     }
 
-    fun resetTracking(logSummary: Boolean = true) {
+    fun resetTracking(logSummary: Boolean = true, trigger: String = "unknown") {
+        val resolvedTrigger =
+            if (trigger != "unknown") {
+                trigger
+            } else {
+                val caller = Throwable().stackTrace.getOrNull(1)
+                if (caller != null) "${caller.className}.${caller.methodName}" else "unknown_caller"
+            }
         if (logSummary) {
             logEvalSummary("reset")
         }
-        logDiag("TRACK", "session=$diagSessionId action=reset_tracking")
-        releaseTracker("reset", requestGc = true)
+        logDiag("MANUAL_ROI_LIFECYCLE", "session=$diagSessionId trigger=resetTracking:$resolvedTrigger")
+        logDiag("TRACK", "session=$diagSessionId action=reset_tracking trigger=$resolvedTrigger")
+        releaseTracker("reset", requestGc = true, callerTrigger = "resetTracking:$resolvedTrigger")
         pendingInitBox = null
         lastTrackedBox = null
         lastMeasuredTrackBox = null
@@ -2522,8 +2583,16 @@ class OpenCVTrackerAnalyzer(
         }
     }
 
-    private fun releaseTracker(reason: String, requestGc: Boolean) {
-        logDiag("TRACK", "session=$diagSessionId action=release reason=$reason requestGc=$requestGc isTracking=$isTracking backend=${activeTrackBackend.name.lowercase(Locale.US)}")
+    private fun releaseTracker(reason: String, requestGc: Boolean, callerTrigger: String = "unknown") {
+        logDiag(
+            "MANUAL_ROI_LIFECYCLE",
+            "session=$diagSessionId trigger=releaseTracker:$callerTrigger reason=$reason manualActive=$manualRoiActive"
+        )
+        logDiag(
+            "TRACK",
+            "session=$diagSessionId action=release reason=$reason requestGc=$requestGc " +
+                "trigger=$callerTrigger isTracking=$isTracking backend=${activeTrackBackend.name.lowercase(Locale.US)}"
+        )
         val hadTracker = tracker != null
         val hadNativeTracking = isTracking && activeTrackBackend != TrackBackend.KCF
         tracker = null
@@ -2851,11 +2920,17 @@ class OpenCVTrackerAnalyzer(
         if (hadActive) {
             Log.w(
                 TAG,
-                "EVAL_EVENT type=MANUAL_ROI state=clear reason=$reason tsMs=$manualRoiFrameTsMs"
+                "EVAL_EVENT type=MANUAL_ROI state=clear reason=$reason tsMs=$manualRoiFrameTsMs " +
+                    "init_path=$manualRoiInitPath bbox_clamped=$manualRoiBboxClamped " +
+                    "patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)}"
             )
         }
         manualRoiActive = false
         manualRoiFrameTsMs = 0L
+        manualRoiPatchKp = -1
+        manualRoiPatchTexture = Double.NaN
+        manualRoiBboxClamped = false
+        manualRoiInitPath = "none"
     }
 
     private fun resolveDescendTimestampSec(): Double {
@@ -4191,7 +4266,7 @@ class OpenCVTrackerAnalyzer(
     private fun onLost(reason: String) {
         logDiag("TRACK", "session=$diagSessionId action=lost_enter reason=$reason")
         val priorLost = lastMeasuredTrackBox ?: lastTrackedBox
-        releaseTracker("lost_$reason", requestGc = true)
+        releaseTracker("lost_$reason", requestGc = true, callerTrigger = "onLost:$reason")
         consecutiveTrackerFailures = 0
         trackVerifyFailStreak = 0
         trackVerifyHardDriftStreak = 0
@@ -4275,7 +4350,7 @@ class OpenCVTrackerAnalyzer(
         val wasTracking = isTracking
         latestSearchFrame?.release()
         latestSearchFrame = null
-        releaseTracker("reinit_$reason", requestGc = false)
+        releaseTracker("reinit_$reason", requestGc = false, callerTrigger = "reinit:$reason")
         resetKalman("reinit_$reason")
 
         if (preferredTrackBackend != TrackBackend.KCF) {
@@ -4348,7 +4423,7 @@ class OpenCVTrackerAnalyzer(
             kcf
         }.getOrElse { err ->
             Log.e(TAG, "KCF init failed", err)
-            releaseTracker("reinit_failed", requestGc = true)
+            releaseTracker("reinit_failed", requestGc = true, callerTrigger = "reinit_failed:$reason")
             return
         }
 
