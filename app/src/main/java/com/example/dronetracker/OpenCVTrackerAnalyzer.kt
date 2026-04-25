@@ -3461,6 +3461,18 @@ class OpenCVTrackerAnalyzer(
         }
 
         if (shouldAutoInitWithoutManual(confirmed, frame.cols(), frame.rows())) {
+            if (isManualRoiSessionActive() && !passesManualRoiRelockGate(confirmed, frame)) {
+                metricsSearchLastReason = "manual_auto_gate_reject"
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=manual_auto_gate_reject " +
+                            "good=${confirmed.goodMatches} inliers=${confirmed.inlierCount} conf=${fmt(confirmed.confidence)}"
+                    )
+                }
+                clearFirstLockCandidate("manual_auto_gate_reject")
+                return
+            }
             if (canDirectAutoInit(confirmed) && passesAutoInitVerification(frame, confirmed)) {
                 searchMissStreak = 0
                 clearFirstLockCandidate("auto_init")
@@ -3567,6 +3579,20 @@ class OpenCVTrackerAnalyzer(
                 }
                 searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
                 clearFirstLockCandidate("promoted_verify_reject")
+                return
+            }
+            if (isManualRoiSessionActive() && !passesManualRoiRelockGate(promoted, frame)) {
+                metricsSearchPromoteRejectCount++
+                metricsSearchLastReason = "manual_temporal_gate_reject"
+                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                    Log.w(
+                        TAG,
+                        "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=manual_temporal_gate_reject " +
+                            "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
+                    )
+                }
+                searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
+                clearFirstLockCandidate("manual_temporal_gate_reject")
                 return
             }
             searchMissStreak = 0
@@ -6267,28 +6293,9 @@ class OpenCVTrackerAnalyzer(
                 "good=${candidate.goodMatches} inliers=${candidate.inlierCount} " +
                 "conf=${fmt(candidate.confidence)} fallback=${candidate.fallbackReason ?: "none"} " +
                 "blocked=$manualRoiRelockBlocked"
+        val blocked = manualRoiRelockBlocked
 
-        if (candidate.fallbackReason == "refined_area_small") {
-            logDiag("LOCK_GATE", "$gatePrefix pass=false reason=ban_refined_area_small")
-            return false
-        }
-
-        if (candidate.goodMatches < MANUAL_ROI_RELOCK_MIN_GOOD) {
-            logDiag("LOCK_GATE", "$gatePrefix pass=false reason=low_good min=$MANUAL_ROI_RELOCK_MIN_GOOD")
-            return false
-        }
-        if (candidate.inlierCount < MANUAL_ROI_RELOCK_MIN_INLIERS) {
-            logDiag("LOCK_GATE", "$gatePrefix pass=false reason=low_inliers min=$MANUAL_ROI_RELOCK_MIN_INLIERS")
-            return false
-        }
-        if (candidate.confidence < MANUAL_ROI_RELOCK_MIN_CONF_V2) {
-            logDiag(
-                "LOCK_GATE",
-                "$gatePrefix pass=false reason=low_conf min=${fmt(MANUAL_ROI_RELOCK_MIN_CONF_V2)}"
-            )
-            return false
-        }
-
+        // Layer 1: spatial and timing sanity applies in both blocked and normal relock states.
         val anchor = manualRoiAnchorBox
         if (anchor != null) {
             val anchorCx = anchor.x + anchor.width / 2.0
@@ -6321,13 +6328,58 @@ class OpenCVTrackerAnalyzer(
             }
         }
 
+        // Layer 1: candidate quality threshold splits by blocked state.
+        if (blocked) {
+            if (candidate.goodMatches < MANUAL_ROI_RELOCK_BLOCKED_MIN_GOOD) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=low_good_blocked min=$MANUAL_ROI_RELOCK_BLOCKED_MIN_GOOD"
+                )
+                return false
+            }
+            if (candidate.inlierCount < MANUAL_ROI_RELOCK_BLOCKED_MIN_INLIERS) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=low_inliers_blocked min=$MANUAL_ROI_RELOCK_BLOCKED_MIN_INLIERS"
+                )
+                return false
+            }
+            if (candidate.confidence < MANUAL_ROI_RELOCK_BLOCKED_MIN_CONF) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=low_conf_blocked min=${fmt(MANUAL_ROI_RELOCK_BLOCKED_MIN_CONF)}"
+                )
+                return false
+            }
+        } else {
+            if (candidate.fallbackReason == "refined_area_small") {
+                logDiag("LOCK_GATE", "$gatePrefix pass=false reason=ban_refined_area_small")
+                return false
+            }
+            if (candidate.goodMatches < MANUAL_ROI_RELOCK_MIN_GOOD) {
+                logDiag("LOCK_GATE", "$gatePrefix pass=false reason=low_good min=$MANUAL_ROI_RELOCK_MIN_GOOD")
+                return false
+            }
+            if (candidate.inlierCount < MANUAL_ROI_RELOCK_MIN_INLIERS) {
+                logDiag("LOCK_GATE", "$gatePrefix pass=false reason=low_inliers min=$MANUAL_ROI_RELOCK_MIN_INLIERS")
+                return false
+            }
+            if (candidate.confidence < MANUAL_ROI_RELOCK_MIN_CONF_V2) {
+                logDiag(
+                    "LOCK_GATE",
+                    "$gatePrefix pass=false reason=low_conf min=${fmt(MANUAL_ROI_RELOCK_MIN_CONF_V2)}"
+                )
+                return false
+            }
+        }
+
         val ncc = verifyCandidateViaTemplateFingerprint(candidate, frame)
         if (ncc == null) {
-            if (manualRoiRelockBlocked) {
+            if (blocked) {
                 logDiag("LOCK_GATE", "$gatePrefix pass=false reason=blocked_no_fingerprint")
                 return false
             }
-            logDiag("LOCK_GATE", "$gatePrefix pass=true reason=fingerprint_unavailable")
+            logDiag("LOCK_GATE", "$gatePrefix pass=true reason=fingerprint_unavailable (legacy)")
             return true
         }
 
@@ -6339,7 +6391,7 @@ class OpenCVTrackerAnalyzer(
             return false
         }
 
-        if (manualRoiRelockBlocked) {
+        if (blocked) {
             Log.w(
                 TAG,
                 "EVAL_EVENT type=MANUAL_ROI state=relock_unblocked trigger=fingerprint_pass " +
@@ -8337,6 +8389,9 @@ class OpenCVTrackerAnalyzer(
         private const val MANUAL_ROI_FINGERPRINT_ENABLED = true
         private const val MANUAL_ROI_RELOCK_MIN_FINGERPRINT_NCC = 0.70
         private const val MANUAL_ROI_FINGERPRINT_MIN_SIDE = 16
+        private const val MANUAL_ROI_RELOCK_BLOCKED_MIN_GOOD = 12
+        private const val MANUAL_ROI_RELOCK_BLOCKED_MIN_INLIERS = 6
+        private const val MANUAL_ROI_RELOCK_BLOCKED_MIN_CONF = 0.30
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_SMALL_REFINED = 0.24
         private const val DEFAULT_TEMPORAL_MIN_CONFIDENCE_BASE = 0.32
         private const val DEFAULT_TEMPORAL_LIVE_CONFIDENCE_RELAX = 0.03
