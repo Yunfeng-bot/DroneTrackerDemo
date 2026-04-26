@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "video_id": "scene_mvp5_l3_20260421",
+  "description": "MVP-5 L3 hit acceptance window (target outside +/-40%, expect L3 full-frame lock).",
+  "expected_final_state": "TRACKING",
+  "windows": [
+    {
+      "name": "first_lock_window",
+      "start_sec": 2.0,
+      "end_sec": 9.0,
+      "expected_final_state": "TRACKING",
+      "expected_first_state_not_fail": true,
+      "expected_first_lock_level": "l3"
+    },
+    {
+      "name": "steady_track_window",
+      "start_sec": 9.0,
+      "end_sec": 25.5,
+      "expected_final_state": "TRACKING",
+      "min_track_ratio": 0.90
+    }
+  ]
+}

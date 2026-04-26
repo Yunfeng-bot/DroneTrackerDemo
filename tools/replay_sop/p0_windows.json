@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "video_id": "scene_20260417",
+  "description": "P0 windows for wrong-lock scoring. Target is the left ID card back side.",
+  "windows": [
+    {
+      "name": "window_20_to_21",
+      "start_sec": 20.0,
+      "metric_key_sec": 20.0,
+      "return_sec": 21.0,
+      "eval_window_sec": 4.0,
+      "relock_max_sec": 8.0,
+      "target_center_x_ratio": [0.30, 0.50]
+    },
+    {
+      "name": "window_23_to_24",
+      "start_sec": 23.0,
+      "metric_key_sec": 24.0,
+      "return_sec": 24.0,
+      "eval_window_sec": 4.0,
+      "relock_max_sec": 8.0,
+      "target_center_x_ratio": [0.30, 0.50]
+    }
+  ]
+}
