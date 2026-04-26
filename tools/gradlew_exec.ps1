@@ -18,6 +18,10 @@ $null = Remove-Item Env:ANDROID_PREFS_ROOT -ErrorAction SilentlyContinue
 $null = Remove-Item Env:ANDROID_SDK_HOME -ErrorAction SilentlyContinue
 $env:ANDROID_USER_HOME = $androidHome
 $env:ADB_VENDOR_KEYS = $androidHome
+$env:HOME = $projectRoot
+$env:USERPROFILE = $projectRoot
+$env:HOMEDRIVE = [System.IO.Path]::GetPathRoot($projectRoot).TrimEnd('\')
+$env:HOMEPATH = $projectRoot.Substring($env:HOMEDRIVE.Length)
 
 if ($UseAndroidStudioJbr) {
     $jbr = "C:\Program Files\Android\Android Studio\jbr"

@@ -53,6 +53,17 @@ private:
     float cosineSimilarity(const std::vector<float>& a, const std::vector<float>& b) const;
     float reduceScore(const ncnn::Mat& out) const;
     void updateTemplateFeature(const ncnn::Mat& feature);
+    float computeTemplateUpdateMahalanobis(const TrackerBbox& prev, const TrackerBbox& next) const;
+    float computeTemplateEdgeRatio(const TrackerBbox& box, int frameW, int frameH) const;
+    bool shouldUpdateTemplateFeature(
+        const TrackerBbox& prev,
+        const TrackerBbox& next,
+        float similarity,
+        int frameW,
+        int frameH,
+        float* outMahalanobis,
+        float* outAnchorMahalanobis,
+        float* outEdgeRatio) const;
     float cosineWindowValue(float centerOffset, float radius) const;
     float applyCosineWindow(
         float confidence,
@@ -81,6 +92,8 @@ private:
     bool modelReady_ = false;
     bool hasTemplate_ = false;
     TrackerBbox lastBox_{};
+    TrackerBbox templateAnchorBox_{};
+    bool hasTemplateAnchorBox_ = false;
 
 #if defined(DRONETRACKER_HAVE_NCNN) && DRONETRACKER_HAVE_NCNN
     ModelMode modelMode_ = ModelMode::kEmbedding;
@@ -120,6 +133,9 @@ private:
     float minScoreThreshold_ = 0.16f;
     float smoothAlpha_ = 0.60f;
     float templateUpdateRate_ = 0.04f;
+    float templateUpdateMahalThreshold_ = 9.0f;
+    float templateUpdateMinSimilarity_ = 0.70f;
+    float templateUpdateMaxEdgeRatio_ = 0.15f;
     float gapRecoverSimilarityThreshold_ = 0.85f;
 };
 

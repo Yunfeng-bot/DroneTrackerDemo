@@ -599,6 +599,25 @@ foreach ($variant in @('l1','l2','l3','fail')) {
 
 ### 2026-04-20（MVP-1/3/4 代码实装 + 默认回放口径切换）
 
+---
+
+## 7. 远期演进路线：Phase 1~3 路线图 (MVP-5 收官后衔接)
+
+在 MVP-5 (静态楼顶基于预置模板降落) 彻底跑通基础骨架后，我们将沿着以下三个阶段解决**外场真实可用性**的核心瓶颈：
+
+### Phase 1: 屏幕框选互动 (Manual ROI)
+- **目标**：彻底消灭事先拍照的 Template 与实景（Real）之间的光照/视角/尺度偏差 (Domain Gap)。
+- **动作**：通过手机屏幕触控，当场提取当前帧的 Patch 作为基准特征传入 NanoTrack 与 ORB。
+- **局限交底**：无法解决目标过远、像素过少导致的先天特征丢失。
+
+### Phase 2: VLM 辅助圈选 (Semi-Autonomous ROI)
+- **目标**：用视觉大模型（VLM）替代用户手指的圈选动作。
+- **动作**：测试端侧 VLM（如 Qwen2-VL、MiniCPM-V）或云端 API（如 Claude / Gemini），输入自然语言指令（如 "锁住那片楼顶"），输出精确 BBox 并喂给 Phase 1 的相同接口。
+
+### Phase 3: 小目标鲁棒性补强 (Robust DL Tracking)
+- **目标**：突破小目标远距离崩锁的极限，解决高空微小目标易丢的问题（中期技术债）。
+- **动作**：引入多帧时序累积、尺度自适应机制，或替换更为鲁棒的端到端深度学习单目标追踪器（SOT）。
+
 - **默认回放口径切换（对齐 MVP 主线）**：
   - [sweep_replay.py:1575-1576](tools/auto_tune/sweep_replay.py#L1575)：`--video-path` / `--target-path` 默认切到 `/sdcard/Download/Video_Search/scene_20260417.mp4` + `target0417_s640.jpg`
   - [MainActivity.kt:780](app/src/main/java/com/example/dronetracker/MainActivity.kt#L780)：`DEFAULT_REPLAY_VIDEO_PATH` / `DEFAULT_REPLAY_TARGET_PATH` 同步更新

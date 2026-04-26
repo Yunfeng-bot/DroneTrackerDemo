@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <numeric>
 #include <utility>
 
@@ -525,6 +526,8 @@ bool NcnnTrackerImpl::init(const FrameBuffer& frame, const TrackerBbox& bbox) {
 
     hasTemplate_ = true;
     lastBox_ = safe;
+    templateAnchorBox_ = safe;
+    hasTemplateAnchorBox_ = true;
     return true;
 }
 
@@ -900,7 +903,38 @@ bool NcnnTrackerImpl::track(const FrameBuffer& frame, TrackResult* outResult) {
                 &patch)) {
             ncnn::Mat feat;
             if (runEmbeddingFeature(patch, &feat) && !feat.empty()) {
-                updateTemplateFeature(feat);
+                float mahal = std::numeric_limits<float>::infinity();
+                float anchorMahal = std::numeric_limits<float>::infinity();
+                float edgeRatio = 1.0f;
+                if (shouldUpdateTemplateFeature(
+                        lastBox_,
+                        smoothed,
+                        bestConfidence,
+                        logicalW,
+                        logicalH,
+                        &mahal,
+                        &anchorMahal,
+                        &edgeRatio)) {
+                    updateTemplateFeature(feat);
+                    constexpr float kAnchorRefreshSimilarityMargin = 0.08f;
+                    constexpr float kAnchorRefreshFrameMahalMax = 4.0f;
+                    if (!hasTemplateAnchorBox_ ||
+                        (bestConfidence >= templateUpdateMinSimilarity_ + kAnchorRefreshSimilarityMargin &&
+                         mahal <= kAnchorRefreshFrameMahalMax &&
+                         anchorMahal <= templateUpdateMahalThreshold_)) {
+                        templateAnchorBox_ = smoothed;
+                        hasTemplateAnchorBox_ = true;
+                    }
+                } else {
+                    __android_log_print(
+                        ANDROID_LOG_DEBUG,
+                        kTag,
+                        "backend=ncnn template_update skip sim=%.3f mahal=%.3f anchor=%.3f edge=%.3f",
+                        bestConfidence,
+                        mahal,
+                        anchorMahal,
+                        edgeRatio);
+                }
             }
         }
     } else {
@@ -956,6 +990,8 @@ bool NcnnTrackerImpl::setPrior(const TrackerBbox& bbox) {
 void NcnnTrackerImpl::reset() {
     hasTemplate_ = false;
     lastBox_ = TrackerBbox{};
+    templateAnchorBox_ = TrackerBbox{};
+    hasTemplateAnchorBox_ = false;
     templateFeature_ = ncnn::Mat();
     templateGapEmbedding_.clear();
     templateInputMat_ = ncnn::Mat();
@@ -1372,6 +1408,79 @@ void NcnnTrackerImpl::updateTemplateFeature(const ncnn::Mat& feature) {
     computeGapEmbedding(templateFeature_, &templateGapEmbedding_);
 }
 
+float NcnnTrackerImpl::computeTemplateUpdateMahalanobis(const TrackerBbox& prev, const TrackerBbox& next) const {
+    const float prevCx = prev.x + prev.w * 0.5f;
+    const float prevCy = prev.y + prev.h * 0.5f;
+    const float nextCx = next.x + next.w * 0.5f;
+    const float nextCy = next.y + next.h * 0.5f;
+
+    const float sigmaX = std::max(6.0f, prev.w * 0.50f);
+    const float sigmaY = std::max(6.0f, prev.h * 0.50f);
+    const float sigmaW = std::max(4.0f, prev.w * 0.35f);
+    const float sigmaH = std::max(4.0f, prev.h * 0.35f);
+
+    const float dx = (nextCx - prevCx) / sigmaX;
+    const float dy = (nextCy - prevCy) / sigmaY;
+    const float dw = (next.w - prev.w) / sigmaW;
+    const float dh = (next.h - prev.h) / sigmaH;
+    return dx * dx + dy * dy + dw * dw + dh * dh;
+}
+
+float NcnnTrackerImpl::computeTemplateEdgeRatio(const TrackerBbox& box, int frameW, int frameH) const {
+    if (frameW <= 1 || frameH <= 1) {
+        return 1.0f;
+    }
+    const float marginL = box.x;
+    const float marginT = box.y;
+    const float marginR = static_cast<float>(frameW) - (box.x + box.w);
+    const float marginB = static_cast<float>(frameH) - (box.y + box.h);
+    const float minMargin = std::min(std::min(marginL, marginR), std::min(marginT, marginB));
+    const float requiredMargin = std::max(1.0f, std::min(box.w, box.h) * 0.15f);
+    return clampFloat(1.0f - (minMargin / requiredMargin), 0.0f, 1.0f);
+}
+
+bool NcnnTrackerImpl::shouldUpdateTemplateFeature(
+    const TrackerBbox& prev,
+    const TrackerBbox& next,
+    float similarity,
+    int frameW,
+    int frameH,
+    float* outMahalanobis,
+    float* outAnchorMahalanobis,
+    float* outEdgeRatio) const {
+    const float frameMahal = computeTemplateUpdateMahalanobis(prev, next);
+    const TrackerBbox& anchor = hasTemplateAnchorBox_ ? templateAnchorBox_ : prev;
+    const float anchorMahal = computeTemplateUpdateMahalanobis(anchor, next);
+    const float edgeRatio = computeTemplateEdgeRatio(next, frameW, frameH);
+    if (outMahalanobis != nullptr) {
+        *outMahalanobis = frameMahal;
+    }
+    if (outAnchorMahalanobis != nullptr) {
+        *outAnchorMahalanobis = anchorMahal;
+    }
+    if (outEdgeRatio != nullptr) {
+        *outEdgeRatio = edgeRatio;
+    }
+    if (!std::isfinite(similarity) || !std::isfinite(frameMahal) ||
+        !std::isfinite(anchorMahal) || !std::isfinite(edgeRatio)) {
+        return false;
+    }
+    if (similarity < templateUpdateMinSimilarity_) {
+        return false;
+    }
+    constexpr float kAnchorMahalScale = 1.8f;
+    if (frameMahal > templateUpdateMahalThreshold_) {
+        return false;
+    }
+    if (anchorMahal > templateUpdateMahalThreshold_ * kAnchorMahalScale) {
+        return false;
+    }
+    if (edgeRatio > templateUpdateMaxEdgeRatio_) {
+        return false;
+    }
+    return true;
+}
+
 void NcnnTrackerImpl::ensureDualHanningCache(int rows, int cols) {
     if (rows <= 0 || cols <= 0) {
         dualHanningY_.clear();
@@ -1468,6 +1577,8 @@ bool NcnnTrackerImpl::init(const FrameBuffer& frame, const TrackerBbox& bbox) {
     scratchPatch_.resize(templatePatch_.size(), 0.0f);
     hasTemplate_ = true;
     lastBox_ = safe;
+    templateAnchorBox_ = safe;
+    hasTemplateAnchorBox_ = true;
     return true;
 }
 
@@ -1583,6 +1694,8 @@ bool NcnnTrackerImpl::setPrior(const TrackerBbox& bbox) {
 void NcnnTrackerImpl::reset() {
     hasTemplate_ = false;
     lastBox_ = TrackerBbox{};
+    templateAnchorBox_ = TrackerBbox{};
+    hasTemplateAnchorBox_ = false;
     templatePatch_.clear();
     scratchPatch_.clear();
 }

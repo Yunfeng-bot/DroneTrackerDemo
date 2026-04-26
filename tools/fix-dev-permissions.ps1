@@ -20,6 +20,10 @@ $null = Remove-Item Env:ANDROID_PREFS_ROOT -ErrorAction SilentlyContinue
 $null = Remove-Item Env:ANDROID_SDK_HOME -ErrorAction SilentlyContinue
 $env:ANDROID_USER_HOME = $androidHome
 $env:ADB_VENDOR_KEYS = $androidHome
+$env:HOME = $projectRoot
+$env:USERPROFILE = $projectRoot
+$env:HOMEDRIVE = [System.IO.Path]::GetPathRoot($projectRoot).TrimEnd('\')
+$env:HOMEPATH = $projectRoot.Substring($env:HOMEDRIVE.Length)
 
 if ($PersistEnv) {
     [Environment]::SetEnvironmentVariable("ANDROID_PREFS_ROOT", $null, "User")
@@ -48,6 +52,7 @@ Write-Host "ANDROID_PREFS_ROOT=<unset>"
 Write-Host "ANDROID_SDK_HOME=<unset>"
 Write-Host "ANDROID_USER_HOME=$($env:ANDROID_USER_HOME)"
 Write-Host "ADB_VENDOR_KEYS=$($env:ADB_VENDOR_KEYS)"
+Write-Host "HOME=$($env:HOME)"
 Write-Host "Git objects ACL repaired for user: $userName"
 if ($PersistEnv) {
     Write-Host "Persistent user env updated. Reopen terminal for new sessions."

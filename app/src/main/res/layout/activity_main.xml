@@ -57,6 +57,13 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="@string/btn_reset" />
+
+        <Button
+            android:id="@+id/btnGpsReady"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="16dp"
+            android:text="GPS: OFF" />
     </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>
