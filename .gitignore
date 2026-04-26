@@ -14,7 +14,25 @@ local.properties
 /tools/.adb-home/
 /tools/auto_tune/out/
 /.android-home/
+/.android_home/
 /.home/
+/__pycache__/
+/.codex_tmp/
+/diag_*.log
+/tmp_*.log
+/tmp_*.txt
 /tools/auto_tune/__pycache__/
 /tools/auto_tune/eval_csv/
+/tools/backbone_probe/__pycache__/
+/tools/backbone_probe/out/
+/.claude/
+/Microsoft/
+/manual_patch_latest/
+/test/Backup/
+/test/*.mp4
+/test/*.jpg
+/test/templates/
+/*_diff.txt
+/tmp_*.csv
+/*.log
 
