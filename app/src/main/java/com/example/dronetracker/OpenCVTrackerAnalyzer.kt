@@ -565,6 +565,9 @@ class OpenCVTrackerAnalyzer(
     private var manualRoiPatchGray: Mat? = null
     @Volatile
     private var manualRoiLastTrackNccFrameId: Long = -1L
+    @Volatile
+    private var manualRoiLastInitFrameId: Long = -1L
+    private val manualRoiNccHistory: ArrayDeque<Double> = ArrayDeque()
     private var isTracking = false
     private var trackingStage = TrackingStage.ACQUIRE
     private var lastTrackedBox: Rect? = null
@@ -1941,26 +1944,76 @@ class OpenCVTrackerAnalyzer(
             if (sinceLastCheck >= MANUAL_ROI_TRACK_NCC_INTERVAL_FRAMES) {
                 manualRoiLastTrackNccFrameId = frameCounter
                 val ncc = computeNccAgainstManualPatch(measured, frame)
-                if (ncc != null && ncc < MANUAL_ROI_TRACK_MIN_NCC) {
-                    Log.w(
-                        TAG,
-                        "EVAL_EVENT type=MANUAL_ROI_TRACK_VETO reason=track_ncc_drift " +
-                            "ncc=${fmt(ncc)} min=${fmt(MANUAL_ROI_TRACK_MIN_NCC)} " +
-                            "box=${measured.x},${measured.y},${measured.width}x${measured.height}"
-                    )
-                    logDiag(
-                        "MANUAL_ROI_LIFECYCLE",
-                        "session=$diagSessionId trigger=track_ncc_drift ncc=${fmt(ncc)}"
-                    )
-                    enterManualRoiRelockBlocked("track_ncc_drift")
-                    onLost("manual_track_veto")
-                    return measured
-                }
-                if (
-                    ncc != null &&
-                    frameCounter % (MANUAL_ROI_TRACK_NCC_INTERVAL_FRAMES * 4L) == 0L
-                ) {
-                    logDiag("MANUAL_ROI_TRACK_NCC", "session=$diagSessionId pass=true ncc=${fmt(ncc)}")
+                if (ncc != null) {
+                    val sinceLastInit =
+                        if (manualRoiLastInitFrameId >= 0L) {
+                            frameCounter - manualRoiLastInitFrameId
+                        } else {
+                            Long.MAX_VALUE
+                        }
+                    val inGrace = sinceLastInit < MANUAL_ROI_TRACK_NCC_GRACE_FRAMES
+
+                    if (inGrace) {
+                        logDiag(
+                            "MANUAL_ROI_TRACK_NCC",
+                            "session=$diagSessionId stage=grace ncc=${fmt(ncc)} sinceInit=$sinceLastInit"
+                        )
+                    } else {
+                        if (ncc < MANUAL_ROI_TRACK_NCC_PANIC_SINGLE) {
+                            Log.w(
+                                TAG,
+                                "EVAL_EVENT type=MANUAL_ROI_TRACK_VETO reason=track_ncc_panic " +
+                                    "ncc=${fmt(ncc)} min=${fmt(MANUAL_ROI_TRACK_NCC_PANIC_SINGLE)} " +
+                                    "box=${measured.x},${measured.y},${measured.width}x${measured.height}"
+                            )
+                            logDiag(
+                                "MANUAL_ROI_LIFECYCLE",
+                                "session=$diagSessionId trigger=track_ncc_panic ncc=${fmt(ncc)}"
+                            )
+                            manualRoiNccHistory.clear()
+                            enterManualRoiRelockBlocked("track_ncc_panic")
+                            onLost("manual_track_veto")
+                            return measured
+                        }
+
+                        manualRoiNccHistory.addLast(ncc)
+                        while (manualRoiNccHistory.size > MANUAL_ROI_TRACK_NCC_HISTORY_SIZE) {
+                            manualRoiNccHistory.removeFirst()
+                        }
+
+                        if (manualRoiNccHistory.size < MANUAL_ROI_TRACK_NCC_HISTORY_SIZE) {
+                            logDiag(
+                                "MANUAL_ROI_TRACK_NCC",
+                                "session=$diagSessionId stage=warmup ncc=${fmt(ncc)} samples=${manualRoiNccHistory.size}"
+                            )
+                        } else {
+                            val sorted = manualRoiNccHistory.sorted()
+                            val median = (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2.0
+                            if (median < MANUAL_ROI_TRACK_NCC_DRIFT_MEDIAN) {
+                                Log.w(
+                                    TAG,
+                                    "EVAL_EVENT type=MANUAL_ROI_TRACK_VETO reason=track_ncc_drift_sustained " +
+                                        "median=${fmt(median)} min=${fmt(MANUAL_ROI_TRACK_NCC_DRIFT_MEDIAN)} " +
+                                        "ncc=${fmt(ncc)} samples=$sorted " +
+                                        "box=${measured.x},${measured.y},${measured.width}x${measured.height}"
+                                )
+                                logDiag(
+                                    "MANUAL_ROI_LIFECYCLE",
+                                    "session=$diagSessionId trigger=track_ncc_drift_sustained median=${fmt(median)}"
+                                )
+                                manualRoiNccHistory.clear()
+                                enterManualRoiRelockBlocked("track_ncc_drift_sustained")
+                                onLost("manual_track_veto")
+                                return measured
+                            }
+                            if (frameCounter % (MANUAL_ROI_TRACK_NCC_INTERVAL_FRAMES * 4L) == 0L) {
+                                logDiag(
+                                    "MANUAL_ROI_TRACK_NCC",
+                                    "session=$diagSessionId stage=stable ncc=${fmt(ncc)} median=${fmt(median)}"
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2380,6 +2433,8 @@ class OpenCVTrackerAnalyzer(
             manualRoiLostFrameId = -1L
             manualRoiRelockBlocked = false
             manualRoiLastTrackNccFrameId = -1L
+            manualRoiLastInitFrameId = -1L
+            manualRoiNccHistory.clear()
             Log.w(
                 TAG,
                 "EVAL_EVENT type=MANUAL_ROI_INIT_OK tsMs=$frameTs init_path=$manualRoiInitPath " +
@@ -3056,6 +3111,8 @@ class OpenCVTrackerAnalyzer(
             manualRoiPatchGray = null
             manualRoiRelockBlocked = false
             manualRoiLastTrackNccFrameId = -1L
+            manualRoiLastInitFrameId = -1L
+            manualRoiNccHistory.clear()
         }
     }
 
@@ -4639,7 +4696,7 @@ class OpenCVTrackerAnalyzer(
             if (needFingerprint) {
                 val threshold =
                     if (reason.startsWith("verify_")) {
-                        MANUAL_ROI_TRACK_MIN_NCC
+                        MANUAL_ROI_TRACK_NCC_DRIFT_MEDIAN
                     } else {
                         MANUAL_ROI_RELOCK_MIN_FINGERPRINT_NCC
                     }
@@ -4710,6 +4767,8 @@ class OpenCVTrackerAnalyzer(
                 nativeFuseWarmupRemaining = heuristicConfig.nativeGate.fuseWarmupFrames
                 lockHoldFramesRemaining = lockHoldFrames
                 manualRoiLastTrackNccFrameId = -1L
+                manualRoiLastInitFrameId = frameCounter
+                manualRoiNccHistory.clear()
                 fastFirstLockRemaining = 0
                 resetCenterRoiSearchState("lock")
                 descendLostActive = false
@@ -4783,6 +4842,8 @@ class OpenCVTrackerAnalyzer(
         lockHoldFramesRemaining = lockHoldFrames
         lastNativeAcceptMs = 0L
         manualRoiLastTrackNccFrameId = -1L
+        manualRoiLastInitFrameId = frameCounter
+        manualRoiNccHistory.clear()
         fastFirstLockRemaining = 0
         resetCenterRoiSearchState("lock")
         descendLostActive = false
@@ -6353,44 +6414,60 @@ class OpenCVTrackerAnalyzer(
         if (patch.width() < MANUAL_ROI_FINGERPRINT_MIN_SIDE || patch.height() < MANUAL_ROI_FINGERPRINT_MIN_SIDE) {
             return null
         }
-
-        val safeBox = clampRect(box, frame.cols(), frame.rows()) ?: return null
-        if (safeBox.width < MANUAL_ROI_FINGERPRINT_MIN_SIDE || safeBox.height < MANUAL_ROI_FINGERPRINT_MIN_SIDE) {
+        if (box.width < MANUAL_ROI_FINGERPRINT_MIN_SIDE || box.height < MANUAL_ROI_FINGERPRINT_MIN_SIDE) {
             return null
         }
 
-        val region = frame.submat(safeBox)
-        var grayRegion = region
-        var needReleaseGray = false
-        val resized = Mat()
+        val margin = MANUAL_ROI_FINGERPRINT_SEARCH_MARGIN
+        val expandedW = (box.width * (1.0 + 2.0 * margin)).toInt().coerceAtLeast(box.width + 4)
+        val expandedH = (box.height * (1.0 + 2.0 * margin)).toInt().coerceAtLeast(box.height + 4)
+        val expandedX = box.x - (expandedW - box.width) / 2
+        val expandedY = box.y - (expandedH - box.height) / 2
+        val searchRect = clampRect(Rect(expandedX, expandedY, expandedW, expandedH), frame.cols(), frame.rows())
+            ?: return null
+
+        val region = frame.submat(searchRect)
+        var graySearch = region
+        var needReleaseGraySearch = false
+        var scaledPatch: Mat? = null
         val result = Mat()
         return try {
             if (region.channels() != 1) {
-                grayRegion = Mat()
+                graySearch = Mat()
                 val cvtCode =
                     when (region.channels()) {
                         3 -> Imgproc.COLOR_RGB2GRAY
                         4 -> Imgproc.COLOR_RGBA2GRAY
                         else -> return null
                     }
-                Imgproc.cvtColor(region, grayRegion, cvtCode)
-                needReleaseGray = true
+                Imgproc.cvtColor(region, graySearch, cvtCode)
+                needReleaseGraySearch = true
             }
 
-            Imgproc.resize(
-                grayRegion,
-                resized,
-                Size(patch.width().toDouble(), patch.height().toDouble())
-            )
-            Imgproc.matchTemplate(resized, patch, result, Imgproc.TM_CCOEFF_NORMED)
+            val targetW = box.width
+            val targetH = box.height
+            val templateMat =
+                if (patch.width() == targetW && patch.height() == targetH) {
+                    patch
+                } else {
+                    scaledPatch = Mat()
+                    Imgproc.resize(patch, scaledPatch, Size(targetW.toDouble(), targetH.toDouble()))
+                    scaledPatch!!
+                }
+
+            if (graySearch.cols() < templateMat.cols() || graySearch.rows() < templateMat.rows()) {
+                return null
+            }
+
+            Imgproc.matchTemplate(graySearch, templateMat, result, Imgproc.TM_CCOEFF_NORMED)
             Core.minMaxLoc(result).maxVal.coerceIn(-1.0, 1.0)
         } catch (t: Throwable) {
             Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_FINGERPRINT_ERROR err=${t.message}")
             null
         } finally {
             result.release()
-            resized.release()
-            if (needReleaseGray) grayRegion.release()
+            scaledPatch?.release()
+            if (needReleaseGraySearch) graySearch.release()
             region.release()
         }
     }
@@ -8493,8 +8570,13 @@ class OpenCVTrackerAnalyzer(
         // drifting across large parts of the frame while native tracking kept accepting it.
         private const val MANUAL_ROI_TRACK_ANCHOR_VETO_ENABLED = true
         private const val MANUAL_ROI_TRACK_NCC_CHECK_ENABLED = true
-        private const val MANUAL_ROI_TRACK_MIN_NCC = 0.55
         private const val MANUAL_ROI_TRACK_NCC_INTERVAL_FRAMES = 15L
+        // Phase 1 T4.2 Batch 11: stabilize NCC over time.
+        // Batch 10 showed NCC could drop from 0.800 to 0.436 within 12 ms on the same target.
+        private const val MANUAL_ROI_TRACK_NCC_GRACE_FRAMES = 30L
+        private const val MANUAL_ROI_TRACK_NCC_HISTORY_SIZE = 4
+        private const val MANUAL_ROI_TRACK_NCC_DRIFT_MEDIAN = 0.40
+        private const val MANUAL_ROI_TRACK_NCC_PANIC_SINGLE = 0.20
         private const val MANUAL_ROI_TRACK_ANCHOR_MAX_DRIFT_FACTOR = 3.0
         private const val MANUAL_ROI_TRACK_AREA_MAX_GROWTH = 4.0
         private const val MANUAL_ROI_TRACK_AREA_MIN_SHRINK = 0.25
@@ -8506,6 +8588,7 @@ class OpenCVTrackerAnalyzer(
         private const val MANUAL_ROI_FINGERPRINT_ENABLED = true
         private const val MANUAL_ROI_RELOCK_MIN_FINGERPRINT_NCC = 0.70
         private const val MANUAL_ROI_FINGERPRINT_MIN_SIDE = 16
+        private const val MANUAL_ROI_FINGERPRINT_SEARCH_MARGIN = 0.20
         private const val MANUAL_ROI_RELOCK_BLOCKED_MIN_GOOD = 12
         private const val MANUAL_ROI_RELOCK_BLOCKED_MIN_INLIERS = 6
         private const val MANUAL_ROI_RELOCK_BLOCKED_MIN_CONF = 0.30
