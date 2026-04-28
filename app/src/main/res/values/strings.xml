@@ -1,15 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">DroneTrackerDemo</string>
-    <string name="btn_select_image">选择目标图</string>
-    <string name="btn_reset">重置跟踪</string>
-    <string name="toast_template_loaded">目标模板加载成功</string>
-    <string name="toast_template_load_failed">加载目标模板失败</string>
+    <string name="btn_select_image">选目标照片</string>
+    <string name="btn_reset">重置</string>
+    <string name="btn_help">试用说明</string>
+    <string name="btn_export_logs">导出日志</string>
+    <string name="toast_template_loaded">目标照片已设置</string>
+    <string name="toast_template_load_failed">目标照片加载失败</string>
     <string name="toast_opencv_loaded">OpenCV 初始化成功</string>
     <string name="toast_opencv_failed">OpenCV 初始化失败</string>
     <string name="toast_camera_permission_required">需要授权后才能继续</string>
-    <string name="toast_replay_target_missing">回放目标图不存在或不可读</string>
+    <string name="toast_replay_target_missing">回放目标图片不存在或不可读</string>
     <string name="toast_replay_video_missing">回放视频不存在或不可读</string>
     <string name="toast_replay_failed">回放模式启动失败</string>
     <string name="toast_replay_started">回放模式已启动</string>
+    <string name="toast_phase1_log_missing">当前还没有可导出的运行日志，请先试用一轮</string>
+    <string name="toast_phase1_log_exported">已打开分享面板，请发送本次运行日志</string>
+    <string name="toast_phase1_log_export_failed">导出运行日志失败</string>
+    <string name="phase1_hint_live">两种方式任选一种：选目标照片，或直接在画面圈住目标。一般只用一种即可。</string>
+    <string name="phase1_hint_replay">回放模式：目标图片和视频由脚本注入，可观察锁定、丢失和重新锁定。</string>
 </resources>

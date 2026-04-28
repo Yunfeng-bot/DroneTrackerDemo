@@ -1002,15 +1002,7 @@ class OpenCVTrackerAnalyzer(
         }
 
         var shouldRefreshTemplate = false
-        val entries = raw.split(',', ';')
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && it.contains('=') }
-
-        for (entry in entries) {
-            val parts = entry.split('=', limit = 2)
-            if (parts.size != 2) continue
-            val key = parts[0].trim().lowercase(Locale.US)
-            val value = parts[1].trim()
+        for ((key, value) in parseRuntimeOverrideEntries(raw)) {
 
             when (key) {
                 "orb_features" -> value.toIntOrNull()?.let {
@@ -1408,6 +1400,28 @@ class OpenCVTrackerAnalyzer(
             }
         }
 
+        normalizeRuntimeOverrideValues()
+
+        configureOrbDetector(orbMaxFeatures)
+        refreshHeuristicConfig()
+        if (shouldRefreshTemplate && templateSourceGrays.isNotEmpty()) {
+            rebuildTemplatePyramid(templateSourceGrays)
+        }
+        logEffectiveParams("override")
+    }
+
+    private fun parseRuntimeOverrideEntries(raw: String): List<Pair<String, String>> {
+        return raw.split(',', ';')
+            .mapNotNull { entry ->
+                val trimmed = entry.trim()
+                if (trimmed.isEmpty() || !trimmed.contains('=')) return@mapNotNull null
+                val parts = trimmed.split('=', limit = 2)
+                if (parts.size != 2) return@mapNotNull null
+                parts[0].trim().lowercase(Locale.US) to parts[1].trim()
+            }
+    }
+
+    private fun normalizeRuntimeOverrideValues() {
         orbFeatureHardCap = orbFeatureHardCap.coerceIn(200, 1200)
         if (homographyScaleMin > homographyScaleMax) {
             val t = homographyScaleMin
@@ -1667,13 +1681,6 @@ class OpenCVTrackerAnalyzer(
         if (!centerRoiSearchEnabled || !centerRoiGpsReady) {
             resetCenterRoiSearchState("override_sync")
         }
-
-        configureOrbDetector(orbMaxFeatures)
-        refreshHeuristicConfig()
-        if (shouldRefreshTemplate && templateSourceGrays.isNotEmpty()) {
-            rebuildTemplatePyramid(templateSourceGrays)
-        }
-        logEffectiveParams("override")
     }
 
     fun setReplayTargetAppearSec(seconds: Double) {
@@ -1929,93 +1936,8 @@ class OpenCVTrackerAnalyzer(
         markNativeAccept: Boolean,
         frame: Mat? = null
     ): Rect {
-        if (
-            MANUAL_ROI_TRACK_NCC_CHECK_ENABLED &&
-            frame != null &&
-            isManualRoiSessionActive() &&
-            manualRoiPatchGray != null
-        ) {
-            val sinceLastCheck =
-                if (manualRoiLastTrackNccFrameId >= 0L) {
-                    frameCounter - manualRoiLastTrackNccFrameId
-                } else {
-                    Long.MAX_VALUE
-                }
-            if (sinceLastCheck >= MANUAL_ROI_TRACK_NCC_INTERVAL_FRAMES) {
-                manualRoiLastTrackNccFrameId = frameCounter
-                val ncc = computeNccAgainstManualPatch(measured, frame)
-                if (ncc != null) {
-                    val sinceLastInit =
-                        if (manualRoiLastInitFrameId >= 0L) {
-                            frameCounter - manualRoiLastInitFrameId
-                        } else {
-                            Long.MAX_VALUE
-                        }
-                    val inGrace = sinceLastInit < MANUAL_ROI_TRACK_NCC_GRACE_FRAMES
-
-                    if (inGrace) {
-                        logDiag(
-                            "MANUAL_ROI_TRACK_NCC",
-                            "session=$diagSessionId stage=grace ncc=${fmt(ncc)} sinceInit=$sinceLastInit"
-                        )
-                    } else {
-                        if (ncc < MANUAL_ROI_TRACK_NCC_PANIC_SINGLE) {
-                            Log.w(
-                                TAG,
-                                "EVAL_EVENT type=MANUAL_ROI_TRACK_VETO reason=track_ncc_panic " +
-                                    "ncc=${fmt(ncc)} min=${fmt(MANUAL_ROI_TRACK_NCC_PANIC_SINGLE)} " +
-                                    "box=${measured.x},${measured.y},${measured.width}x${measured.height}"
-                            )
-                            logDiag(
-                                "MANUAL_ROI_LIFECYCLE",
-                                "session=$diagSessionId trigger=track_ncc_panic ncc=${fmt(ncc)}"
-                            )
-                            manualRoiNccHistory.clear()
-                            enterManualRoiRelockBlocked("track_ncc_panic")
-                            onLost("manual_track_veto")
-                            return measured
-                        }
-
-                        manualRoiNccHistory.addLast(ncc)
-                        while (manualRoiNccHistory.size > MANUAL_ROI_TRACK_NCC_HISTORY_SIZE) {
-                            manualRoiNccHistory.removeFirst()
-                        }
-
-                        if (manualRoiNccHistory.size < MANUAL_ROI_TRACK_NCC_HISTORY_SIZE) {
-                            logDiag(
-                                "MANUAL_ROI_TRACK_NCC",
-                                "session=$diagSessionId stage=warmup ncc=${fmt(ncc)} samples=${manualRoiNccHistory.size}"
-                            )
-                        } else {
-                            val sorted = manualRoiNccHistory.sorted()
-                            val median = (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2.0
-                            if (median < MANUAL_ROI_TRACK_NCC_DRIFT_MEDIAN) {
-                                Log.w(
-                                    TAG,
-                                    "EVAL_EVENT type=MANUAL_ROI_TRACK_VETO reason=track_ncc_drift_sustained " +
-                                        "median=${fmt(median)} min=${fmt(MANUAL_ROI_TRACK_NCC_DRIFT_MEDIAN)} " +
-                                        "ncc=${fmt(ncc)} samples=$sorted " +
-                                        "box=${measured.x},${measured.y},${measured.width}x${measured.height}"
-                                )
-                                logDiag(
-                                    "MANUAL_ROI_LIFECYCLE",
-                                    "session=$diagSessionId trigger=track_ncc_drift_sustained median=${fmt(median)}"
-                                )
-                                manualRoiNccHistory.clear()
-                                enterManualRoiRelockBlocked("track_ncc_drift_sustained")
-                                onLost("manual_track_veto")
-                                return measured
-                            }
-                            if (frameCounter % (MANUAL_ROI_TRACK_NCC_INTERVAL_FRAMES * 4L) == 0L) {
-                                logDiag(
-                                    "MANUAL_ROI_TRACK_NCC",
-                                    "session=$diagSessionId stage=stable ncc=${fmt(ncc)} median=${fmt(median)}"
-                                )
-                            }
-                        }
-                    }
-                }
-            }
+        if (shouldEvaluateManualRoiTrackNcc(frame) && evaluateManualRoiTrackNcc(measured, frame!!)) {
+            return measured
         }
         val fused = correctKalman(measured, confidence = confidence)
         lastMeasuredTrackBox = measured
@@ -2026,6 +1948,94 @@ class OpenCVTrackerAnalyzer(
         dispatchTrackedRect(fused)
         updateLatestPrediction(fused, confidence.coerceIn(0.0, 1.0), tracking = true)
         return fused
+    }
+
+    private fun shouldEvaluateManualRoiTrackNcc(frame: Mat?): Boolean {
+        return MANUAL_ROI_TRACK_NCC_CHECK_ENABLED &&
+            frame != null &&
+            isManualRoiSessionActive() &&
+            manualRoiPatchGray != null
+    }
+
+    private fun evaluateManualRoiTrackNcc(measured: Rect, frame: Mat): Boolean {
+        val sinceLastCheck =
+            if (manualRoiLastTrackNccFrameId >= 0L) {
+                frameCounter - manualRoiLastTrackNccFrameId
+            } else {
+                Long.MAX_VALUE
+            }
+        if (sinceLastCheck < MANUAL_ROI_TRACK_NCC_INTERVAL_FRAMES) return false
+
+        manualRoiLastTrackNccFrameId = frameCounter
+        val ncc = computeNccAgainstManualPatch(measured, frame) ?: return false
+        val sinceLastInit =
+            if (manualRoiLastInitFrameId >= 0L) {
+                frameCounter - manualRoiLastInitFrameId
+            } else {
+                Long.MAX_VALUE
+            }
+        if (sinceLastInit < MANUAL_ROI_TRACK_NCC_GRACE_FRAMES) {
+            logDiag(
+                "MANUAL_ROI_TRACK_NCC",
+                "session=$diagSessionId stage=grace ncc=${fmt(ncc)} sinceInit=$sinceLastInit"
+            )
+            return false
+        }
+        if (ncc < MANUAL_ROI_TRACK_NCC_PANIC_SINGLE) {
+            vetoManualRoiTrack(
+                reason = "track_ncc_panic",
+                measured = measured,
+                detail = "ncc=${fmt(ncc)} min=${fmt(MANUAL_ROI_TRACK_NCC_PANIC_SINGLE)}"
+            )
+            return true
+        }
+
+        manualRoiNccHistory.addLast(ncc)
+        while (manualRoiNccHistory.size > MANUAL_ROI_TRACK_NCC_HISTORY_SIZE) {
+            manualRoiNccHistory.removeFirst()
+        }
+        if (manualRoiNccHistory.size < MANUAL_ROI_TRACK_NCC_HISTORY_SIZE) {
+            logDiag(
+                "MANUAL_ROI_TRACK_NCC",
+                "session=$diagSessionId stage=warmup ncc=${fmt(ncc)} samples=${manualRoiNccHistory.size}"
+            )
+            return false
+        }
+
+        val sorted = manualRoiNccHistory.sorted()
+        val median = (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2.0
+        if (median < MANUAL_ROI_TRACK_NCC_DRIFT_MEDIAN) {
+            vetoManualRoiTrack(
+                reason = "track_ncc_drift_sustained",
+                measured = measured,
+                detail =
+                    "median=${fmt(median)} min=${fmt(MANUAL_ROI_TRACK_NCC_DRIFT_MEDIAN)} " +
+                        "ncc=${fmt(ncc)} samples=$sorted"
+            )
+            return true
+        }
+        if (frameCounter % (MANUAL_ROI_TRACK_NCC_INTERVAL_FRAMES * 4L) == 0L) {
+            logDiag(
+                "MANUAL_ROI_TRACK_NCC",
+                "session=$diagSessionId stage=stable ncc=${fmt(ncc)} median=${fmt(median)}"
+            )
+        }
+        return false
+    }
+
+    private fun vetoManualRoiTrack(reason: String, measured: Rect, detail: String) {
+        Log.w(
+            TAG,
+            "EVAL_EVENT type=MANUAL_ROI_TRACK_VETO reason=$reason " +
+                "$detail box=${measured.x},${measured.y},${measured.width}x${measured.height}"
+        )
+        logDiag(
+            "MANUAL_ROI_LIFECYCLE",
+            "session=$diagSessionId trigger=$reason $detail"
+        )
+        manualRoiNccHistory.clear()
+        enterManualRoiRelockBlocked(reason)
+        onLost("manual_track_veto")
     }
 
     private fun feedNativePriorBox(prior: Rect, reason: String) {
@@ -2264,11 +2274,12 @@ class OpenCVTrackerAnalyzer(
         if (!refreshOk) {
             pendingInitBox = null
             manualRoiInitPath = "fallback_disk"
-            Log.w(
-                TAG,
-                "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=fallback_forbidden init_path=$manualRoiInitPath " +
-                    "bbox_clamped=$clamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)} " +
-                    "box=${target.x},${target.y},${target.width}x${target.height}"
+            logManualRoiInitFail(
+                reason = "fallback_forbidden",
+                detail =
+                    "init_path=$manualRoiInitPath bbox_clamped=$clamped " +
+                        "patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)} " +
+                        "box=${target.x},${target.y},${target.width}x${target.height}"
             )
             Log.w(
                 TAG,
@@ -2296,11 +2307,11 @@ class OpenCVTrackerAnalyzer(
             val cachedGray = lastLiveFrameGray
             val cachedRgb = lastLiveFrameRgb
             if (cachedGray == null || cachedGray.empty()) {
-                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=no_live_frame detail=gray")
+                logManualRoiInitFail("no_live_frame", "detail=gray")
                 return false
             }
             if (cachedRgb == null || cachedRgb.empty()) {
-                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=no_live_frame detail=rgb")
+                logManualRoiInitFail("no_live_frame", "detail=rgb")
                 return false
             }
             frameGray = cachedGray.clone()
@@ -2310,7 +2321,7 @@ class OpenCVTrackerAnalyzer(
         try {
             val safe = clampRect(requestedBox, frameGray.cols(), frameGray.rows())
             if (safe == null) {
-                Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=box_oob")
+                logManualRoiInitFail("box_oob")
                 return false
             }
             val effectiveClamped =
@@ -2320,11 +2331,7 @@ class OpenCVTrackerAnalyzer(
                     safe.width != requestedBox.width ||
                     safe.height != requestedBox.height
             if (safe.width < 32 || safe.height < 32) {
-                Log.w(
-                    TAG,
-                    "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=box_small " +
-                        "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
-                )
+                logManualRoiInitFail("box_small", "box=${safe.x},${safe.y},${safe.width}x${safe.height}")
                 return false
             }
 
@@ -2353,10 +2360,9 @@ class OpenCVTrackerAnalyzer(
             )
 
             if (patchStd < 3.0 || (patchMax - patchMin) < 10.0) {
-                Log.w(
-                    TAG,
-                    "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=patch_low_contrast " +
-                        "mean=${fmt(patchMean)} std=${fmt(patchStd)} range=${fmt(patchMax - patchMin)} " +
+                logManualRoiInitFail(
+                    "patch_low_contrast",
+                    "mean=${fmt(patchMean)} std=${fmt(patchStd)} range=${fmt(patchMax - patchMin)} " +
                         "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
                 )
                 dumpPatchToDisk(frameGray, safe, "low_contrast")
@@ -2372,7 +2378,7 @@ class OpenCVTrackerAnalyzer(
                     3 -> Imgproc.cvtColor(patch, patchRgba, Imgproc.COLOR_RGB2RGBA)
                     4 -> patch.copyTo(patchRgba)
                     else -> {
-                        Log.w(TAG, "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=patch_channel_unsupported ch=${patch.channels()}")
+                        logManualRoiInitFail("patch_channel_unsupported", "ch=${patch.channels()}")
                         return false
                     }
                 }
@@ -2395,10 +2401,10 @@ class OpenCVTrackerAnalyzer(
             manualRoiPatchKp = templateKeypointCount
             manualRoiPatchTexture = templateTextureScore
             if (!templateReady) {
-                Log.w(
-                    TAG,
-                    "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=template_rebuild_failed init_path=live " +
-                        "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)}"
+                logManualRoiInitFail(
+                    "template_rebuild_failed",
+                    "init_path=live bbox_clamped=$effectiveClamped " +
+                        "patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)}"
                 )
                 dumpPatchToDisk(frameGray, safe, "template_rebuild_failed")
                 return false
@@ -2406,10 +2412,10 @@ class OpenCVTrackerAnalyzer(
 
             val nativeReady = warmupNativeManualInit(frameRgb, safe)
             if (!nativeReady) {
-                Log.w(
-                    TAG,
-                    "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=native_init_failed init_path=live " +
-                        "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)}"
+                logManualRoiInitFail(
+                    "native_init_failed",
+                    "init_path=live bbox_clamped=$effectiveClamped " +
+                        "patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)}"
                 )
                 dumpPatchToDisk(frameGray, safe, "native_init_failed")
                 return false
@@ -2420,29 +2426,29 @@ class OpenCVTrackerAnalyzer(
             manualRoiFrameTsMs = frameTs
             manualRoiBboxClamped = effectiveClamped
             manualRoiInitPath = "live"
-            val patchFingerprintRoi = frameGray.submat(safe)
-            val patchFingerprint = try {
-                patchFingerprintRoi.clone()
-            } finally {
-                patchFingerprintRoi.release()
-            }
-            val oldPatchFingerprint = manualRoiPatchGray
-            manualRoiPatchGray = patchFingerprint
-            oldPatchFingerprint?.release()
+            replaceManualRoiPatchFingerprint(frameGray, safe)
             manualRoiAnchorBox = Rect(safe.x, safe.y, safe.width, safe.height)
             manualRoiLostFrameId = -1L
             manualRoiRelockBlocked = false
-            manualRoiLastTrackNccFrameId = -1L
-            manualRoiLastInitFrameId = -1L
-            manualRoiNccHistory.clear()
+            resetManualRoiTrackNccState()
             Log.w(
                 TAG,
                 "EVAL_EVENT type=MANUAL_ROI_INIT_OK tsMs=$frameTs init_path=$manualRoiInitPath " +
                     "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)} " +
                     "box=${safe.x},${safe.y},${safe.width}x${safe.height} view=${viewWidth}x${viewHeight}"
             )
+            appendTrialLog(
+                "EVAL_EVENT type=MANUAL_ROI_INIT_OK tsMs=$frameTs init_path=$manualRoiInitPath " +
+                    "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)} " +
+                    "box=${safe.x},${safe.y},${safe.width}x${safe.height} view=${viewWidth}x${viewHeight}"
+            )
             Log.w(
                 TAG,
+                "EVAL_EVENT type=MANUAL_ROI state=active tsMs=$frameTs init_path=$manualRoiInitPath " +
+                    "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)} " +
+                    "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
+            )
+            appendTrialLog(
                 "EVAL_EVENT type=MANUAL_ROI state=active tsMs=$frameTs init_path=$manualRoiInitPath " +
                     "bbox_clamped=$effectiveClamped patch_kp=$manualRoiPatchKp patch_texture=${fmt(manualRoiPatchTexture)} " +
                     "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
@@ -2548,6 +2554,10 @@ class OpenCVTrackerAnalyzer(
             Log.i(TAG, "template loaded: ${templateLibrarySize} templates first=${firstW}x${firstH}")
             Log.w(
                 TAG,
+                "EVAL_EVENT type=TEMPLATE_READY source=$source templates=$templateLibrarySize width=$firstW height=$firstH " +
+                    "kp=$templateKeypointCount texture=${fmt(templateTextureScore)} ready=$ok"
+            )
+            appendTrialLog(
                 "EVAL_EVENT type=TEMPLATE_READY source=$source templates=$templateLibrarySize width=$firstW height=$firstH " +
                     "kp=$templateKeypointCount texture=${fmt(templateTextureScore)} ready=$ok"
             )
@@ -2851,7 +2861,9 @@ class OpenCVTrackerAnalyzer(
         resetCenterRoiSearchState("session_start")
         resetDescendOffsetState("session_start")
         resetDescendExplosionState("session_start")
-        Log.w(TAG, "EVAL_EVENT type=SESSION_START reason=$reason session=$diagSessionId")
+        val sessionStartLine = "EVAL_EVENT type=SESSION_START reason=$reason session=$diagSessionId"
+        Log.w(TAG, sessionStartLine)
+        appendTrialLog(sessionStartLine)
     }
 
     fun logEvalSummary(reason: String = "manual") {
@@ -2861,33 +2873,32 @@ class OpenCVTrackerAnalyzer(
         val firstLockReplaySec = if (metricsFirstLockReplayMs >= 0L) metricsFirstLockReplayMs.toDouble() / 1000.0 else -1.0
         val replayPtsSec = if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0
         val trackingRatio = if (metricsFrames > 0) metricsTrackingFrames.toDouble() / metricsFrames else 0.0
-        Log.w(
-            TAG,
-            String.format(
-                Locale.US,
-                "EVAL_SUMMARY reason=%s mode=%s elapsedMs=%d replayPtsSec=%.3f frames=%d avgFrameMs=%.2f locks=%d lost=%d firstLockSec=%.3f firstLockReplaySec=%.3f firstLockFrame=%d trackRatio=%.3f maxTrackStreak=%d searchSkipStride=%d searchSkipBudget=%d budgetTrips=%d nativeFuseSoft=%d nativeFuseHard=%d nativeHold=%d kalmanPredHold=%d",
-                reason,
-                trackerMode.name.lowercase(Locale.US),
-                elapsed,
-                replayPtsSec,
-                metricsFrames,
-                avgMs,
-                metricsLockCount,
-                metricsLostCount,
-                firstLockSec,
-                firstLockReplaySec,
-                metricsFirstLockFrame,
-                trackingRatio,
-                metricsMaxTrackingStreak,
-                metricsSearchStrideSkipCount,
-                metricsSearchBudgetSkipCount,
-                metricsSearchBudgetTripCount,
-                metricsNativeFuseSoftCount,
-                metricsNativeFuseHardCount,
-                metricsNativeLowConfHoldCount,
-                metricsKalmanPredHoldCount
-            )
+        val summaryLine = String.format(
+            Locale.US,
+            "EVAL_SUMMARY reason=%s mode=%s elapsedMs=%d replayPtsSec=%.3f frames=%d avgFrameMs=%.2f locks=%d lost=%d firstLockSec=%.3f firstLockReplaySec=%.3f firstLockFrame=%d trackRatio=%.3f maxTrackStreak=%d searchSkipStride=%d searchSkipBudget=%d budgetTrips=%d nativeFuseSoft=%d nativeFuseHard=%d nativeHold=%d kalmanPredHold=%d",
+            reason,
+            trackerMode.name.lowercase(Locale.US),
+            elapsed,
+            replayPtsSec,
+            metricsFrames,
+            avgMs,
+            metricsLockCount,
+            metricsLostCount,
+            firstLockSec,
+            firstLockReplaySec,
+            metricsFirstLockFrame,
+            trackingRatio,
+            metricsMaxTrackingStreak,
+            metricsSearchStrideSkipCount,
+            metricsSearchBudgetSkipCount,
+            metricsSearchBudgetTripCount,
+            metricsNativeFuseSoftCount,
+            metricsNativeFuseHardCount,
+            metricsNativeLowConfHoldCount,
+            metricsKalmanPredHoldCount
         )
+        Log.w(TAG, summaryLine)
+        appendTrialLog(summaryLine)
     }
     @Synchronized
     fun latestPredictionSnapshot(): PredictionSnapshot {
@@ -3025,6 +3036,32 @@ class OpenCVTrackerAnalyzer(
         return true
     }
 
+    private fun resetManualRoiTrackNccState(initFrameId: Long = -1L) {
+        manualRoiLastTrackNccFrameId = -1L
+        manualRoiLastInitFrameId = initFrameId
+        manualRoiNccHistory.clear()
+    }
+
+    private fun replaceManualRoiPatchFingerprint(frameGray: Mat, box: Rect) {
+        val patchFingerprintRoi = frameGray.submat(box)
+        val patchFingerprint =
+            try {
+                patchFingerprintRoi.clone()
+            } finally {
+                patchFingerprintRoi.release()
+            }
+        val oldPatchFingerprint = manualRoiPatchGray
+        manualRoiPatchGray = patchFingerprint
+        oldPatchFingerprint?.release()
+    }
+
+    private fun logManualRoiInitFail(reason: String, detail: String = "") {
+        val suffix = if (detail.isBlank()) "" else " $detail"
+        val line = "EVAL_EVENT type=MANUAL_ROI_INIT_FAIL reason=$reason$suffix"
+        Log.w(TAG, line)
+        appendTrialLog(line)
+    }
+
     private fun isCenterRoiSearchActive(): Boolean {
         return centerRoiSearchEnabled && centerRoiGpsReady && !centerRoiFailLatched && !isManualRoiSessionActive()
     }
@@ -3110,9 +3147,7 @@ class OpenCVTrackerAnalyzer(
             manualRoiPatchGray?.release()
             manualRoiPatchGray = null
             manualRoiRelockBlocked = false
-            manualRoiLastTrackNccFrameId = -1L
-            manualRoiLastInitFrameId = -1L
-            manualRoiNccHistory.clear()
+            resetManualRoiTrackNccState()
         }
     }
 
@@ -3479,46 +3514,14 @@ class OpenCVTrackerAnalyzer(
     }
 
     private fun searchFrameByOrb(frame: Mat, image: ImageProxy? = null) {
-        val templateReady = templatePyramidLevels.isNotEmpty()
-        if (!templateReady) {
-            logDiag(
-                "SEARCH",
-                "session=$diagSessionId stage=template_check ready=false kp=$templateKeypointCount texture=${fmt(templateTextureScore)} minTexture=${fmt(templateMinTextureScore)}"
-            )
-            metricsSearchTemplateSkipCount++
-            metricsSearchLastReason = "template_not_ready"
-            if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
-                Log.w(
-                    TAG,
-                    "EVAL_EVENT type=SEARCH_SKIPPED reason=template_not_ready kp=$templateKeypointCount " +
-                        "texture=${fmt(templateTextureScore)} textureMin=${fmt(templateMinTextureScore)}"
-                )
-            }
-            lastTemplateReadyState = false
-            clearFirstLockCandidate("template_not_ready")
-            updateLatestPrediction(null, 0.0, tracking = false)
+        if (!isTemplateReadyForSearch()) {
+            handleTemplateNotReadySearch()
             return
         }
-        lastTemplateReadyState = true
 
         val candidate = findOrbMatchForAcquire(frame)
         if (candidate == null) {
-            metricsSearchMissCount++
-            metricsSearchLastReason =
-                if (isCenterRoiSearchActive()) {
-                    "roi_${centerRoiLastScope}_${lastSearchDiagReason}"
-                } else {
-                    lastSearchDiagReason
-                }
-            if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
-                logDiag(
-                    "SEARCH",
-                    "session=$diagSessionId stage=no_candidate reason=$lastSearchDiagReason miss=$searchMissStreak tplKp=$templateKeypointCount"
-                )
-            }
-            searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
-            expireFirstLockCandidateIfNeeded()
-            updateLatestPrediction(null, 0.0, tracking = false)
+            handleMissingSearchCandidate()
             return
         }
         metricsSearchCandidateCount++
@@ -3528,14 +3531,7 @@ class OpenCVTrackerAnalyzer(
             } else {
                 "candidate"
             }
-        if (isCenterRoiSearchActive()) {
-            Log.w(
-                TAG,
-                "EVAL_EVENT type=ROI_SEARCH state=hit level=$centerRoiLastScope " +
-                    "box=${candidate.box.x},${candidate.box.y},${candidate.box.width}x${candidate.box.height} " +
-                    "good=${candidate.goodMatches} inliers=${candidate.inlierCount} conf=${fmt(candidate.confidence)}"
-            )
-        }
+        logRoiSearchHit(candidate)
         val confirmed = maybeRefineFallbackCandidate(frame, candidate)
         if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
             logDiag(
@@ -3545,54 +3541,11 @@ class OpenCVTrackerAnalyzer(
         }
         updateLatestPrediction(confirmed.box, confirmed.confidence, tracking = false)
 
-        if (
-            isManualRoiSessionActive() &&
-            isCandidateLockableForInit(confirmed, frame.cols(), frame.rows()) &&
-            passesManualRoiRelockGate(confirmed, frame)
-        ) {
-            searchMissStreak = 0
-            clearFirstLockCandidate("manual_roi_direct")
-            metricsSearchLastReason = "manual_roi_direct_lock"
-            initializeTracker(
-                frame,
-                confirmed.box,
-                "manual_roi_direct good=${confirmed.goodMatches} inliers=${confirmed.inlierCount} " +
-                    "conf=${fmt(confirmed.confidence)} h=${confirmed.usedHomography} ds=${fmt(confirmed.searchScale)} " +
-                    "fallback=${confirmed.fallbackReason ?: "none"} matcher=${confirmed.matcherType}",
-                image
-            )
+        if (tryManualDirectInit(frame, confirmed, image)) {
             return
         }
 
-        if (shouldAutoInitWithoutManual(confirmed, frame.cols(), frame.rows())) {
-            if (isManualRoiSessionActive() && !passesManualRoiRelockGate(confirmed, frame)) {
-                metricsSearchLastReason = "manual_auto_gate_reject"
-                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
-                    Log.w(
-                        TAG,
-                        "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=manual_auto_gate_reject " +
-                            "good=${confirmed.goodMatches} inliers=${confirmed.inlierCount} conf=${fmt(confirmed.confidence)}"
-                    )
-                }
-                clearFirstLockCandidate("manual_auto_gate_reject")
-                return
-            }
-            if (canDirectAutoInit(confirmed) && passesAutoInitVerification(frame, confirmed)) {
-                searchMissStreak = 0
-                clearFirstLockCandidate("auto_init")
-                metricsSearchLastReason = "auto_lock_init"
-                initializeTracker(
-                    frame,
-                    confirmed.box,
-                    "orb_auto_init good=${confirmed.goodMatches} inliers=${confirmed.inlierCount} " +
-                        "conf=${fmt(confirmed.confidence)} h=${confirmed.usedHomography} ds=${fmt(confirmed.searchScale)} " +
-                        "fallback=${confirmed.fallbackReason ?: "none"} matcher=${confirmed.matcherType}",
-                    image
-                )
-                return
-            }
-            metricsSearchLastReason = "auto_lock_buffer"
-        }
+        if (tryAutoInit(frame, confirmed, image)) return
 
         if (!isCandidateEligibleForTemporal(confirmed)) {
             metricsSearchTemporalRejectCount++
@@ -3624,99 +3577,237 @@ class OpenCVTrackerAnalyzer(
             (searchMissStreak - 1).coerceAtLeast(0)
         }
         val promoted = accumulateFirstLockCandidate(confirmed, frame.cols(), frame.rows())
-        if (promoted != null) {
-            if (!isCandidateLockableForInit(promoted, frame.cols(), frame.rows())) {
-                metricsSearchPromoteRejectCount++
-                metricsSearchLastReason = "promoted_not_lockable"
-                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
-                    Log.w(
-                        TAG,
-                        "EVAL_EVENT type=SEARCH_STABLE state=final_reject " +
-                            "good=${promoted.goodMatches} inliers=${promoted.inlierCount} " +
-                            "conf=${fmt(promoted.confidence)} h=${promoted.usedHomography} " +
-                            "fallback=${promoted.fallbackReason ?: "none"}"
-                    )
-                }
-                searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
-                clearFirstLockCandidate("promoted_not_lockable")
-                return
-            }
-            val s3Enabled = s3PromotedNearGateEnabled || s3PromotedFarGateEnabled
-            val promotedTier =
-                if (s3Enabled) classifyPromotedRelockTier(frame, promoted) else PromotedRelockTier.NONE
-            if (
-                s3PromotedFarGateEnabled &&
-                promotedTier == PromotedRelockTier.FAR &&
-                !passesPromotedFarRelockGate(frame, promoted)
-            ) {
-                metricsSearchPromoteRejectCount++
-                metricsSearchLastReason = "promoted_far_gate_reject"
-                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
-                    Log.w(
-                        TAG,
-                        "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=promoted_far_gate_reject " +
-                            "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
-                    )
-                }
-                searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
-                clearFirstLockCandidate("promoted_far_gate_reject")
-                return
-            }
-            var promotedVerified = passesAutoInitVerification(frame, promoted)
-            if (!promotedVerified && s3PromotedNearGateEnabled && promotedTier == PromotedRelockTier.NEAR) {
-                promotedVerified = passesPromotedNearRelockOverride(frame, promoted)
-            }
-            if (!promotedVerified) {
-                logDiag(
-                    "LOCK_GATE",
-                    "session=$diagSessionId stage=promoted_verify pass=false tier=${promotedTier.name.lowercase(Locale.US)} " +
-                        "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
-                )
-                metricsSearchPromoteRejectCount++
-                metricsSearchLastReason = "promoted_verify_reject"
-                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
-                    Log.w(
-                        TAG,
-                        "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=promoted_verify_reject tier=${promotedTier.name.lowercase(Locale.US)} " +
-                            "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
-                    )
-                }
-                searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
-                clearFirstLockCandidate("promoted_verify_reject")
-                return
-            }
-            if (isManualRoiSessionActive() && !passesManualRoiRelockGate(promoted, frame)) {
-                metricsSearchPromoteRejectCount++
-                metricsSearchLastReason = "manual_temporal_gate_reject"
-                if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
-                    Log.w(
-                        TAG,
-                        "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=manual_temporal_gate_reject " +
-                            "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
-                    )
-                }
-                searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
-                clearFirstLockCandidate("manual_temporal_gate_reject")
-                return
-            }
-            searchMissStreak = 0
-            clearFirstLockCandidate("promoted_candidate")
-            metricsSearchLastReason = "lock_init"
-            logDiag(
-                "LOCK_GATE",
-                "session=$diagSessionId stage=promote pass=true tier=${promotedTier.name.lowercase(Locale.US)} " +
-                    "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
-            )
-            initializeTracker(
-                frame,
-                promoted.box,
-                "orb_temporal_confirm good=${promoted.goodMatches} inliers=${promoted.inlierCount} " +
-                    "conf=${fmt(promoted.confidence)} h=${promoted.usedHomography} ds=${fmt(promoted.searchScale)} " +
-                    "fallback=${promoted.fallbackReason ?: "none"} matcher=${promoted.matcherType} " +
-                    "tier=${promotedTier.name.lowercase(Locale.US)}",
-                image
+        if (promoted != null && tryPromotedInit(frame, promoted, image)) return
+    }
+
+    private fun isTemplateReadyForSearch(): Boolean {
+        val templateReady = templatePyramidLevels.isNotEmpty()
+        lastTemplateReadyState = templateReady
+        return templateReady
+    }
+
+    private fun handleTemplateNotReadySearch() {
+        logDiag(
+            "SEARCH",
+            "session=$diagSessionId stage=template_check ready=false kp=$templateKeypointCount texture=${fmt(templateTextureScore)} minTexture=${fmt(templateMinTextureScore)}"
+        )
+        metricsSearchTemplateSkipCount++
+        metricsSearchLastReason = "template_not_ready"
+        if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=SEARCH_SKIPPED reason=template_not_ready kp=$templateKeypointCount " +
+                    "texture=${fmt(templateTextureScore)} textureMin=${fmt(templateMinTextureScore)}"
             )
         }
+        clearFirstLockCandidate("template_not_ready")
+        updateLatestPrediction(null, 0.0, tracking = false)
+    }
+
+    private fun handleMissingSearchCandidate() {
+        metricsSearchMissCount++
+        metricsSearchLastReason =
+            if (isCenterRoiSearchActive()) {
+                "roi_${centerRoiLastScope}_${lastSearchDiagReason}"
+            } else {
+                lastSearchDiagReason
+            }
+        if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+            logDiag(
+                "SEARCH",
+                "session=$diagSessionId stage=no_candidate reason=$lastSearchDiagReason miss=$searchMissStreak tplKp=$templateKeypointCount"
+            )
+        }
+        searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
+        expireFirstLockCandidateIfNeeded()
+        updateLatestPrediction(null, 0.0, tracking = false)
+    }
+
+    private fun logRoiSearchHit(candidate: OrbMatchCandidate) {
+        if (!isCenterRoiSearchActive()) return
+        Log.w(
+            TAG,
+            "EVAL_EVENT type=ROI_SEARCH state=hit level=$centerRoiLastScope " +
+                "box=${candidate.box.x},${candidate.box.y},${candidate.box.width}x${candidate.box.height} " +
+                "good=${candidate.goodMatches} inliers=${candidate.inlierCount} conf=${fmt(candidate.confidence)}"
+        )
+    }
+
+    private fun tryManualDirectInit(frame: Mat, candidate: OrbMatchCandidate, image: ImageProxy?): Boolean {
+        if (!isManualRoiSessionActive()) return false
+        if (!isCandidateLockableForInit(candidate, frame.cols(), frame.rows())) return false
+        if (!passesManualRoiRelockGate(candidate, frame)) return false
+
+        searchMissStreak = 0
+        clearFirstLockCandidate("manual_roi_direct")
+        metricsSearchLastReason = "manual_roi_direct_lock"
+        initializeTracker(
+            frame,
+            candidate.box,
+            "manual_roi_direct good=${candidate.goodMatches} inliers=${candidate.inlierCount} " +
+                "conf=${fmt(candidate.confidence)} h=${candidate.usedHomography} ds=${fmt(candidate.searchScale)} " +
+                "fallback=${candidate.fallbackReason ?: "none"} matcher=${candidate.matcherType}",
+            image
+        )
+        return true
+    }
+
+    private fun tryAutoInit(frame: Mat, candidate: OrbMatchCandidate, image: ImageProxy?): Boolean {
+        if (!shouldAutoInitWithoutManual(candidate, frame.cols(), frame.rows())) return false
+        if (isManualRoiSessionActive() && !passesManualRoiRelockGate(candidate, frame)) {
+            metricsSearchLastReason = "manual_auto_gate_reject"
+            if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+                Log.w(
+                    TAG,
+                    "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=manual_auto_gate_reject " +
+                        "good=${candidate.goodMatches} inliers=${candidate.inlierCount} conf=${fmt(candidate.confidence)}"
+                )
+            }
+            clearFirstLockCandidate("manual_auto_gate_reject")
+            return true
+        }
+        if (canDirectAutoInit(candidate) && passesAutoInitVerification(frame, candidate)) {
+            searchMissStreak = 0
+            clearFirstLockCandidate("auto_init")
+            metricsSearchLastReason = "auto_lock_init"
+            initializeTracker(
+                frame,
+                candidate.box,
+                "orb_auto_init good=${candidate.goodMatches} inliers=${candidate.inlierCount} " +
+                    "conf=${fmt(candidate.confidence)} h=${candidate.usedHomography} ds=${fmt(candidate.searchScale)} " +
+                    "fallback=${candidate.fallbackReason ?: "none"} matcher=${candidate.matcherType}",
+                image
+            )
+            return true
+        }
+        metricsSearchLastReason = "auto_lock_buffer"
+        return false
+    }
+
+    private fun tryPromotedInit(frame: Mat, promoted: OrbMatchCandidate, image: ImageProxy?): Boolean {
+        if (!isCandidateLockableForInit(promoted, frame.cols(), frame.rows())) {
+            rejectPromotedCandidate("promoted_not_lockable", promoted)
+            return true
+        }
+        val s3Enabled = s3PromotedNearGateEnabled || s3PromotedFarGateEnabled
+        val promotedTier =
+            if (s3Enabled) classifyPromotedRelockTier(frame, promoted) else PromotedRelockTier.NONE
+        if (
+            s3PromotedFarGateEnabled &&
+            promotedTier == PromotedRelockTier.FAR &&
+            !passesPromotedFarRelockGate(frame, promoted)
+        ) {
+            rejectPromotedCandidate("promoted_far_gate_reject", promoted)
+            return true
+        }
+        var promotedVerified = passesAutoInitVerification(frame, promoted)
+        if (!promotedVerified && s3PromotedNearGateEnabled && promotedTier == PromotedRelockTier.NEAR) {
+            promotedVerified = passesPromotedNearRelockOverride(frame, promoted)
+        }
+        if (!promotedVerified) {
+            logDiag(
+                "LOCK_GATE",
+                "session=$diagSessionId stage=promoted_verify pass=false tier=${promotedTier.name.lowercase(Locale.US)} " +
+                    "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
+            )
+            rejectPromotedCandidate("promoted_verify_reject", promoted, "tier=${promotedTier.name.lowercase(Locale.US)}")
+            return true
+        }
+        if (isManualRoiSessionActive() && !passesManualRoiRelockGate(promoted, frame)) {
+            rejectPromotedCandidate("manual_temporal_gate_reject", promoted)
+            return true
+        }
+        searchMissStreak = 0
+        clearFirstLockCandidate("promoted_candidate")
+        metricsSearchLastReason = "lock_init"
+        logDiag(
+            "LOCK_GATE",
+            "session=$diagSessionId stage=promote pass=true tier=${promotedTier.name.lowercase(Locale.US)} " +
+                "good=${promoted.goodMatches} inliers=${promoted.inlierCount} conf=${fmt(promoted.confidence)}"
+        )
+        initializeTracker(
+            frame,
+            promoted.box,
+            "orb_temporal_confirm good=${promoted.goodMatches} inliers=${promoted.inlierCount} " +
+                "conf=${fmt(promoted.confidence)} h=${promoted.usedHomography} ds=${fmt(promoted.searchScale)} " +
+                "fallback=${promoted.fallbackReason ?: "none"} matcher=${promoted.matcherType} " +
+                "tier=${promotedTier.name.lowercase(Locale.US)}",
+            image
+        )
+        return true
+    }
+
+    private fun rejectPromotedCandidate(
+        reason: String,
+        candidate: OrbMatchCandidate,
+        extraDetail: String = ""
+    ) {
+        metricsSearchPromoteRejectCount++
+        metricsSearchLastReason = reason
+        if (frameCounter % SEARCH_DIAG_INTERVAL_FRAMES == 0L) {
+            val detail = if (extraDetail.isBlank()) "" else " $extraDetail"
+            Log.w(
+                TAG,
+                "EVAL_EVENT type=SEARCH_STABLE state=final_reject reason=$reason$detail " +
+                    "good=${candidate.goodMatches} inliers=${candidate.inlierCount} conf=${fmt(candidate.confidence)}"
+            )
+        }
+        searchMissStreak = (searchMissStreak + 1).coerceAtMost(50_000)
+        clearFirstLockCandidate(reason)
+    }
+
+    private fun shouldRejectAutoVerifyBeforeTargetAppear(isFirstLock: Boolean, gatePrefix: String): Boolean {
+        if (!isFirstLock || !isReplayInput || replayTargetAppearMs <= 0L || currentReplayPtsMs < 0L) {
+            return false
+        }
+        if (currentReplayPtsMs + REPLAY_TARGET_APPEAR_GRACE_MS >= replayTargetAppearMs) {
+            return false
+        }
+        logDiag(
+            "LOCK_GATE",
+            "$gatePrefix pass=false reason=before_target_appear replayPtsSec=${fmt(currentReplayPtsMs.toDouble() / 1000.0)} targetSec=${fmt(replayTargetAppearMs.toDouble() / 1000.0)}"
+        )
+        return true
+    }
+
+    private fun passesFirstLockAutoVerify(
+        frame: Mat,
+        candidate: OrbMatchCandidate,
+        appearanceScore: Double,
+        gatePrefix: String
+    ): Boolean {
+        if (isReplayInput && candidate.inlierCount < autoVerifyFirstLockMinInliersReplay) {
+            logDiag(
+                "LOCK_GATE",
+                "$gatePrefix pass=false reason=first_lock_inliers inliers=${candidate.inlierCount} min=$autoVerifyFirstLockMinInliersReplay"
+            )
+            return false
+        }
+        val firstLockMinAppear =
+            if (!isReplayInput) autoVerifyFirstLockAppearanceMinLive else autoVerifyFirstLockAppearanceMinReplay
+        if (appearanceScore < firstLockMinAppear) {
+            logDiag(
+                "LOCK_GATE",
+                "$gatePrefix pass=false reason=first_lock_appearance score=${fmt(appearanceScore)} min=${fmt(firstLockMinAppear)}"
+            )
+            return false
+        }
+        if (!isReplayInput || !autoVerifyFirstLockCenterGuardReplay) return true
+
+        val center = rectCenter(candidate.box)
+        val frameW = frame.cols().toDouble().coerceAtLeast(1.0)
+        val frameH = frame.rows().toDouble().coerceAtLeast(1.0)
+        val dxNorm = abs(center.x / frameW - 0.5)
+        val dyNorm = abs(center.y / frameH - 0.5)
+        if (dxNorm > autoVerifyFirstLockCenterFactorReplay || dyNorm > autoVerifyFirstLockCenterFactorReplay) {
+            logDiag(
+                "LOCK_GATE",
+                "$gatePrefix pass=false reason=first_lock_center dx=${fmt(dxNorm)} dy=${fmt(dyNorm)} " +
+                    "th=${fmt(autoVerifyFirstLockCenterFactorReplay)}"
+            )
+            return false
+        }
+        return true
     }
 
     private fun trackFrame(frame: Mat) {
@@ -4662,13 +4753,13 @@ class OpenCVTrackerAnalyzer(
         updateLatestPrediction(null, 0.0, tracking = false)
         descendLostActive = true
         descendLostStartMs = currentTimelineMs()
-        Log.w(
-            TAG,
-                "EVAL_EVENT type=LOST reason=$reason lost=$metricsLostCount " +
+        val lostLine =
+            "EVAL_EVENT type=LOST reason=$reason lost=$metricsLostCount " +
                 "backend=${activeTrackBackend.name.lowercase(Locale.US)} " +
                 "replayPtsSec=${fmt(if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0)} " +
                 "lastBox=${priorLost?.let { "${it.x},${it.y},${it.width}x${it.height}" } ?: "none"}"
-        )
+        Log.w(TAG, lostLine)
+        appendTrialLog(lostLine)
         logDiag("TRACK", "session=$diagSessionId action=lost reason=$reason lost=$metricsLostCount")
         val token = ++overlayResetToken
         if (lostOverlayHoldMs <= 0L) {
@@ -4751,52 +4842,14 @@ class OpenCVTrackerAnalyzer(
             val nativeOk = initializeNativeTracker(frame, safe, preferredTrackBackend, image)
             if (nativeOk) {
                 tracker = null
-                isTracking = true
-                trackingStage = TrackingStage.TRACK
-                activeTrackBackend = preferredTrackBackend
-                relockSpatialRejectStreak = 0
-                consecutiveTrackerFailures = 0
-                trackMismatchStreak = 0
-                trackAppearanceLowStreak = 0
-                trackAccelGraceFramesRemaining = 0
-                trackVerifyFailStreak = 0
-                trackVerifyHardDriftStreak = 0
-                searchMissStreak = 0
-                searchBudgetCooldownFrames = 0
-                nativeLowConfidenceStreak = 0
-                nativeFuseWarmupRemaining = heuristicConfig.nativeGate.fuseWarmupFrames
-                lockHoldFramesRemaining = lockHoldFrames
-                manualRoiLastTrackNccFrameId = -1L
-                manualRoiLastInitFrameId = frameCounter
-                manualRoiNccHistory.clear()
-                fastFirstLockRemaining = 0
-                resetCenterRoiSearchState("lock")
-                descendLostActive = false
-                overlayResetToken++
-                commitTrackingObservation(safe, confidence = 1.0, markNativeAccept = true, frame = null)
-                if (!wasTracking) {
-                    metricsLockCount++
-                    if (metricsFirstLockMs < 0L) {
-                        metricsFirstLockMs = (SystemClock.elapsedRealtime() - metricsSessionStartMs).coerceAtLeast(0L)
-                        metricsFirstLockFrame = frameCounter
-                        if (isReplayInput && currentReplayPtsMs >= 0L) {
-                            metricsFirstLockReplayMs = currentReplayPtsMs
-                        }
-                    }
-                    Log.w(
-                        TAG,
-                        "EVAL_EVENT type=LOCK reason=$reason backend=${activeTrackBackend.name.lowercase(Locale.US)} " +
-                            "locks=$metricsLockCount firstLockSec=${fmt(metricsFirstLockMs.toDouble() / 1000.0)} " +
-                            "firstLockReplaySec=${fmt(if (metricsFirstLockReplayMs >= 0L) metricsFirstLockReplayMs.toDouble() / 1000.0 else -1.0)} " +
-                            "firstLockFrame=$metricsFirstLockFrame " +
-                            "replayPtsSec=${fmt(if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0)} " +
-                            "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
-                    )
-                }
-                Log.i(TAG, "Native tracker initialized ($reason): ${safe.x},${safe.y},${safe.width}x${safe.height}")
-                logDiag(
-                    "LOCK",
-                    "session=$diagSessionId backend=${activeTrackBackend.name.lowercase(Locale.US)} reason=$reason box=${safe.x},${safe.y},${safe.width}x${safe.height} firstLockSec=${fmt(if (metricsFirstLockMs >= 0L) metricsFirstLockMs.toDouble() / 1000.0 else -1.0)}"
+                finalizeTrackerInitialization(
+                    safe = safe,
+                    reason = reason,
+                    backend = preferredTrackBackend,
+                    wasTracking = wasTracking,
+                    markNativeAccept = true,
+                    nativeWarmupFrames = heuristicConfig.nativeGate.fuseWarmupFrames,
+                    initLog = "Native tracker initialized ($reason): ${safe.x},${safe.y},${safe.width}x${safe.height}"
                 )
                 return
             }
@@ -4825,9 +4878,29 @@ class OpenCVTrackerAnalyzer(
         }
 
         tracker = freshTracker
+        finalizeTrackerInitialization(
+            safe = safe,
+            reason = reason,
+            backend = TrackBackend.KCF,
+            wasTracking = wasTracking,
+            markNativeAccept = false,
+            nativeWarmupFrames = 0,
+            initLog = "KCF initialized ($reason): ${safe.x},${safe.y},${safe.width}x${safe.height}"
+        )
+    }
+
+    private fun finalizeTrackerInitialization(
+        safe: Rect,
+        reason: String,
+        backend: TrackBackend,
+        wasTracking: Boolean,
+        markNativeAccept: Boolean,
+        nativeWarmupFrames: Int,
+        initLog: String
+    ) {
         isTracking = true
         trackingStage = TrackingStage.TRACK
-        activeTrackBackend = TrackBackend.KCF
+        activeTrackBackend = backend
         relockSpatialRejectStreak = 0
         consecutiveTrackerFailures = 0
         trackMismatchStreak = 0
@@ -4838,17 +4911,15 @@ class OpenCVTrackerAnalyzer(
         searchMissStreak = 0
         searchBudgetCooldownFrames = 0
         nativeLowConfidenceStreak = 0
-        nativeFuseWarmupRemaining = 0
+        nativeFuseWarmupRemaining = nativeWarmupFrames
         lockHoldFramesRemaining = lockHoldFrames
         lastNativeAcceptMs = 0L
-        manualRoiLastTrackNccFrameId = -1L
-        manualRoiLastInitFrameId = frameCounter
-        manualRoiNccHistory.clear()
+        resetManualRoiTrackNccState(frameCounter)
         fastFirstLockRemaining = 0
         resetCenterRoiSearchState("lock")
         descendLostActive = false
         overlayResetToken++
-        commitTrackingObservation(safe, confidence = 1.0, markNativeAccept = false, frame = null)
+        commitTrackingObservation(safe, confidence = 1.0, markNativeAccept = markNativeAccept, frame = null)
 
         if (!wasTracking) {
             metricsLockCount++
@@ -4859,18 +4930,18 @@ class OpenCVTrackerAnalyzer(
                     metricsFirstLockReplayMs = currentReplayPtsMs
                 }
             }
-            Log.w(
-                TAG,
+            val lockLine =
                 "EVAL_EVENT type=LOCK reason=$reason backend=${activeTrackBackend.name.lowercase(Locale.US)} " +
                     "locks=$metricsLockCount firstLockSec=${fmt(metricsFirstLockMs.toDouble() / 1000.0)} " +
                     "firstLockReplaySec=${fmt(if (metricsFirstLockReplayMs >= 0L) metricsFirstLockReplayMs.toDouble() / 1000.0 else -1.0)} " +
                     "firstLockFrame=$metricsFirstLockFrame " +
                     "replayPtsSec=${fmt(if (currentReplayPtsMs >= 0L) currentReplayPtsMs.toDouble() / 1000.0 else -1.0)} " +
                     "box=${safe.x},${safe.y},${safe.width}x${safe.height}"
-            )
+            Log.w(TAG, lockLine)
+            appendTrialLog(lockLine)
         }
 
-        Log.i(TAG, "KCF initialized ($reason): ${safe.x},${safe.y},${safe.width}x${safe.height}")
+        Log.i(TAG, initLog)
         logDiag(
             "LOCK",
             "session=$diagSessionId backend=${activeTrackBackend.name.lowercase(Locale.US)} reason=$reason box=${safe.x},${safe.y},${safe.width}x${safe.height} firstLockSec=${fmt(if (metricsFirstLockMs >= 0L) metricsFirstLockMs.toDouble() / 1000.0 else -1.0)}"
@@ -6740,17 +6811,7 @@ class OpenCVTrackerAnalyzer(
         }
         val isRelock = metricsLockCount > 0
         val isFirstLock = metricsLockCount == 0
-        if (
-            isFirstLock &&
-            isReplayInput &&
-            replayTargetAppearMs > 0L &&
-            currentReplayPtsMs >= 0L &&
-            currentReplayPtsMs + REPLAY_TARGET_APPEAR_GRACE_MS < replayTargetAppearMs
-        ) {
-            logDiag(
-                "LOCK_GATE",
-                "$gatePrefix pass=false reason=before_target_appear replayPtsSec=${fmt(currentReplayPtsMs.toDouble() / 1000.0)} targetSec=${fmt(replayTargetAppearMs.toDouble() / 1000.0)}"
-            )
+        if (shouldRejectAutoVerifyBeforeTargetAppear(isFirstLock, gatePrefix)) {
             return false
         }
         val appearanceScore = computePatchTemplateCorrelation(frame, candidate.box)
@@ -6775,38 +6836,8 @@ class OpenCVTrackerAnalyzer(
                         appearanceScore >= anchorScore - AUTO_VERIFY_FAST_RELOCK_ANCHOR_MAX_DROP
                 nearPrior && anchorOk
             }
-        if (isFirstLock) {
-            if (isReplayInput && candidate.inlierCount < autoVerifyFirstLockMinInliersReplay) {
-                logDiag(
-                    "LOCK_GATE",
-                    "$gatePrefix pass=false reason=first_lock_inliers inliers=${candidate.inlierCount} min=$autoVerifyFirstLockMinInliersReplay"
-                )
-                return false
-            }
-            val firstLockMinAppear =
-                if (!isReplayInput) autoVerifyFirstLockAppearanceMinLive else autoVerifyFirstLockAppearanceMinReplay
-            if (appearanceScore < firstLockMinAppear) {
-                logDiag(
-                    "LOCK_GATE",
-                    "$gatePrefix pass=false reason=first_lock_appearance score=${fmt(appearanceScore)} min=${fmt(firstLockMinAppear)}"
-                )
-                return false
-            }
-            if (isReplayInput && autoVerifyFirstLockCenterGuardReplay) {
-                val center = rectCenter(candidate.box)
-                val frameW = frame.cols().toDouble().coerceAtLeast(1.0)
-                val frameH = frame.rows().toDouble().coerceAtLeast(1.0)
-                val dxNorm = abs(center.x / frameW - 0.5)
-                val dyNorm = abs(center.y / frameH - 0.5)
-                if (dxNorm > autoVerifyFirstLockCenterFactorReplay || dyNorm > autoVerifyFirstLockCenterFactorReplay) {
-                    logDiag(
-                        "LOCK_GATE",
-                        "$gatePrefix pass=false reason=first_lock_center dx=${fmt(dxNorm)} dy=${fmt(dyNorm)} " +
-                            "th=${fmt(autoVerifyFirstLockCenterFactorReplay)}"
-                    )
-                    return false
-                }
-            }
+        if (isFirstLock && !passesFirstLockAutoVerify(frame, candidate, appearanceScore, gatePrefix)) {
+            return false
         }
         if (isRelock) {
             val manualStrictRelock = isManualRoiSessionActive()
@@ -8179,8 +8210,14 @@ class OpenCVTrackerAnalyzer(
         }
     }
 
+    private fun appendTrialLog(message: String) {
+        Phase1TrialLogger.append(overlayView.context.applicationContext, TAG, message)
+    }
+
     private fun logDiag(type: String, payload: String) {
-        Log.i(TAG, "DIAG_${type.uppercase(Locale.US)} $payload")
+        val line = "DIAG_${type.uppercase(Locale.US)} $payload"
+        Log.i(TAG, line)
+        appendTrialLog(line)
     }
 
     companion object {

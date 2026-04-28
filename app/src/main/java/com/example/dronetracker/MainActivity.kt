@@ -16,8 +16,10 @@ import android.view.View
 import android.widget.Button
 import android.widget.ImageButton
 import android.widget.ImageView
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -26,6 +28,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.exifinterface.media.ExifInterface
 import com.canhub.cropper.CropImageContract
 import com.canhub.cropper.CropImageContractOptions
@@ -50,6 +53,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSelectImage: Button
     private lateinit var btnReset: Button
     private lateinit var btnGpsReady: Button
+    private lateinit var btnHelp: Button
+    private lateinit var btnExportLogs: Button
+    private lateinit var tvPhase1Hint: TextView
 
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var trackerAnalyzer: OpenCVTrackerAnalyzer
@@ -101,12 +107,17 @@ class MainActivity : AppCompatActivity() {
             decodeBitmapFromUriWithExif(uri)
         }.onSuccess { bitmap ->
             if (bitmap == null) {
+                appendTrialLog("template_load_failed source=crop reason=bitmap_null")
                 Toast.makeText(this, getString(R.string.toast_template_load_failed), Toast.LENGTH_SHORT).show()
                 return@onSuccess
             }
             val quality = evaluateTemplateQuality(bitmap)
             if (!quality.pass) {
-                Toast.makeText(this, buildTemplateQualityMessage(quality), Toast.LENGTH_LONG).show()
+                appendTrialLog(
+                    "template_quality_reject source=crop reason=${quality.reason} " +
+                        "size=${bitmap.width}x${bitmap.height} kp=${quality.orbKeypoints}"
+                )
+                Toast.makeText(this, buildPhase1TemplateQualityMessage(quality), Toast.LENGTH_LONG).show()
                 if (!bitmap.isRecycled) bitmap.recycle()
                 return@onSuccess
             }
@@ -116,12 +127,15 @@ class MainActivity : AppCompatActivity() {
                 if (!bitmap.isRecycled) bitmap.recycle()
             }
             if (ok) {
+                appendTrialLog("template_loaded source=crop size=${bitmap.width}x${bitmap.height}")
                 Toast.makeText(this, getString(R.string.toast_template_loaded), Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(this, "\u6A21\u677F\u7EB9\u7406\u8FC7\u5F31\uFF0C\u8BF7\u91CD\u65B0\u63D0\u4F9B\u76EE\u6807\u6E05\u6670\u7167\u7247", Toast.LENGTH_LONG).show()
+                appendTrialLog("template_load_failed source=crop reason=tracker_reject")
+                Toast.makeText(this, "目标照片不够清晰，请换一张更清楚的照片", Toast.LENGTH_LONG).show()
             }
         }.onFailure { e ->
             Log.e(TAG, "Failed to load cropped image", e)
+            appendTrialLog("template_load_failed source=crop reason=exception err=${e.message}")
             Toast.makeText(this, getString(R.string.toast_template_load_failed), Toast.LENGTH_SHORT).show()
         }
     }
@@ -154,6 +168,9 @@ class MainActivity : AppCompatActivity() {
         btnSelectImage = findViewById(R.id.btnSelectImage)
         btnReset = findViewById(R.id.btnReset)
         btnGpsReady = findViewById(R.id.btnGpsReady)
+        btnHelp = findViewById(R.id.btnHelp)
+        btnExportLogs = findViewById(R.id.btnExportLogs)
+        tvPhase1Hint = findViewById(R.id.tvPhase1Hint)
         findViewById<ImageButton>(R.id.btnClose).setOnClickListener { finish() }
 
         cameraExecutor = Executors.newSingleThreadExecutor()
@@ -185,18 +202,33 @@ class MainActivity : AppCompatActivity() {
             Toast.LENGTH_SHORT
         ).show()
         applyIntentConfig(intent)
+        Phase1TrialLogger.startSession(this, if (isReplayMode) "replay" else "camera")
+        appendTrialLog("activity_create replay=$isReplayMode mode=${trackerAnalyzer.currentTrackerMode()}")
 
         overlayView.onBoxSelectedListener = { rect ->
+            appendTrialLog(
+                "manual_roi_box_selected view=${overlayView.width}x${overlayView.height} " +
+                    "rect=${rect.left.toInt()},${rect.top.toInt()},${rect.width().toInt()}x${rect.height().toInt()}"
+            )
             trackerAnalyzer.setInitialTarget(rect, overlayView.width, overlayView.height)
         }
 
         btnSelectImage.setOnClickListener {
-            Toast.makeText(this, TEMPLATE_ORIENTATION_HINT_MESSAGE, Toast.LENGTH_LONG).show()
+            appendTrialLog("template_picker_open")
+            Toast.makeText(this, PHASE1_TEMPLATE_ORIENTATION_HINT_MESSAGE, Toast.LENGTH_LONG).show()
             selectImageLauncher.launch("image/*")
         }
         btnReset.setOnClickListener {
+            appendTrialLog("tracking_reset_click")
             trackerAnalyzer.logEvalSummary("reset_button")
             trackerAnalyzer.resetTracking(logSummary = false)
+        }
+        btnHelp.setOnClickListener {
+            appendTrialLog("guide_open")
+            showPhase1Guide()
+        }
+        btnExportLogs.setOnClickListener {
+            exportPhase1Logs()
         }
         btnGpsReady.setOnClickListener {
             if (!isDebuggable) return@setOnClickListener
@@ -223,6 +255,8 @@ class MainActivity : AppCompatActivity() {
         setIntent(intent)
 
         applyIntentConfig(intent)
+        Phase1TrialLogger.startSession(this, if (isReplayMode) "replay" else "camera")
+        appendTrialLog("activity_new_intent replay=$isReplayMode mode=${trackerAnalyzer.currentTrackerMode()}")
         syncGpsReadyFromAnalyzer()
         refreshUiByMode()
         trackerAnalyzer.resetTracking(logSummary = false)
@@ -275,9 +309,11 @@ class MainActivity : AppCompatActivity() {
         if (isReplayMode) {
             btnSelectImage.isEnabled = false
             btnSelectImage.alpha = 0.5f
+            tvPhase1Hint.text = getString(R.string.phase1_hint_replay)
         } else {
             btnSelectImage.isEnabled = true
             btnSelectImage.alpha = 1.0f
+            tvPhase1Hint.text = getString(R.string.phase1_hint_live)
         }
         if (isDebuggable) {
             btnGpsReady.visibility = View.VISIBLE
@@ -306,6 +342,7 @@ class MainActivity : AppCompatActivity() {
         gpsReady = ready
         trackerAnalyzer.setCenterRoiGpsReady(ready, reason)
         updateGpsReadyButton()
+        appendTrialLog("gps_ready ready=$ready source=$source reason=$reason")
         Log.w(
             TRACKER_TAG,
             "EVAL_EVENT type=GPS_READY ready=$ready source=$source reason=$reason debug=$isDebuggable"
@@ -338,6 +375,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCamera() {
+        appendTrialLog("camera_start")
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
@@ -364,6 +402,7 @@ class MainActivity : AppCompatActivity() {
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Use case binding failed", e)
+                appendTrialLog("camera_bind_failed err=${e.message}")
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -387,6 +426,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (!loadTemplatesFromPaths(targets.toList())) {
+            appendTrialLog("replay_start_failed reason=target_missing")
             Toast.makeText(this, getString(R.string.toast_replay_target_missing), Toast.LENGTH_LONG).show()
             Log.e(TAG, "Replay target is missing or unreadable: ${targets.joinToString(";")}")
             Log.w(
@@ -400,6 +440,7 @@ class MainActivity : AppCompatActivity() {
         val replayStartMs = (replayStartSec * 1000f).toLong().coerceAtLeast(0L)
         val videoFile = File(videoPath)
         if (!videoFile.exists()) {
+            appendTrialLog("replay_start_failed reason=video_missing path=$videoPath")
             Toast.makeText(this, getString(R.string.toast_replay_video_missing), Toast.LENGTH_LONG).show()
             Log.e(TAG, "Replay video does not exist: $videoPath")
             Log.w(TRACKER_TAG, "EVAL_EVENT type=REPLAY_INPUT state=video_missing path=$videoPath")
@@ -411,6 +452,10 @@ class MainActivity : AppCompatActivity() {
                 "targets=${targets.size} loop=$replayLoopEnabled startSec=${"%.2f".format(replayStartSec)} " +
                 "targetAppearSec=${"%.2f".format(replayTargetAppearSec)} " +
                 "catchup=$replayCatchupEnabled replayFps=${"%.2f".format(replayFpsOverride)}"
+        )
+        appendTrialLog(
+            "replay_start video=$videoPath targets=${targets.size} startSec=${"%.2f".format(replayStartSec)} " +
+                "appearSec=${"%.2f".format(replayTargetAppearSec)} fps=${"%.2f".format(replayFpsOverride)}"
         )
 
         viewFinder.visibility = View.INVISIBLE
@@ -428,12 +473,14 @@ class MainActivity : AppCompatActivity() {
             onMatFrame = { mat, ptsMs -> trackerAnalyzer.analyzeReplayFrame(mat, ptsMs) },
             onError = { message, throwable ->
                 Log.e(TAG, message, throwable)
+                appendTrialLog("replay_error err=${throwable?.message ?: message}")
                 runOnUiThread {
                     Toast.makeText(this, getString(R.string.toast_replay_failed), Toast.LENGTH_LONG).show()
                 }
             }
         )
         cameraExecutor.execute(replayRunner)
+        appendTrialLog("replay_runner_started")
         Toast.makeText(this, getString(R.string.toast_replay_started), Toast.LENGTH_SHORT).show()
     }
 
@@ -463,6 +510,10 @@ class MainActivity : AppCompatActivity() {
                 val quality = evaluateTemplateQuality(bitmap)
                 if (!quality.pass) {
                     skippedBadTemplate = true
+                    appendTrialLog(
+                        "template_quality_reject source=disk path=$path reason=${quality.reason} " +
+                            "size=${bitmap.width}x${bitmap.height} kp=${quality.orbKeypoints}"
+                    )
                     Log.w(
                         TAG,
                         "Skip bad template: $path size=${bitmap.width}x${bitmap.height} " +
@@ -476,14 +527,17 @@ class MainActivity : AppCompatActivity() {
             }
             if (bitmaps.isEmpty()) {
                 if (skippedBadTemplate) {
-                    Toast.makeText(this, TEMPLATE_QUALITY_REJECT_MESSAGE, Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, PHASE1_TEMPLATE_QUALITY_REJECT_MESSAGE, Toast.LENGTH_LONG).show()
                 }
                 return false
             }
 
             val ready = trackerAnalyzer.setTemplateImages(bitmaps, source = "disk")
             if (!ready) {
-                Toast.makeText(this, "\u6A21\u677F\u7EB9\u7406\u8FC7\u5F31\uFF0C\u8BF7\u91CD\u65B0\u63D0\u4F9B\u76EE\u6807\u6E05\u6670\u7167\u7247", Toast.LENGTH_LONG).show()
+                appendTrialLog("template_load_failed source=disk reason=tracker_reject count=${bitmaps.size}")
+                Toast.makeText(this, "目标照片不够清晰，请换一张更清楚的照片", Toast.LENGTH_LONG).show()
+            } else {
+                appendTrialLog("template_loaded source=disk count=${bitmaps.size}")
             }
             return ready
         } finally {
@@ -651,17 +705,76 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun buildPhase1TemplateQualityMessage(quality: TemplateQuality): String {
+        return when (quality.reason) {
+            "short_side" ->
+                "图片短边不足 ${MIN_TEMPLATE_INPUT_SIDE}px，请放大目标后重试"
+            "usable_pixels" ->
+                "目标照片不够清晰，请换更近、更清楚的照片"
+            "orb_keypoints" ->
+                "目标照片细节不足，请选纹理更清晰、方向更接近当前画面的照片"
+            else ->
+                PHASE1_TEMPLATE_QUALITY_REJECT_MESSAGE
+        }
+    }
+
     private fun buildTemplateQualityMessage(quality: TemplateQuality): String {
         return when (quality.reason) {
             "short_side" ->
                 "图片短边不足 ${MIN_TEMPLATE_INPUT_SIDE}px，请放大目标后重试"
             "usable_pixels" ->
-                "模板有效像素不足（${quality.usablePixels} < ${MIN_TEMPLATE_USABLE_PIXELS}），请换更近更清晰目标图"
+                "目标照片不够清晰，请换更近、更清楚的照片"
             "orb_keypoints" ->
-                "模板特征点不足（${quality.orbKeypoints} < ${MIN_TEMPLATE_ORB_KEYPOINTS}），请选纹理更清晰且方向一致的目标图"
+                "目标照片细节不足，请选纹理更清晰、方向更接近当前画面的照片"
             else ->
                 TEMPLATE_QUALITY_REJECT_MESSAGE
         }
+    }
+
+    private fun showPhase1Guide() {
+        AlertDialog.Builder(this)
+            .setTitle("试用说明")
+            .setMessage(buildPhase1GuideMessage())
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
+    }
+
+    private fun buildPhase1GuideMessage(): String {
+        val install = "1. 首次启动后，允许相机和图片读取权限。"
+        val template = "2. 方式 A：选目标照片\n点击“选目标照片”，选择一张清晰的目标图片。"
+        val manual = "3. 方式 B：直接圈住目标\n在实时画面上长按并拖框圈住目标。"
+        val expect = "4. 使用规则\n这两种方式任选一种，不需要同时做。"
+        val reset = "5. 期望行为\n锁定后红框会跟着目标走；目标离开画面时会先松开；目标回到画面后会尝试重新锁定。"
+        val logs = "6. 导出日志\n试用结束后点击“导出日志”，把最新运行日志文件分享给开发者。"
+        return listOf(install, template, manual, expect, reset, logs).joinToString("\n\n")
+    }
+
+    private fun exportPhase1Logs() {
+        val logFile = Phase1TrialLogger.latestLogFile(this)
+        if (logFile == null || !logFile.exists()) {
+            Toast.makeText(this, getString(R.string.toast_phase1_log_missing), Toast.LENGTH_LONG).show()
+            return
+        }
+        appendTrialLog("log_export file=${logFile.absolutePath}")
+        val uri = FileProvider.getUriForFile(this, "${packageName}.fileprovider", logFile)
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "Phase 1 运行日志")
+            putExtra(Intent.EXTRA_STREAM, uri)
+            putExtra(Intent.EXTRA_TEXT, "请把这份 Phase 1 运行日志发给开发者。文件名：${logFile.name}")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching {
+            startActivity(Intent.createChooser(shareIntent, getString(R.string.btn_export_logs)))
+            Toast.makeText(this, getString(R.string.toast_phase1_log_exported), Toast.LENGTH_SHORT).show()
+        }.onFailure { error ->
+            Log.e(TAG, "exportPhase1Logs failed", error)
+            Toast.makeText(this, getString(R.string.toast_phase1_log_export_failed), Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun appendTrialLog(message: String) {
+        Phase1TrialLogger.append(this, TAG, message)
     }
 
     private fun buildRequiredPermissions(): Array<String> {
@@ -734,6 +847,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         unregisterGpsReadyReceiverIfNeeded()
+        appendTrialLog("activity_destroy")
         trackerAnalyzer.logEvalSummary("activity_destroy")
         replayRunner?.stop()
         replayRunner = null
@@ -775,14 +889,18 @@ class MainActivity : AppCompatActivity() {
         private const val CROP_MIN_RESULT_SIDE = 256
         private const val CROP_OUTPUT_MAX_SIDE = 640
         private const val TEMPLATE_TOO_SMALL_MESSAGE = "\u56FE\u7247\u592A\u5C0F\uFF0C\u8BF7\u9009\u62E9\u66F4\u6E05\u6670\u7684\u76EE\u6807\u7167\u7247"
-        private const val TEMPLATE_QUALITY_REJECT_MESSAGE = "模板质量不足，请选择清晰目标图并保持目标方向与视频首帧一致"
-        private const val TEMPLATE_ORIENTATION_HINT_MESSAGE = "请尽量让目标方向与首帧一致（建议朝上，偏差不超过 ±30°）"
+        private const val TEMPLATE_QUALITY_REJECT_MESSAGE = "目标照片不够清晰，请换一张更清楚、方向更接近当前画面的照片"
+        private const val TEMPLATE_ORIENTATION_HINT_MESSAGE = "如果你选目标照片，请尽量让照片方向接近当前画面"
         private const val DEFAULT_REPLAY_TARGET_PATH = "/sdcard/Download/Video_Search/target0417_s640.jpg"
         private const val DEFAULT_REPLAY_VIDEO_PATH = "/sdcard/Download/Video_Search/scene_20260417.mp4"
         private const val ASSET_NCNN_BACKBONE_PARAM = "nanotrack_backbone_sim-opt.param"
         private const val ASSET_NCNN_BACKBONE_BIN = "nanotrack_backbone_sim-opt.bin"
         private const val ASSET_NCNN_HEAD_PARAM = "nanotrack_head_sim-opt.param"
         private const val ASSET_NCNN_HEAD_BIN = "nanotrack_head_sim-opt.bin"
+        private const val PHASE1_TEMPLATE_QUALITY_REJECT_MESSAGE =
+            "目标照片不够清晰，请换一张更清楚、方向更接近当前画面的照片"
+        private const val PHASE1_TEMPLATE_ORIENTATION_HINT_MESSAGE =
+            "如果你选目标照片，请尽量让照片方向接近当前画面"
     }
 
     private data class TemplateQuality(
